@@ -1,0 +1,24 @@
+[package]
+authors = ["Matthew Turner <matthew.m.turner@outlook.com>"]
+description = "DataFusion table provider for querying Apache Cassandra tables"
+edition = "2021"
+homepage = "https://github.com/datafusion-contrib/datafusion-dft/tree/main/crates/datafusion-cassandra"
+keywords = ["cassandra", "cql", "datafusion", "query", "sql"]
+license = "Apache-2.0"
+name = "datafusion-cassandra"
+readme = "README.md"
+repository = "https://github.com/datafusion-contrib/datafusion-dft/tree/main/crates/datafusion-cassandra"
+version = "0.1.0"
+
+[dependencies]
+async-trait = "0.1.80"
+datafusion = { version = "54" }
+futures = "0.3"
+scylla = "1.7"
+tokio = { features = ["sync"], version = "1" }
+
+[dev-dependencies]
+tokio = { features = ["macros", "rt-multi-thread"], version = "1" }
+
+[lints.clippy]
+clone_on_ref_ptr = "deny"

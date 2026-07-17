@@ -254,6 +254,30 @@ Because MongoDB is schemaless, the Arrow schema of a collection is inferred by s
 
 [datafusion-table-providers]: https://github.com/datafusion-contrib/datafusion-table-providers
 
+### Cassandra (`--features=cassandra`)
+
+Register an entire Cassandra (or ScyllaDB) cluster as a catalog (backed by the in-repo [datafusion-cassandra](../crates/datafusion-cassandra) crate).  Each non-system keyspace becomes a schema in the catalog and its tables (including materialized views) are queryable.  For example use the following config:
+
+```toml
+[[execution.cassandra]]
+name = "cassandra"                 # catalog name to register (default "cassandra")
+contact_points = ["localhost:9042"]
+# user = "cassandra"               # for clusters with PasswordAuthenticator enabled
+# password = "cassandra"
+# keyspace = "my_keyspace"         # optionally limit the catalog to a single keyspace
+# connection_timeout_ms = 5000     # per-node connection timeout (driver default when unset)
+```
+
+And then query with:
+
+```sql
+SELECT * FROM cassandra.my_keyspace.my_table
+```
+
+Multiple `[[execution.cassandra]]` entries can be defined, each registered as its own catalog.  Keyspaces and table names are discovered once at startup from the cluster's schema metadata; the data itself is queried from Cassandra on demand with paging.
+
+Projection and `LIMIT` are pushed into the generated CQL, as are equality filters that cover the full partition key (the only `WHERE` shape Cassandra executes without `ALLOW FILTERING`).  All other predicates are evaluated by DataFusion after the scan.  Scalar CQL types map to their natural Arrow equivalents; types without one (`uuid`, `inet`, `decimal`, `varint`, `duration`, `map`, `tuple`, UDTs) are rendered as strings.
+
 ### Json Functions (`--features=function-json`)
 
 Adds functions from [datafusion-function-json] for querying JSON strings in DataFusion in `dft`.  For example:

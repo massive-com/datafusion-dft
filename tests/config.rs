@@ -148,6 +148,36 @@ impl TestConfigBuilder {
         self
     }
 
+    #[cfg(feature = "cassandra")]
+    pub fn with_cassandra(
+        &mut self,
+        app: &str,
+        name: &str,
+        contact_points: &[&str],
+        user: Option<&str>,
+        password: Option<&str>,
+        keyspace: Option<&str>,
+    ) -> &mut Self {
+        self.config_text
+            .push_str(&format!("[[{app}.execution.cassandra]]\n"));
+        self.config_text.push_str(&format!("name = '{}'\n", name));
+        let points: Vec<String> = contact_points.iter().map(|p| format!("'{}'", p)).collect();
+        self.config_text
+            .push_str(&format!("contact_points = [{}]\n", points.join(", ")));
+        if let Some(user) = user {
+            self.config_text.push_str(&format!("user = '{}'\n", user));
+        }
+        if let Some(password) = password {
+            self.config_text
+                .push_str(&format!("password = '{}'\n", password));
+        }
+        if let Some(keyspace) = keyspace {
+            self.config_text
+                .push_str(&format!("keyspace = '{}'\n", keyspace));
+        }
+        self
+    }
+
     #[cfg(feature = "clickhouse")]
     pub fn with_clickhouse(
         &mut self,

@@ -104,6 +104,7 @@ cargo test --features=flightsql extension_cases::flightsql -- --test-threads=1
 cargo test --features=s3 extension_cases::s3
 cargo test --features=clickhouse extension_cases::clickhouse  # Requires local ClickHouse (see tests/extension_cases/clickhouse.rs)
 cargo test --features=mongodb extension_cases::mongodb  # Requires local MongoDB (see tests/extension_cases/mongodb.rs)
+cargo test --features=cassandra extension_cases::cassandra  # Requires local Cassandra (see tests/extension_cases/cassandra.rs)
 cargo test --features=functions-json extension_cases::functions_json
 cargo test --features=deltalake extension_cases::deltalake
 cargo test --features="deltalake s3" extension_cases::deltalake::test_deltalake_s3  # Requires LocalStack
@@ -117,6 +118,7 @@ cargo test --manifest-path crates/datafusion-app/Cargo.toml --all-features
 cargo test --manifest-path crates/datafusion-functions-parquet/Cargo.toml
 cargo test --manifest-path crates/datafusion-udfs-wasm/Cargo.toml
 cargo test --manifest-path crates/datafusion-net/Cargo.toml --all-features
+cargo test --manifest-path crates/datafusion-cassandra/Cargo.toml
 
 # Run a single test
 cargo test <test_name>
@@ -172,6 +174,8 @@ The project is organized as a workspace with multiple crates:
 
 - **`crates/datafusion-net`**: Network packet capture querying — `pcap` (capture files), `capture` (live capture), `interfaces` (list capture devices), and `tcp_conversations` (per-connection TCP flow analytics) table functions (`capture`/`interfaces` behind its `live` feature); the `reverse_dns` (IP → hostname via PTR lookup) and `geoip` (IP → location via MaxMind `.mmdb` database) scalar UDFs; the `dns_query` and `tls_sni` payload-decoding scalar UDFs; and `pcap_wide` / `capture_wide` variants that append DNS and geolocation enrichment columns
 
+- **`crates/datafusion-cassandra`**: DataFusion `TableProvider` for Apache Cassandra/ScyllaDB (built on the `scylla` CQL driver) — CQL→Arrow type mapping, streamed paged scans, and projection/limit/partition-key-equality pushdown; keyspace/table discovery helpers used by the `cassandra` catalog in `datafusion-app`
+
 - **`crates/datafusion-auth`**: Authentication implementations
 
 - **`crates/datafusion-ffi-table-providers`**: FFI table provider support
@@ -209,6 +213,7 @@ The project uses extensive feature flags to keep binary size manageable:
 - `s3` - S3 object store integration (default)
 - `functions-parquet` - Parquet-specific functions (default)
 - `functions-json` - JSON functions
+- `cassandra` - Register Cassandra clusters as catalogs
 - `clickhouse` - Register ClickHouse instances as catalogs
 - `mongodb` - Register MongoDB instances as catalogs
 - `deltalake` - Delta Lake table format support

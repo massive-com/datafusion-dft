@@ -142,6 +142,22 @@ options = { auth_source = "admin", sslmode = "disabled" }
 
 See the [Features Guide](features.md) for details.
 
+### Cassandra Catalog Configuration
+
+With the `cassandra` feature enabled, one or more Cassandra (or ScyllaDB) clusters can be registered as catalogs.  All non-system keyspaces (or a single one, if `keyspace` is set) are exposed as schemas with their tables queryable, for example `SELECT * FROM cassandra.my_keyspace.my_table`.
+
+```toml
+[[execution.cassandra]]
+name = "cassandra"                 # catalog name to register (default "cassandra")
+contact_points = ["localhost:9042"]
+# user = "cassandra"               # for clusters with PasswordAuthenticator enabled
+# password = "cassandra"
+# keyspace = "my_keyspace"         # optionally limit the catalog to a single keyspace
+# connection_timeout_ms = 5000     # per-node connection timeout (driver default when unset)
+```
+
+See the [Features Guide](features.md) for details.
+
 And define a custom DDL path like so (the default is `~/.config/dft/ddl.sql`).
 
 ```toml

@@ -67,6 +67,11 @@ pub fn merge_configs(shared: ExecutionConfig, priority: ExecutionConfig) -> Exec
         merged.wasm_udf = priority.wasm_udf
     }
 
+    #[cfg(feature = "cassandra")]
+    if let Some(cassandra) = priority.cassandra {
+        merged.cassandra = Some(cassandra)
+    }
+
     #[cfg(feature = "clickhouse")]
     if let Some(clickhouse) = priority.clickhouse {
         merged.clickhouse = Some(clickhouse)
@@ -100,6 +105,9 @@ pub struct NetConfig {
 pub struct ExecutionConfig {
     #[serde(default)]
     pub object_store: Option<ObjectStoreConfig>,
+    #[cfg(feature = "cassandra")]
+    #[serde(default)]
+    pub cassandra: Option<Vec<CassandraConfig>>,
     #[cfg(feature = "clickhouse")]
     #[serde(default)]
     pub clickhouse: Option<Vec<ClickHouseConfig>>,
@@ -135,6 +143,8 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             object_store: None,
+            #[cfg(feature = "cassandra")]
+            cassandra: None,
             #[cfg(feature = "clickhouse")]
             clickhouse: None,
             #[cfg(feature = "mongodb")]
@@ -262,6 +272,46 @@ impl S3Config {
         }
 
         Ok(builder.build()?)
+    }
+}
+
+#[cfg(feature = "cassandra")]
+fn default_cassandra_catalog_name() -> String {
+    "cassandra".to_string()
+}
+
+/// Connection details for a Cassandra (or ScyllaDB) cluster that is registered as a catalog.
+/// Keyspaces are exposed as schemas and tables (including materialized views) as tables.
+#[cfg(feature = "cassandra")]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CassandraConfig {
+    /// Name of the DataFusion catalog the Cassandra keyspaces and tables are registered under
+    #[serde(default = "default_cassandra_catalog_name")]
+    pub name: String,
+    /// Cluster contact points, each as "host" or "host:port" (default port 9042), for example
+    /// ["localhost:9042"]
+    pub contact_points: Vec<String>,
+    /// Username for clusters with `PasswordAuthenticator` enabled
+    pub user: Option<String>,
+    /// Password for clusters with `PasswordAuthenticator` enabled
+    pub password: Option<String>,
+    /// Limit the catalog to a single keyspace. When unset all non-system keyspaces are
+    /// registered as schemas.
+    pub keyspace: Option<String>,
+    /// Per-node connection timeout in milliseconds (driver default when unset)
+    pub connection_timeout_ms: Option<u64>,
+}
+
+#[cfg(feature = "cassandra")]
+impl CassandraConfig {
+    /// Convert to the connection options expected by [`datafusion_cassandra::connect`]
+    pub fn to_connection_options(&self) -> datafusion_cassandra::CassandraConnectionOptions {
+        datafusion_cassandra::CassandraConnectionOptions {
+            contact_points: self.contact_points.clone(),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            connection_timeout_ms: self.connection_timeout_ms,
+        }
     }
 }
 

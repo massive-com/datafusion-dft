@@ -93,6 +93,7 @@ url = "2.5.2"
 
 # When addding a new feature, also add it to the features tested list in CI (`.github/workflows/test.yml`)
 [features]
+cassandra = ["datafusion-app/cassandra"]
 clickhouse = ["datafusion-app/clickhouse"]
 default = ["functions-parquet", "s3"]
 deltalake = ["datafusion-app/deltalake"]

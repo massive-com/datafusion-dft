@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(feature = "cassandra")]
+pub mod cassandra;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "mongodb")]

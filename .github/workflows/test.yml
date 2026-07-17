@@ -402,6 +402,47 @@ jobs:
       - name: Run MongoDB tests
         run: |
           cargo test --features=mongodb extension_cases::mongodb
+  test-cassandra:
+    name: Extension / Cassandra
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Cache Cargo registry and git
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.cargo
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+      - name: Cache Rust target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            target-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
+            target-${{ runner.os }}-
+      - name: Setup Rust Toolchain
+        uses: ./.github/actions/setup-rust
+      # The tests seed data with `docker exec cassandra cqlsh`, which requires a container
+      # named `cassandra`, so a service container (with a generated name) is not used here
+      # The heap is capped so Cassandra doesn't get OOM-killed on memory-constrained runners
+      - name: Start Cassandra
+        run: |
+          docker run -d --name cassandra -p 9042:9042 \
+            -e MAX_HEAP_SIZE=512M -e HEAP_NEWSIZE=128M \
+            cassandra:5.0
+      # Cassandra can take a couple of minutes to accept connections after starting
+      - name: Wait for Cassandra
+        run: |
+          timeout 300 bash -c 'until docker exec cassandra cqlsh -e "DESCRIBE KEYSPACES" > /dev/null 2>&1; do sleep 5; done'
+      - name: Run Cassandra tests
+        run: |
+          cargo test --manifest-path crates/datafusion-cassandra/Cargo.toml
+          cargo test --features=cassandra extension_cases::cassandra
   test-deltalake:
     name: Extension / Deltalake
     runs-on: ubuntu-latest
