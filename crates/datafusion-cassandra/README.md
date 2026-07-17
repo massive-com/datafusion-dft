@@ -59,10 +59,23 @@ let tables = keyspace_table_names(&session, "my_keyspace"); // includes material
 - **Projection**: only the selected columns are fetched (the generated CQL
   lists columns explicitly).
 - **Limit**: `LIMIT` is pushed into the CQL query.
-- **Filters**: equality predicates that together cover the *full* partition
-  key are pushed down (that is the only `WHERE` shape Cassandra executes
-  without `ALLOW FILTERING`). All other predicates are evaluated by
-  DataFusion after the scan.
+- **Filters**: the `WHERE` shapes Cassandra executes without
+  `ALLOW FILTERING` are pushed down — equality covering the *full* partition
+  key, optionally followed by equality on a prefix of the clustering key and
+  a range (`>`, `>=`, `<`, `<=`) on the next clustering column. For example
+  on `PRIMARY KEY (ticker, timestamp_ms)`, `ticker = 'AAPL' AND timestamp_ms
+  >= 1000 AND timestamp_ms < 2000` runs entirely server-side. All other
+  predicates are evaluated by DataFusion after the scan.
 
 Results are streamed with the driver's transparent paging, so large tables do
 not need to fit in memory on the server side.
+
+## Clusters behind a tunnel
+
+By default the driver connects to the addresses nodes advertise in
+`system.peers`/`system.local`. When the cluster is reached through a tunnel
+(`kubectl port-forward`, an SSH tunnel, NAT, ...) those addresses are not
+reachable and queries fail with `No connections in the pool` even though
+schema discovery works. Set `single_endpoint: true` in
+`CassandraConnectionOptions` to route every node connection through the first
+contact point instead.

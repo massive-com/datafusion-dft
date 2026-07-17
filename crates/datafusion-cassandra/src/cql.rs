@@ -18,10 +18,12 @@
 //! CQL `SELECT` generation: identifier/literal quoting and conversion of
 //! DataFusion filter expressions into CQL predicates.
 //!
-//! Cassandra only allows efficient `WHERE` clauses that constrain the full
-//! partition key, so filter pushdown is limited to equality predicates that
-//! together cover every partition key column. Everything else is left for
-//! DataFusion to evaluate.
+//! Cassandra only executes `WHERE` clauses (without `ALLOW FILTERING`) that
+//! constrain the full partition key with equality, optionally followed by a
+//! prefix of the clustering key: equality on leading clustering columns and
+//! at most one range (lower/upper bound) on the last constrained one.
+//! [`plan_pushdown`] translates exactly that shape; everything else is left
+//! for DataFusion to evaluate after the scan.
 
 use std::collections::HashMap;
 
@@ -67,58 +69,128 @@ fn quote_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// Converts the filters that are equality predicates on partition key
-/// columns into CQL predicates, in partition key order. Returns `None`
-/// unless every partition key column is constrained, because Cassandra
-/// rejects partially constrained partition keys (without `ALLOW FILTERING`).
-pub(crate) fn partition_key_predicates(
-    filters: &[&Expr],
-    partition_key: &[String],
-    column_types: &HashMap<String, ColumnType<'static>>,
-) -> Option<Vec<String>> {
-    let mut by_column: HashMap<&str, String> = HashMap::new();
-    for filter in filters {
-        if let Some((column, predicate)) = filter_to_predicate(filter, partition_key, column_types)
-        {
-            // A second predicate on the same column stays with DataFusion
-            by_column.entry(column).or_insert(predicate);
-        }
-    }
-    partition_key
-        .iter()
-        .map(|column| by_column.get(column.as_str()).cloned())
-        .collect()
+/// The role a predicate plays in a CQL `WHERE` clause
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PredicateKind {
+    Eq,
+    /// `>` or `>=`
+    LowerBound,
+    /// `<` or `<=`
+    UpperBound,
 }
 
-/// Converts `col = literal` (or `literal = col`) on a partition key column
-/// into a CQL predicate, returning the column name and the predicate
-pub(crate) fn filter_to_predicate<'a>(
-    filter: &'a Expr,
+/// A filter translated to a CQL predicate on a single column
+struct Candidate<'a> {
+    column: &'a str,
+    kind: PredicateKind,
+    cql: String,
+}
+
+/// The CQL-pushable subset of a scan's filters
+pub(crate) struct Pushdown {
+    /// CQL predicates, in partition key then clustering key order
+    pub predicates: Vec<String>,
+    /// For each input filter, whether it is fully covered by `predicates`
+    pub pushed: Vec<bool>,
+}
+
+/// Computes the largest CQL-executable `WHERE` clause from the filters:
+/// equality on every partition key column, then equality on a prefix of the
+/// clustering key, then at most one lower and one upper bound on the next
+/// clustering column. Returns no predicates unless the full partition key is
+/// covered, because Cassandra rejects partially constrained partition keys.
+pub(crate) fn plan_pushdown(
+    filters: &[&Expr],
     partition_key: &[String],
+    clustering_key: &[String],
     column_types: &HashMap<String, ColumnType<'static>>,
-) -> Option<(&'a str, String)> {
+) -> Pushdown {
+    let candidates: Vec<Option<Candidate>> = filters
+        .iter()
+        .map(|f| filter_to_candidate(f, column_types))
+        .collect();
+    let mut pushed = vec![false; filters.len()];
+    let mut predicates = Vec::new();
+
+    // Find the first unused candidate on `column` of kind `kind`
+    let find = |pushed: &[bool], column: &str, kind: PredicateKind| -> Option<usize> {
+        candidates.iter().enumerate().position(|(i, c)| {
+            !pushed[i]
+                && c.as_ref()
+                    .is_some_and(|c| c.column == column && c.kind == kind)
+        })
+    };
+
+    // Every partition key column must have an equality predicate
+    for pk_column in partition_key {
+        match find(&pushed, pk_column, PredicateKind::Eq) {
+            Some(i) => {
+                predicates.push(candidates[i].as_ref().unwrap().cql.clone());
+                pushed[i] = true;
+            }
+            None => {
+                return Pushdown {
+                    predicates: Vec::new(),
+                    pushed: vec![false; filters.len()],
+                }
+            }
+        }
+    }
+
+    // Clustering key prefix: equality continues the walk, a range (or no
+    // constraint) ends it
+    for ck_column in clustering_key {
+        if let Some(i) = find(&pushed, ck_column, PredicateKind::Eq) {
+            predicates.push(candidates[i].as_ref().unwrap().cql.clone());
+            pushed[i] = true;
+            continue;
+        }
+        if let Some(i) = find(&pushed, ck_column, PredicateKind::LowerBound) {
+            predicates.push(candidates[i].as_ref().unwrap().cql.clone());
+            pushed[i] = true;
+        }
+        if let Some(i) = find(&pushed, ck_column, PredicateKind::UpperBound) {
+            predicates.push(candidates[i].as_ref().unwrap().cql.clone());
+            pushed[i] = true;
+        }
+        break;
+    }
+
+    Pushdown { predicates, pushed }
+}
+
+/// Converts `col OP literal` (or `literal OP col`) into a CQL predicate
+/// candidate, for operators and literal types CQL can execute
+fn filter_to_candidate<'a>(
+    filter: &'a Expr,
+    column_types: &HashMap<String, ColumnType<'static>>,
+) -> Option<Candidate<'a>> {
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter else {
         return None;
     };
-    if *op != Operator::Eq {
-        return None;
-    }
-    let (column, literal) = match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(c), Expr::Literal(v, _)) => (c, v),
-        (Expr::Literal(v, _), Expr::Column(c)) => (c, v),
+    let (column, literal, op) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(c), Expr::Literal(v, _)) => (c, v, *op),
+        // `literal OP column` is equivalent to `column swapped-OP literal`
+        (Expr::Literal(v, _), Expr::Column(c)) => (c, v, op.swap()?),
         _ => return None,
     };
-    if !partition_key.iter().any(|pk| pk == &column.name) {
-        return None;
-    }
+    let (kind, cql_op) = match op {
+        Operator::Eq => (PredicateKind::Eq, "="),
+        Operator::Gt => (PredicateKind::LowerBound, ">"),
+        Operator::GtEq => (PredicateKind::LowerBound, ">="),
+        Operator::Lt => (PredicateKind::UpperBound, "<"),
+        Operator::LtEq => (PredicateKind::UpperBound, "<="),
+        _ => return None,
+    };
     let ColumnType::Native(native) = column_types.get(&column.name)? else {
         return None;
     };
     let rendered = literal_to_cql(literal, native)?;
-    Some((
-        column.name.as_str(),
-        format!("{} = {rendered}", quote_ident(&column.name)),
-    ))
+    Some(Candidate {
+        column: column.name.as_str(),
+        kind,
+        cql: format!("{} {cql_op} {rendered}", quote_ident(&column.name)),
+    })
 }
 
 /// Renders a DataFusion literal as a CQL literal, only for combinations
@@ -134,6 +206,10 @@ fn literal_to_cql(value: &ScalarValue, column_type: &NativeType) -> Option<Strin
         (NativeType::Boolean, ScalarValue::Boolean(Some(b))) => Some(b.to_string()),
         (NativeType::TinyInt | NativeType::SmallInt | NativeType::Int | NativeType::BigInt, _) => {
             integer_literal(value)
+        }
+        // CQL accepts integer literals (milliseconds since epoch) for timestamps
+        (NativeType::Timestamp, ScalarValue::TimestampMillisecond(Some(ms), _)) => {
+            Some(ms.to_string())
         }
         _ => None,
     }
@@ -158,11 +234,24 @@ mod tests {
     use super::*;
     use datafusion::prelude::{col, lit};
 
-    fn text_pk_types() -> HashMap<String, ColumnType<'static>> {
+    fn minute_aggs_types() -> HashMap<String, ColumnType<'static>> {
         HashMap::from([
-            ("id".to_string(), ColumnType::Native(NativeType::Int)),
-            ("name".to_string(), ColumnType::Native(NativeType::Text)),
+            ("ticker".to_string(), ColumnType::Native(NativeType::Text)),
+            (
+                "timestamp_ms".to_string(),
+                ColumnType::Native(NativeType::BigInt),
+            ),
+            ("seq".to_string(), ColumnType::Native(NativeType::Int)),
+            ("close".to_string(), ColumnType::Native(NativeType::Double)),
         ])
+    }
+
+    fn pk() -> Vec<String> {
+        vec!["ticker".to_string()]
+    }
+
+    fn ck() -> Vec<String> {
+        vec!["timestamp_ms".to_string()]
     }
 
     #[test]
@@ -203,47 +292,133 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_to_predicate_eq() {
-        let pk = vec!["id".to_string()];
-        let types = text_pk_types();
-        let filter = col("id").eq(lit(5i32));
-        let (column, predicate) = filter_to_predicate(&filter, &pk, &types).unwrap();
-        assert_eq!(column, "id");
-        assert_eq!(predicate, r#""id" = 5"#);
+    fn test_partition_key_eq_pushdown() {
+        let f = col("ticker").eq(lit("C:EUR-QAR"));
+        let plan = plan_pushdown(&[&f], &pk(), &ck(), &minute_aggs_types());
+        assert_eq!(plan.predicates, vec![r#""ticker" = 'C:EUR-QAR'"#]);
+        assert_eq!(plan.pushed, vec![true]);
     }
 
     #[test]
-    fn test_filter_to_predicate_reversed_and_string() {
-        let pk = vec!["name".to_string()];
-        let types = text_pk_types();
-        let filter = lit("o'brien").eq(col("name"));
-        let (_, predicate) = filter_to_predicate(&filter, &pk, &types).unwrap();
-        assert_eq!(predicate, r#""name" = 'o''brien'"#);
+    fn test_reversed_literal_eq() {
+        let f = lit("o'brien").eq(col("ticker"));
+        let plan = plan_pushdown(&[&f], &pk(), &ck(), &minute_aggs_types());
+        assert_eq!(plan.predicates, vec![r#""ticker" = 'o''brien'"#]);
     }
 
     #[test]
-    fn test_filter_to_predicate_rejects_non_pk_and_non_eq() {
-        let pk = vec!["id".to_string()];
-        let types = text_pk_types();
-        assert!(filter_to_predicate(&col("other").eq(lit(1)), &pk, &types).is_none());
-        assert!(filter_to_predicate(&col("id").gt(lit(1)), &pk, &types).is_none());
+    fn test_clustering_range_pushdown() {
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let f2 = col("timestamp_ms").gt_eq(lit(1_000i64));
+        let f3 = col("timestamp_ms").lt(lit(2_000i64));
+        let plan = plan_pushdown(&[&f1, &f2, &f3], &pk(), &ck(), &minute_aggs_types());
+        assert_eq!(
+            plan.predicates,
+            vec![
+                r#""ticker" = 'AAPL'"#,
+                r#""timestamp_ms" >= 1000"#,
+                r#""timestamp_ms" < 2000"#,
+            ]
+        );
+        assert_eq!(plan.pushed, vec![true, true, true]);
     }
 
     #[test]
-    fn test_partition_key_predicates_full_coverage() {
-        let pk = vec!["id".to_string(), "name".to_string()];
-        let types = text_pk_types();
-        let f1 = col("id").eq(lit(1i32));
-        let f2 = col("name").eq(lit("alice"));
-        let predicates = partition_key_predicates(&[&f1, &f2], &pk, &types).unwrap();
-        assert_eq!(predicates, vec![r#""id" = 1"#, r#""name" = 'alice'"#]);
+    fn test_reversed_range_swaps_operator() {
+        // 1000 <= timestamp_ms is a lower bound on the column
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let f2 = lit(1_000i64).lt_eq(col("timestamp_ms"));
+        let plan = plan_pushdown(&[&f1, &f2], &pk(), &ck(), &minute_aggs_types());
+        assert_eq!(
+            plan.predicates,
+            vec![r#""ticker" = 'AAPL'"#, r#""timestamp_ms" >= 1000"#]
+        );
     }
 
     #[test]
-    fn test_partition_key_predicates_partial_coverage() {
-        let pk = vec!["id".to_string(), "name".to_string()];
-        let types = text_pk_types();
-        let f1 = col("id").eq(lit(1i32));
-        assert!(partition_key_predicates(&[&f1], &pk, &types).is_none());
+    fn test_range_without_partition_key_not_pushed() {
+        // Cassandra rejects clustering restrictions without the partition key
+        let f = col("timestamp_ms").gt(lit(1_000i64));
+        let plan = plan_pushdown(&[&f], &pk(), &ck(), &minute_aggs_types());
+        assert!(plan.predicates.is_empty());
+        assert_eq!(plan.pushed, vec![false]);
+    }
+
+    #[test]
+    fn test_regular_column_filter_not_pushed() {
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let f2 = col("close").gt(lit(10.0f64));
+        let plan = plan_pushdown(&[&f1, &f2], &pk(), &ck(), &minute_aggs_types());
+        assert_eq!(plan.predicates, vec![r#""ticker" = 'AAPL'"#]);
+        assert_eq!(plan.pushed, vec![true, false]);
+    }
+
+    #[test]
+    fn test_clustering_prefix_gap_stops_walk() {
+        // Range on the second clustering column without constraining the
+        // first cannot be pushed
+        let two_ck = vec!["timestamp_ms".to_string(), "seq".to_string()];
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let f2 = col("seq").gt(lit(5i32));
+        let plan = plan_pushdown(&[&f1, &f2], &pk(), &two_ck, &minute_aggs_types());
+        assert_eq!(plan.predicates, vec![r#""ticker" = 'AAPL'"#]);
+        assert_eq!(plan.pushed, vec![true, false]);
+    }
+
+    #[test]
+    fn test_clustering_eq_continues_walk() {
+        let two_ck = vec!["timestamp_ms".to_string(), "seq".to_string()];
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let f2 = col("timestamp_ms").eq(lit(1_000i64));
+        let f3 = col("seq").gt(lit(5i32));
+        let plan = plan_pushdown(&[&f1, &f2, &f3], &pk(), &two_ck, &minute_aggs_types());
+        assert_eq!(
+            plan.predicates,
+            vec![
+                r#""ticker" = 'AAPL'"#,
+                r#""timestamp_ms" = 1000"#,
+                r#""seq" > 5"#,
+            ]
+        );
+        assert_eq!(plan.pushed, vec![true, true, true]);
+    }
+
+    #[test]
+    fn test_range_stops_walk_before_next_column() {
+        // After a range on timestamp_ms, seq cannot be constrained in CQL
+        let two_ck = vec!["timestamp_ms".to_string(), "seq".to_string()];
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let f2 = col("timestamp_ms").gt(lit(1_000i64));
+        let f3 = col("seq").eq(lit(5i32));
+        let plan = plan_pushdown(&[&f1, &f2, &f3], &pk(), &two_ck, &minute_aggs_types());
+        assert_eq!(
+            plan.predicates,
+            vec![r#""ticker" = 'AAPL'"#, r#""timestamp_ms" > 1000"#]
+        );
+        assert_eq!(plan.pushed, vec![true, true, false]);
+    }
+
+    #[test]
+    fn test_duplicate_bounds_only_one_pushed() {
+        // Two lower bounds on the same column: CQL rejects duplicates, so the
+        // second stays with DataFusion
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let f2 = col("timestamp_ms").gt(lit(1_000i64));
+        let f3 = col("timestamp_ms").gt(lit(500i64));
+        let plan = plan_pushdown(&[&f1, &f2, &f3], &pk(), &ck(), &minute_aggs_types());
+        assert_eq!(
+            plan.predicates,
+            vec![r#""ticker" = 'AAPL'"#, r#""timestamp_ms" > 1000"#]
+        );
+        assert_eq!(plan.pushed, vec![true, true, false]);
+    }
+
+    #[test]
+    fn test_partial_partition_key_not_pushed() {
+        let two_pk = vec!["ticker".to_string(), "seq".to_string()];
+        let f1 = col("ticker").eq(lit("AAPL"));
+        let plan = plan_pushdown(&[&f1], &two_pk, &ck(), &minute_aggs_types());
+        assert!(plan.predicates.is_empty());
+        assert_eq!(plan.pushed, vec![false]);
     }
 }

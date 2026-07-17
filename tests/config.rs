@@ -149,6 +149,7 @@ impl TestConfigBuilder {
     }
 
     #[cfg(feature = "cassandra")]
+    #[allow(clippy::too_many_arguments)]
     pub fn with_cassandra(
         &mut self,
         app: &str,
@@ -157,6 +158,7 @@ impl TestConfigBuilder {
         user: Option<&str>,
         password: Option<&str>,
         keyspace: Option<&str>,
+        single_endpoint: bool,
     ) -> &mut Self {
         self.config_text
             .push_str(&format!("[[{app}.execution.cassandra]]\n"));
@@ -174,6 +176,9 @@ impl TestConfigBuilder {
         if let Some(keyspace) = keyspace {
             self.config_text
                 .push_str(&format!("keyspace = '{}'\n", keyspace));
+        }
+        if single_endpoint {
+            self.config_text.push_str("single_endpoint = true\n");
         }
         self
     }

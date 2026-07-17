@@ -300,6 +300,12 @@ pub struct CassandraConfig {
     pub keyspace: Option<String>,
     /// Per-node connection timeout in milliseconds (driver default when unset)
     pub connection_timeout_ms: Option<u64>,
+    /// Route every node connection through the first contact point instead of the addresses
+    /// the nodes advertise. Needed when the cluster is reached through a tunnel
+    /// (`kubectl port-forward`, SSH tunnel, NAT, ...) and the advertised addresses are not
+    /// reachable from this machine.
+    #[serde(default)]
+    pub single_endpoint: bool,
 }
 
 #[cfg(feature = "cassandra")]
@@ -311,6 +317,7 @@ impl CassandraConfig {
             user: self.user.clone(),
             password: self.password.clone(),
             connection_timeout_ms: self.connection_timeout_ms,
+            single_endpoint: self.single_endpoint,
         }
     }
 }

@@ -17,11 +17,16 @@
 
 //! Building a Cassandra [`Session`] from connection options
 
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use datafusion::common::{DataFusionError, Result};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::errors::TranslationError;
+use scylla::policies::address_translator::{AddressTranslator, UntranslatedPeer};
 
 /// Options for connecting to a Cassandra cluster
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -34,6 +39,51 @@ pub struct CassandraConnectionOptions {
     pub password: Option<String>,
     /// Per-node connection timeout in milliseconds (driver default if unset)
     pub connection_timeout_ms: Option<u64>,
+    /// Route every node connection through the first contact point instead of
+    /// the addresses the nodes advertise. Needed when the cluster is reached
+    /// through a tunnel (`kubectl port-forward`, SSH tunnel, NAT, ...) and the
+    /// advertised addresses are not reachable from this machine.
+    pub single_endpoint: bool,
+}
+
+/// Translates every node address to one fixed endpoint, for clusters reached
+/// through a tunnel where advertised node addresses are unreachable
+#[derive(Debug)]
+struct FixedAddressTranslator {
+    address: SocketAddr,
+}
+
+#[async_trait]
+impl AddressTranslator for FixedAddressTranslator {
+    async fn translate_address(
+        &self,
+        _untranslated_peer: &UntranslatedPeer,
+    ) -> std::result::Result<SocketAddr, TranslationError> {
+        Ok(self.address)
+    }
+}
+
+/// Resolves a `host` or `host:port` contact point to a socket address,
+/// defaulting to port 9042
+fn resolve_contact_point(contact_point: &str) -> Result<SocketAddr> {
+    let with_port = if contact_point.contains(':') {
+        contact_point.to_string()
+    } else {
+        format!("{contact_point}:9042")
+    };
+    with_port
+        .to_socket_addrs()
+        .map_err(|e| {
+            DataFusionError::Configuration(format!(
+                "Failed to resolve Cassandra contact point '{contact_point}': {e}"
+            ))
+        })?
+        .next()
+        .ok_or_else(|| {
+            DataFusionError::Configuration(format!(
+                "Cassandra contact point '{contact_point}' resolved to no addresses"
+            ))
+        })
 }
 
 /// Connects to a Cassandra cluster and fetches its schema metadata
@@ -50,8 +100,34 @@ pub async fn connect(options: &CassandraConnectionOptions) -> Result<Session> {
     if let Some(timeout_ms) = options.connection_timeout_ms {
         builder = builder.connection_timeout(Duration::from_millis(timeout_ms));
     }
+    if options.single_endpoint {
+        let address = resolve_contact_point(&options.contact_points[0])?;
+        builder = builder.address_translator(Arc::new(FixedAddressTranslator { address }));
+    }
     builder
         .build()
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_contact_point_with_port() {
+        let addr = resolve_contact_point("127.0.0.1:9043").unwrap();
+        assert_eq!(addr.port(), 9043);
+    }
+
+    #[test]
+    fn test_resolve_contact_point_default_port() {
+        let addr = resolve_contact_point("127.0.0.1").unwrap();
+        assert_eq!(addr.port(), 9042);
+    }
+
+    #[test]
+    fn test_resolve_contact_point_invalid() {
+        assert!(resolve_contact_point("no-such-host.invalid:9042").is_err());
+    }
 }

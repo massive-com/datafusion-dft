@@ -154,6 +154,9 @@ contact_points = ["localhost:9042"]
 # password = "cassandra"
 # keyspace = "my_keyspace"         # optionally limit the catalog to a single keyspace
 # connection_timeout_ms = 5000     # per-node connection timeout (driver default when unset)
+# single_endpoint = true           # route all node connections through the first contact
+                                   # point; required when the cluster is reached through a
+                                   # tunnel (kubectl port-forward, SSH tunnel, NAT, ...)
 ```
 
 See the [Features Guide](features.md) for details.

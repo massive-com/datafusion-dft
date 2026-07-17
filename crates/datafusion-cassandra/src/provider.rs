@@ -33,7 +33,7 @@ use scylla::client::session::Session;
 use scylla::cluster::metadata::{ColumnKind, Table};
 use scylla::frame::response::result::ColumnType;
 
-use crate::cql::{build_select, filter_to_predicate, partition_key_predicates};
+use crate::cql::{build_select, plan_pushdown};
 use crate::exec::CassandraExec;
 use crate::metadata::table_metadata;
 use crate::types::cql_type_to_arrow;
@@ -50,6 +50,7 @@ pub struct CassandraTable {
     columns: Vec<String>,
     schema: SchemaRef,
     partition_key: Vec<String>,
+    clustering_key: Vec<String>,
     column_types: HashMap<String, ColumnType<'static>>,
 }
 
@@ -82,6 +83,7 @@ impl CassandraTable {
             columns,
             schema: Arc::new(Schema::new(fields)),
             partition_key: meta.partition_key,
+            clustering_key: meta.clustering_key,
             column_types,
         })
     }
@@ -121,25 +123,20 @@ impl TableProvider for CassandraTable {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // Pushdown is all-or-nothing: CQL only accepts a WHERE clause that
-        // constrains the complete partition key
-        if partition_key_predicates(filters, &self.partition_key, &self.column_types).is_none() {
-            return Ok(vec![
-                TableProviderFilterPushDown::Unsupported;
-                filters.len()
-            ]);
-        }
-        let mut seen: Vec<&str> = Vec::new();
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                match filter_to_predicate(filter, &self.partition_key, &self.column_types) {
-                    // Only the first predicate per column is pushed down
-                    Some((column, _)) if !seen.contains(&column) => {
-                        seen.push(column);
-                        TableProviderFilterPushDown::Exact
-                    }
-                    _ => TableProviderFilterPushDown::Unsupported,
+        let plan = plan_pushdown(
+            filters,
+            &self.partition_key,
+            &self.clustering_key,
+            &self.column_types,
+        );
+        Ok(plan
+            .pushed
+            .into_iter()
+            .map(|pushed| {
+                if pushed {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
                 }
             })
             .collect())
@@ -164,9 +161,13 @@ impl TableProvider for CassandraTable {
             select_columns.push(self.columns[0].clone());
         }
         let filter_refs: Vec<&Expr> = filters.iter().collect();
-        let predicates =
-            partition_key_predicates(&filter_refs, &self.partition_key, &self.column_types)
-                .unwrap_or_default();
+        let predicates = plan_pushdown(
+            &filter_refs,
+            &self.partition_key,
+            &self.clustering_key,
+            &self.column_types,
+        )
+        .predicates;
         let cql = build_select(
             &self.keyspace,
             &self.name,

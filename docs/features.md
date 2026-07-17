@@ -266,7 +266,10 @@ contact_points = ["localhost:9042"]
 # password = "cassandra"
 # keyspace = "my_keyspace"         # optionally limit the catalog to a single keyspace
 # connection_timeout_ms = 5000     # per-node connection timeout (driver default when unset)
+# single_endpoint = true           # see below: clusters reached through a tunnel
 ```
+
+If the cluster is reached through a tunnel (`kubectl port-forward`, an SSH tunnel, NAT, ...), set `single_endpoint = true`.  Without it the driver connects to the addresses the nodes advertise (for example Kubernetes pod IPs), which are not reachable from outside the cluster network — the catalog registers (metadata flows over the tunnel) but queries fail with `No connections in the pool: The pool is broken; Last connection failed with: Connect timeout elapsed`.  With `single_endpoint = true` every node connection is routed through the first contact point instead.
 
 And then query with:
 
@@ -276,7 +279,7 @@ SELECT * FROM cassandra.my_keyspace.my_table
 
 Multiple `[[execution.cassandra]]` entries can be defined, each registered as its own catalog.  Keyspaces and table names are discovered once at startup from the cluster's schema metadata; the data itself is queried from Cassandra on demand with paging.
 
-Projection and `LIMIT` are pushed into the generated CQL, as are equality filters that cover the full partition key (the only `WHERE` shape Cassandra executes without `ALLOW FILTERING`).  All other predicates are evaluated by DataFusion after the scan.  Scalar CQL types map to their natural Arrow equivalents; types without one (`uuid`, `inet`, `decimal`, `varint`, `duration`, `map`, `tuple`, UDTs) are rendered as strings.
+Projection and `LIMIT` are pushed into the generated CQL, as are the filters Cassandra executes without `ALLOW FILTERING`: equality on the full partition key, optionally followed by equality on a prefix of the clustering key and a range (`>`, `>=`, `<`, `<=`) on the next clustering column.  For example on a table with `PRIMARY KEY (ticker, timestamp_ms)`, `WHERE ticker = 'AAPL' AND timestamp_ms >= 1752500000000 AND timestamp_ms < 1752700000000` runs entirely server-side.  All other predicates are evaluated by DataFusion after the scan.  Scalar CQL types map to their natural Arrow equivalents; types without one (`uuid`, `inet`, `decimal`, `varint`, `duration`, `map`, `tuple`, UDTs) are rendered as strings.
 
 ### Json Functions (`--features=function-json`)
 

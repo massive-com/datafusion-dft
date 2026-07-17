@@ -72,6 +72,7 @@ fn cassandra_config(keyspace: Option<&str>) -> crate::config::TestConfig {
         None,
         None,
         keyspace,
+        false,
     );
     config_builder.build("my_config.toml")
 }
@@ -107,6 +108,30 @@ fn test_cassandra_config_parsing() {
     assert_eq!(options.user, None);
     assert_eq!(options.password, None);
     assert_eq!(options.connection_timeout_ms, None);
+    assert!(!options.single_endpoint);
+}
+
+#[test]
+fn test_cassandra_config_parsing_single_endpoint() {
+    let mut config_builder = TestConfigBuilder::default();
+    config_builder.with_cassandra(
+        "cli",
+        "cassandra",
+        &[CASSANDRA_CONTACT_POINT],
+        None,
+        None,
+        None,
+        true,
+    );
+    let config = config_builder.build("my_config.toml");
+    let app_config = datafusion_dft::config::create_config(config.path, &[]);
+    let cassandra_configs = app_config
+        .cli
+        .execution
+        .cassandra
+        .expect("Cassandra config missing");
+    assert!(cassandra_configs[0].single_endpoint);
+    assert!(cassandra_configs[0].to_connection_options().single_endpoint);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -183,6 +208,44 @@ async fn test_cassandra_filter_and_limit() {
 +------+
 | bob  |
 +------+
+"#;
+
+    assert.stdout(contains_str(expected));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cassandra_clustering_range_pushdown() {
+    cassandra_exec(
+        "CREATE KEYSPACE IF NOT EXISTS dft_cassandra_range WITH replication = \
+         {'class': 'SimpleStrategy', 'replication_factor': 1}; \
+         DROP TABLE IF EXISTS dft_cassandra_range.ticks; \
+         CREATE TABLE dft_cassandra_range.ticks \
+         (id int, seq bigint, val text, PRIMARY KEY (id, seq)); \
+         INSERT INTO dft_cassandra_range.ticks (id, seq, val) VALUES (1, 1, 'a'); \
+         INSERT INTO dft_cassandra_range.ticks (id, seq, val) VALUES (1, 2, 'b'); \
+         INSERT INTO dft_cassandra_range.ticks (id, seq, val) VALUES (1, 3, 'c');",
+    );
+    let config = cassandra_config(Some("dft_cassandra_range"));
+
+    // Partition key equality plus a clustering key range is pushed down to CQL
+    let assert = Command::cargo_bin("dft")
+        .unwrap()
+        .arg("--config")
+        .arg(config.path)
+        .arg("-c")
+        .arg(
+            "SELECT seq, val FROM cassandra.dft_cassandra_range.ticks \
+             WHERE id = 1 AND seq >= 2 AND seq < 3",
+        )
+        .assert()
+        .success();
+
+    let expected = r#"
++-----+-----+
+| seq | val |
++-----+-----+
+| 2   | b   |
++-----+-----+
 "#;
 
     assert.stdout(contains_str(expected));

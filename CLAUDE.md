@@ -174,7 +174,7 @@ The project is organized as a workspace with multiple crates:
 
 - **`crates/datafusion-net`**: Network packet capture querying — `pcap` (capture files), `capture` (live capture), `interfaces` (list capture devices), and `tcp_conversations` (per-connection TCP flow analytics) table functions (`capture`/`interfaces` behind its `live` feature); the `reverse_dns` (IP → hostname via PTR lookup) and `geoip` (IP → location via MaxMind `.mmdb` database) scalar UDFs; the `dns_query` and `tls_sni` payload-decoding scalar UDFs; and `pcap_wide` / `capture_wide` variants that append DNS and geolocation enrichment columns
 
-- **`crates/datafusion-cassandra`**: DataFusion `TableProvider` for Apache Cassandra/ScyllaDB (built on the `scylla` CQL driver) — CQL→Arrow type mapping, streamed paged scans, and projection/limit/partition-key-equality pushdown; keyspace/table discovery helpers used by the `cassandra` catalog in `datafusion-app`
+- **`crates/datafusion-cassandra`**: DataFusion `TableProvider` for Apache Cassandra/ScyllaDB (built on the `scylla` CQL driver) — CQL→Arrow type mapping, streamed paged scans, and projection/limit/filter pushdown (partition-key equality plus clustering-key prefix equality and ranges); keyspace/table discovery helpers used by the `cassandra` catalog in `datafusion-app`
 
 - **`crates/datafusion-auth`**: Authentication implementations
 
