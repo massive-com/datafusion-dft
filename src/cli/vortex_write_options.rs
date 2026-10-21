@@ -32,12 +32,13 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use vortex::array::session::ArraySessionExt;
-use vortex::array::ArrayId;
+use vortex::array::{ArrayId, ArrayRef, Canonical, ExecutionCtx};
 use vortex::compressor::{
-    BtrBlocksCompressor, BtrBlocksCompressorBuilder, CompressionSessionExt, Scheme, SchemeId,
+    BtrBlocksCompressor, BtrBlocksCompressorBuilder, CompressionSessionExt, Scheme,
 };
 use vortex::dtype::FieldPath;
 use vortex::editions::{ComponentKind, EditionSessionExt};
+use vortex::error::VortexResult;
 use vortex::layout::layouts::buffered::BufferedStrategy;
 use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex::layout::layouts::collect::CollectStrategy;
@@ -51,8 +52,11 @@ use vortex::layout::layouts::table::TableStrategy;
 use vortex::layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
 use vortex::layout::{LayoutStrategy, VTable};
 use vortex::VortexSessionDefault;
-use vortex_btrblocks::schemes::{binary, integer};
-use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::integer;
+use vortex_btrblocks::{
+    ArrayAndStats, CascadingCompressor, CompressorContext, GenerateStatsOptions, SchemeExt,
+};
+use vortex_compressor::scheme::{AncestorExclusion, CompressionEstimate, DescendantExclusion};
 use vortex_session::VortexSession;
 
 /// Default row block size. Matches `vortex_file::WriteStrategyBuilder`.
@@ -193,11 +197,12 @@ impl VortexWriteConfig {
             BtrBlocksCompressorBuilder::from_session(session)
         };
         let stats_compressor: Arc<dyn CompressorPlugin> = Arc::new(base.clone().build());
-        let default_data_compressor: Arc<dyn CompressorPlugin> = Arc::new(
-            base.clone()
-                .exclude_schemes([integer::IntDictScheme.id()])
-                .build(),
-        );
+        let adaptive_data_compressor = base
+            .clone()
+            .exclude_schemes([integer::IntDictScheme.id()])
+            .build();
+        let default_data_compressor: Arc<dyn CompressorPlugin> =
+            Arc::new(adaptive_data_compressor.clone());
 
         let row_block_size = NonZeroUsize::new(self.row_block_size)
             .ok_or_else(|| eyre!("row_block_size must be greater than zero"))?;
@@ -230,7 +235,7 @@ impl VortexWriteConfig {
                 Some(raw) => {
                     let scheme = resolve_scheme(raw, kind, &column.name)?;
                     check_writable(scheme, &column.name, &writable)?;
-                    Arc::new(override_compressor(scheme, session))
+                    override_compressor(scheme.refine(&writable), adaptive_data_compressor.clone())
                 }
                 None => Arc::clone(&default_data_compressor),
             };
@@ -333,30 +338,90 @@ fn check_writable(
     ))
 }
 
-/// Build a compressor that may only use `scheme`.
+/// Build a compressor that encodes each chunk of a column with `scheme`.
 ///
-/// Starting from the session, rather than `BtrBlocksCompressorBuilder::empty`, restricts the
-/// scheme to the encodings the session's editions permit, so a scheme with several wire formats
-/// (bitpacking, FoR, decimal byte parts) picks one the writer accepts. Presets only exclude
-/// schemes: compact keeps every scheme except buffer-level Zstd, which only the CUDA preset keeps.
+/// `scheme` is forced at the top of the column only. Its children (FoR's residuals, the integer
+/// part of decimal byte parts) are compressed by `adaptive`, the column's default compressor, as
+/// they would be had BtrBlocks picked `scheme` itself. A chunk `scheme` declines (FoR skips values
+/// that bit-pack as narrowly) or cannot shrink is compressed by `adaptive` instead of being stored
+/// uncompressed.
 fn override_compressor(
     scheme: &'static dyn Scheme,
-    session: &VortexSession,
-) -> BtrBlocksCompressor {
-    let others: Vec<SchemeId> = session
-        .compression()
-        .schemes()
-        .iter()
-        .map(|other| other.id())
-        .filter(|id| *id != scheme.id())
-        .collect();
-    let builder = BtrBlocksCompressorBuilder::from_session(session);
-    let builder = if scheme.id() == binary::ZstdBuffersScheme.id() {
-        builder.only_cuda_compatible()
-    } else {
-        builder.with_compact()
-    };
-    builder.exclude_schemes(others).build()
+    adaptive: BtrBlocksCompressor,
+) -> Arc<dyn CompressorPlugin> {
+    // `CascadingCompressor` takes `&'static` schemes, so one is leaked per overridden column.
+    let forced: &'static ForcedScheme = Box::leak(Box::new(ForcedScheme {
+        inner: scheme,
+        children: adaptive.0.clone(),
+    }));
+    let root = CascadingCompressor::new(vec![forced]);
+    Arc::new(
+        move |chunk: &ArrayRef, ctx: &mut ExecutionCtx| -> VortexResult<ArrayRef> {
+            let compressed = root.compress(chunk, ctx)?;
+            if compressed.is_canonical() {
+                return adaptive.compress(chunk, ctx);
+            }
+            Ok(compressed)
+        },
+    )
+}
+
+/// `inner`, compressing its children with `children` rather than the compressor that chose it.
+#[derive(Debug)]
+struct ForcedScheme {
+    inner: &'static dyn Scheme,
+    children: CascadingCompressor,
+}
+
+impl Scheme for ForcedScheme {
+    fn scheme_name(&self) -> &'static str {
+        self.inner.scheme_name()
+    }
+
+    fn matches(&self, canonical: &Canonical) -> bool {
+        self.inner.matches(canonical)
+    }
+
+    fn produced_encodings(&self) -> Vec<ArrayId> {
+        self.inner.produced_encodings()
+    }
+
+    fn stats_options(&self) -> GenerateStatsOptions {
+        self.inner.stats_options()
+    }
+
+    fn num_children(&self) -> usize {
+        self.inner.num_children()
+    }
+
+    fn descendant_exclusions(&self) -> Vec<DescendantExclusion> {
+        self.inner.descendant_exclusions()
+    }
+
+    fn ancestor_exclusions(&self) -> Vec<AncestorExclusion> {
+        self.inner.ancestor_exclusions()
+    }
+
+    fn expected_compression_ratio(
+        &self,
+        data: &ArrayAndStats,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> CompressionEstimate {
+        self.inner
+            .expected_compression_ratio(data, compress_ctx, exec_ctx)
+    }
+
+    fn compress(
+        &self,
+        _compressor: &CascadingCompressor,
+        data: &ArrayAndStats,
+        compress_ctx: CompressorContext,
+        exec_ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ArrayRef> {
+        self.inner
+            .compress(&self.children, data, compress_ctx, exec_ctx)
+    }
 }
 
 /// Compose the leaf pipeline used for a single column.
@@ -618,7 +683,6 @@ mod tests {
     };
     use datafusion::arrow::datatypes::Field;
     use futures::StreamExt;
-    use vortex::array::ArrayRef;
     use vortex::arrow::ArrowSessionExt;
     use vortex::file::OpenOptionsSessionExt;
     use vortex_file::VortexWriteOptions;
@@ -632,16 +696,9 @@ mod tests {
             .collect()
     }
 
-    fn collect_encoding_ids(array: &ArrayRef, ids: &mut Vec<String>) {
-        ids.push(array.encoding_id().to_string());
-        for child in array.children() {
-            collect_encoding_ids(&child, ids);
-        }
-    }
-
-    /// Write `column` as column `c` with an override to `encoding`, then return the encoding IDs
-    /// of every array read back from the file.
-    async fn written_encodings(column: ArrowArrayRef, encoding: &str) -> Vec<String> {
+    /// Write `column` as column `c` with an override to `encoding`, then return the chunks of `c`
+    /// read back from the file.
+    async fn written_chunks(column: ArrowArrayRef, encoding: &str) -> Vec<ArrayRef> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "c",
             column.data_type().clone(),
@@ -669,24 +726,44 @@ mod tests {
 
         let file = session.open_options().open_buffer(buffer).unwrap();
         let mut stream = file.scan().unwrap().into_array_stream().unwrap();
-        let mut ids = Vec::new();
+        let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            collect_encoding_ids(&chunk.unwrap(), &mut ids);
+            let (_, column) = chunk
+                .unwrap()
+                .named_children()
+                .into_iter()
+                .find(|(name, _)| name == "c")
+                .expect("chunk has column c");
+            chunks.push(column);
         }
-        ids
+        chunks
     }
 
-    /// Arrays read back report their in-memory encoding ID, which is the newest wire format's ID
-    /// (for example `fastlanes.bitpacked.v2`) even when the file stores an older one, so this
-    /// matches the encoding family. The write itself only succeeds when every serialized ID is in
+    /// Whether `array` is encoded with `family`. Arrays read back report their in-memory encoding
+    /// ID, which is the newest wire format's ID (for example `fastlanes.bitpacked.v2`) even when
+    /// the file stores an older one. The write itself only succeeds when every serialized ID is in
     /// the enabled editions.
-    async fn assert_written_with(column: ArrowArrayRef, encoding: &str, family: &str) {
-        let ids = written_encodings(column, encoding).await;
-        assert!(
-            ids.iter()
-                .any(|id| id == family || id.starts_with(&format!("{family}."))),
-            "expected {family} for encoding '{encoding}', got {ids:?}"
-        );
+    fn is_family(array: &ArrayRef, family: &str) -> bool {
+        let id = array.encoding_id().to_string();
+        id == family || id.starts_with(&format!("{family}."))
+    }
+
+    /// Assert that `encoding` encodes the top of every chunk, and return the chunks.
+    async fn assert_written_with(
+        column: ArrowArrayRef,
+        encoding: &str,
+        family: &str,
+    ) -> Vec<ArrayRef> {
+        let chunks = written_chunks(column, encoding).await;
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(
+                is_family(chunk, family),
+                "expected {family} for encoding '{encoding}', got {}",
+                chunk.encoding_id()
+            );
+        }
+        chunks
     }
 
     #[tokio::test]
@@ -706,12 +783,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_parts_override_is_written() {
+    async fn byte_parts_override_compresses_its_children() {
         let values =
             Decimal128Array::from_iter_values((0..ROWS).map(|i| ((i * 7919) % 100_000) as i128))
                 .with_precision_and_scale(12, 2)
                 .unwrap();
-        assert_written_with(Arc::new(values), "byte_parts", "vortex.decimal_byte_parts").await;
+        let chunks =
+            assert_written_with(Arc::new(values), "byte_parts", "vortex.decimal_byte_parts").await;
+        // The integer part is left to the adaptive compressor rather than stored as is.
+        for chunk in &chunks {
+            for child in chunk.children() {
+                assert!(
+                    !child.is_canonical(),
+                    "uncompressed {} under {}",
+                    child.encoding_id(),
+                    chunk.encoding_id()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -720,6 +809,22 @@ mod tests {
             (0..ROWS).map(|i| format!("https://example.com/item/{}", (i * 7919) % 5000)),
         );
         assert_written_with(Arc::new(values), "fsst", "vortex.fsst").await;
+    }
+
+    #[tokio::test]
+    async fn declined_override_is_compressed_adaptively() {
+        // With a minimum of 1, FoR narrows nothing that bit-packing doesn't, so it declines these
+        // values. They must still be compressed rather than stored as is.
+        let values = Int64Array::from_iter_values((0..ROWS).map(|i| 1 + (i * 7919) % 1000));
+        let chunks = written_chunks(Arc::new(values), "for").await;
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(
+                !chunk.is_canonical(),
+                "uncompressed {}",
+                chunk.encoding_id()
+            );
+        }
     }
 
     #[test]
