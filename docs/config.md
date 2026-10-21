@@ -166,6 +166,27 @@ Set the number of iterations for benchmarking queries (10 is the default).
 benchmark_iterations = 10
 ```
 
+With the `vortex` feature enabled, the Vortex reader options (`predicate_pushdown`, `projection_pushdown`, `scan_concurrency` and `footer_initial_read_size_bytes`) can be set in the `datafusion` table with a `vortex.` prefix. The table is `[shared.datafusion]` for all apps, or `[<app>.execution.datafusion]` (for example `[cli.execution.datafusion]`) for one app:
+
+```toml
+[shared.datafusion]
+"vortex.predicate_pushdown" = "false"
+```
+
+An app-specific `datafusion` table replaces the shared one as a whole rather than merging with it key by key. Once an app has its own `datafusion` table, none of the shared `datafusion` keys apply to that app, even keys the app's table does not set. For example, with the config below the CLI runs with a batch size of 4096 but with predicate pushdown enabled, because the shared `vortex.predicate_pushdown` setting is dropped:
+
+```toml
+[shared.datafusion]
+"vortex.predicate_pushdown" = "false"
+
+[cli.execution.datafusion]
+"datafusion.execution.batch_size" = "4096"
+```
+
+To keep a shared setting for that app, repeat it in the app's table.
+
+They can also be changed per session with `SET vortex.predicate_pushdown = false`. DataFusion lists extension options without their prefix, so read them back by the bare name: `SHOW predicate_pushdown`, or `SELECT * FROM information_schema.df_settings WHERE name = 'predicate_pushdown'`. `SHOW vortex.predicate_pushdown` is rejected.
+
 With the `net` feature enabled, the MaxMind-format (`.mmdb`) database used by the single-argument form of the `geoip` function can be configured (the `GEOIP_DB` environment variable takes precedence over this value).
 
 ```toml

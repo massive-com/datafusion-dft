@@ -45,6 +45,9 @@ pub fn merge_configs(shared: ExecutionConfig, priority: ExecutionConfig) -> Exec
     if let Some(ddl_path) = priority.ddl_path {
         merged.ddl_path = Some(ddl_path)
     }
+    // TODO: merge the shared and app `datafusion` tables key by key, with app keys taking
+    // precedence. Replacing the whole table silently drops every shared key once an app sets any
+    // key of its own (see `docs/config.md`). Changing this changes what existing configs mean.
     if let Some(datafusion) = priority.datafusion {
         merged.datafusion = Some(datafusion)
     }
