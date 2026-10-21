@@ -1056,3 +1056,24 @@ fn test_output_vortex_encoding_outside_editions_fails_before_writing() {
 
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn test_output_failed_query_keeps_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("out.csv");
+    std::fs::write(&path, "previous\n").unwrap();
+
+    // The first batches succeed and are written; the batch holding value 50000 fails.
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg("SELECT 1 / (value - 50000) AS x FROM generate_series(1, 100000)")
+        .arg("-o")
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(contains_str("Divide by zero"));
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous\n");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
