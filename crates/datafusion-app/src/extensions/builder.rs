@@ -20,6 +20,7 @@
 use color_eyre::{eyre, Result};
 use datafusion::catalog::MemoryCatalogProviderList;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, TableProviderFactory};
+use datafusion::config::ConfigExtension;
 use datafusion::datasource::file_format::{
     csv::CsvFormatFactory, json::JsonFormatFactory, parquet::ParquetFormatFactory,
     FileFormatFactory,
@@ -133,6 +134,30 @@ impl DftSessionStateBuilder {
     /// Add a file format factory to the list of file format factories on this builder
     pub fn add_file_format_factory(&mut self, factory: Arc<dyn FileFormatFactory>) {
         self.file_format_factories.push(factory);
+    }
+
+    /// Register a configuration extension, so its options can be changed with
+    /// `SET <prefix>.<option>` and from the `datafusion` table of the execution config.
+    pub fn add_config_extension<T: ConfigExtension>(
+        &mut self,
+        extension: T,
+    ) -> datafusion::common::Result<()> {
+        let options = self.session_config.options_mut();
+        options.extensions.insert(extension);
+
+        // `SessionConfig::from_string_hash_map` only reads built-in options, so this extension's
+        // keys are applied here, once its namespace exists.
+        let prefix = format!("{}.", T::PREFIX);
+        if let Some(settings) = self
+            .execution_config
+            .as_ref()
+            .and_then(|config| config.datafusion.as_ref())
+        {
+            for (key, value) in settings.iter().filter(|(key, _)| key.starts_with(&prefix)) {
+                options.set(key, value)?;
+            }
+        }
+        Ok(())
     }
 
     /// Add a catalog provider to the list of providers on this builder

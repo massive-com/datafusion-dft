@@ -20,7 +20,7 @@
 use crate::config::ExecutionConfig;
 use crate::extensions::{DftSessionStateBuilder, Extension};
 use std::sync::Arc;
-use vortex_datafusion::VortexFormatFactory;
+use vortex_datafusion::{VortexFormatFactory, VortexTableOptions};
 
 #[derive(Debug, Default)]
 pub struct VortexExtension {}
@@ -38,6 +38,9 @@ impl Extension for VortexExtension {
         _config: ExecutionConfig,
         builder: &mut DftSessionStateBuilder,
     ) -> datafusion::common::Result<()> {
+        // The factory reads the session's `vortex` options when it creates a format, so
+        // registering them makes `SET vortex.<option>` apply to later queries.
+        builder.add_config_extension(VortexTableOptions::default())?;
         builder.add_file_format_factory(Arc::new(VortexFormatFactory::new()));
         Ok(())
     }

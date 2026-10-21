@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
+
+use datafusion_dft::config::AppConfig;
+
 use crate::extension_cases::TestExecution;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -39,4 +43,51 @@ async fn test_vortex_extension_loads() {
     // let output = test_exec
     //     .run_and_format("SELECT * FROM v LIMIT 10")
     //     .await;
+}
+
+/// Write a small `.vortex` file into `dir` and return a query that filters it.
+async fn filter_query(test_exec: &TestExecution, dir: &std::path::Path) -> String {
+    let path = dir.join("ids.vortex");
+    let path = path.to_str().unwrap();
+    test_exec
+        .run(&format!(
+            "COPY (SELECT value AS id FROM generate_series(1, 1000)) TO '{path}' STORED AS VORTEX"
+        ))
+        .await
+        .unwrap();
+    format!("EXPLAIN SELECT count(*) FROM '{path}' WHERE id = 5")
+}
+
+/// Whether the filter in `explain` is evaluated by DataFusion rather than inside the Vortex scan.
+fn filters_after_scan(explain: &[String]) -> bool {
+    explain.iter().any(|line| line.contains("FilterExec"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_vortex_session_options_can_be_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let test_exec = TestExecution::new().await;
+    let query = filter_query(&test_exec, dir.path()).await;
+
+    assert!(!filters_after_scan(&test_exec.run_and_format(&query).await));
+
+    test_exec
+        .run("SET vortex.predicate_pushdown = false")
+        .await
+        .unwrap();
+    assert!(filters_after_scan(&test_exec.run_and_format(&query).await));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_vortex_options_from_config() {
+    let mut config = AppConfig::default();
+    config.cli.execution.datafusion = Some(HashMap::from([(
+        "vortex.predicate_pushdown".to_string(),
+        "false".to_string(),
+    )]));
+    let dir = tempfile::tempdir().unwrap();
+    let test_exec = TestExecution::new_with_config(config).await;
+    let query = filter_query(&test_exec, dir.path()).await;
+
+    assert!(filters_after_scan(&test_exec.run_and_format(&query).await));
 }
