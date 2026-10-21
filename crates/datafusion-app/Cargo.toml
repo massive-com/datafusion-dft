@@ -54,7 +54,7 @@ tokio-tungstenite = { features = [
 ], optional = true, version = "0.29" }
 tonic = { optional = true, version = "0.14" }
 url = { optional = true, version = "2.5.2" }
-vortex = { optional = true, version = "0.89" }
+vortex = { features = ["object_store"], optional = true, version = "0.89" }
 vortex-datafusion = { optional = true, version = "0.89" }
 
 [dev-dependencies]
