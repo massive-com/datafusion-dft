@@ -124,6 +124,12 @@ impl TestExecution {
     pub async fn run_and_format(&self, sql: &str) -> Vec<String> {
         format_results(&self.run(sql).await.expect("Error running query"))
     }
+
+    /// The session the queries run in, for registering object stores
+    #[allow(dead_code)]
+    pub fn session_ctx(&self) -> &datafusion::prelude::SessionContext {
+        self.execution.session_ctx()
+    }
 }
 
 /// Formats the record batches into a Vec<String> suitable for comparison with insta

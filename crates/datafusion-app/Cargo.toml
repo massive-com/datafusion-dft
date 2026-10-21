@@ -56,7 +56,7 @@ tokio-tungstenite = { features = [
 ], optional = true, workspace = true }
 tonic = { optional = true, workspace = true }
 url = { optional = true, workspace = true }
-vortex = { optional = true, workspace = true }
+vortex = { features = ["object_store"], optional = true, workspace = true }
 vortex-datafusion = { optional = true, workspace = true }
 
 [dev-dependencies]
