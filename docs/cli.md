@@ -73,6 +73,10 @@ faster, and queries scan more rows.
 Invalid options fail with a configuration error. Compressed CSV and JSON output
 is not currently supported.
 
+Output is written to a hidden temporary file next to the target and renamed
+into place once it is complete. A query or write that fails leaves no partial
+file behind and leaves an existing file at the target untouched.
+
 To list the available keys, defaults, and descriptions for a format:
 
 ```sh

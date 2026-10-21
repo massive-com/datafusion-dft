@@ -873,21 +873,62 @@ impl CliApp {
     {
         // We get the schema from the first batch and use that for creating the writer
         if let Some(Ok(first_batch)) = stream.next().await {
-            let schema = first_batch.schema();
-            let mut writer = path_to_writer(path, schema, &self.args.format_options)?;
-            writer.write(&first_batch)?;
-
-            while let Some(maybe_batch) = stream.next().await {
-                match maybe_batch {
-                    Ok(batch) => writer.write(&batch)?,
-                    Err(e) => return Err(eyre!("Error executing SQL: {e}")),
+            // Write next to `path` and rename once writer closes,
+            // so a failed write never leaves a partial file.
+            let tmp_path = tmp_output_path(path)?;
+            let written = write_output(
+                &mut stream,
+                first_batch,
+                path,
+                &tmp_path,
+                &self.args.format_options,
+            )
+            .await;
+            match written {
+                Ok(()) => std::fs::rename(&tmp_path, path)?,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
                 }
             }
-            writer.close().await?;
         }
 
         Ok(())
     }
+}
+
+fn tmp_output_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| eyre!("Output path '{}' has no file name", path.display()))?;
+
+    let mut tmp_name = std::ffi::OsString::from(format!(".dft-{}-", std::process::id()));
+    tmp_name.push(file_name);
+    Ok(path.with_file_name(tmp_name))
+}
+
+async fn write_output<S, E>(
+    stream: &mut S,
+    first_batch: RecordBatch,
+    path: &Path,
+    file_path: &Path,
+    format_options: &[(String, String)],
+) -> Result<()>
+where
+    S: Stream<Item = Result<RecordBatch, E>> + Unpin,
+    E: Error,
+{
+    let schema = first_batch.schema();
+    let mut writer = path_to_writer(path, file_path, schema, format_options)?;
+    writer.write(&first_batch)?;
+
+    while let Some(maybe_batch) = stream.next().await {
+        match maybe_batch {
+            Ok(batch) => writer.write(&batch)?,
+            Err(e) => return Err(eyre!("Error executing SQL: {e}")),
+        }
+    }
+    writer.close().await
 }
 
 /// Wrapper for Vortex writer to handle Arrow RecordBatch conversion
@@ -990,65 +1031,65 @@ impl AnyWriter {
 
 fn path_to_writer(
     path: &Path,
+    file_path: &Path,
     schema: SchemaRef,
     format_options: &[(String, String)],
 ) -> Result<AnyWriter> {
-    if let Some(extension) = path.extension() {
-        if let Some(e) = extension.to_ascii_lowercase().to_str() {
-            return match e {
-                "csv" => {
-                    let options = table_options(ConfigFileType::CSV, format_options)?;
-                    let writer_options = CsvWriterOptions::try_from(&options.csv)?;
-                    ensure_uncompressed(&writer_options.compression, "CSV")?;
-                    let file = std::fs::File::create(path)?;
-                    Ok(AnyWriter::Csv(writer_options.writer_options.build(file)))
+    let ext = path.extension().map(|e| e.to_ascii_lowercase());
+    let Some(ext) = ext.as_ref().and_then(|e| e.to_str()) else {
+        return Err(eyre!("Unable to parse extension"));
+    };
+    match ext {
+        "csv" => {
+            let options = table_options(ConfigFileType::CSV, format_options)?;
+            let writer_options = CsvWriterOptions::try_from(&options.csv)?;
+            ensure_uncompressed(&writer_options.compression, "CSV")?;
+            let file = File::create(file_path)?;
+            Ok(AnyWriter::Csv(writer_options.writer_options.build(file)))
+        }
+        "json" => {
+            let options = table_options(ConfigFileType::JSON, format_options)?;
+            ensure_uncompressed(&options.json.compression, "JSON")?;
+            let file = File::create(file_path)?;
+            Ok(AnyWriter::Json(json::writer::LineDelimitedWriter::new(
+                file,
+            )))
+        }
+        "parquet" => {
+            let props = if format_options.is_empty() {
+                WriterProperties::default()
+            } else {
+                let mut options = table_options(ConfigFileType::PARQUET, format_options)?;
+                if !options.parquet.global.skip_arrow_metadata {
+                    options.parquet.arrow_schema(&schema);
                 }
-                "json" => {
-                    let options = table_options(ConfigFileType::JSON, format_options)?;
-                    ensure_uncompressed(&options.json.compression, "JSON")?;
-                    let file = std::fs::File::create(path)?;
-                    Ok(AnyWriter::Json(json::writer::LineDelimitedWriter::new(
-                        file,
-                    )))
-                }
-                "parquet" => {
-                    let props = if format_options.is_empty() {
-                        WriterProperties::default()
-                    } else {
-                        let mut options = table_options(ConfigFileType::PARQUET, format_options)?;
-                        if !options.parquet.global.skip_arrow_metadata {
-                            options.parquet.arrow_schema(&schema);
-                        }
-                        ParquetWriterOptions::try_from(&options.parquet)?.writer_options
-                    };
-                    let file = std::fs::File::create(path)?;
-                    let writer = ArrowWriter::try_new(file, schema, Some(props))?;
-                    Ok(AnyWriter::Parquet(writer))
-                }
-                #[cfg(feature = "vortex")]
-                "vortex" => {
-                    let config = vortex_write_options::VortexWriteConfig::parse(format_options)?;
-                    let session = VortexSession::default();
-                    let strategy = config.build_strategy(schema.as_ref(), &session)?;
-                    let file = std::fs::File::create(path)?;
-                    Ok(AnyWriter::Vortex(VortexFileWriter::new(
-                        file, schema, strategy, session,
-                    )?))
-                }
-                _ => {
-                    #[cfg(feature = "vortex")]
-                    return Err(eyre!(
-                        "Only 'csv', 'parquet', 'json', and 'vortex' file types can be output"
-                    ));
-                    #[cfg(not(feature = "vortex"))]
-                    return Err(eyre!(
-                        "Only 'csv', 'parquet', and 'json' file types can be output"
-                    ));
-                }
+                ParquetWriterOptions::try_from(&options.parquet)?.writer_options
             };
+            let file = File::create(file_path)?;
+            let writer = ArrowWriter::try_new(file, schema, Some(props))?;
+            Ok(AnyWriter::Parquet(writer))
+        }
+        #[cfg(feature = "vortex")]
+        "vortex" => {
+            let config = vortex_write_options::VortexWriteConfig::parse(format_options)?;
+            let session = VortexSession::default();
+            let strategy = config.build_strategy(schema.as_ref(), &session)?;
+            let file = File::create(file_path)?;
+            Ok(AnyWriter::Vortex(VortexFileWriter::new(
+                file, schema, strategy, session,
+            )?))
+        }
+        _ => {
+            #[cfg(feature = "vortex")]
+            return Err(eyre!(
+                "Only 'csv', 'parquet', 'json', and 'vortex' file types can be output"
+            ));
+            #[cfg(not(feature = "vortex"))]
+            return Err(eyre!(
+                "Only 'csv', 'parquet', and 'json' file types can be output"
+            ));
         }
     }
-    Err(eyre!("Unable to parse extension"))
 }
 
 fn table_options(
