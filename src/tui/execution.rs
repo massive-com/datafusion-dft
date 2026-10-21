@@ -203,6 +203,13 @@ impl TuiExecution {
                                         }
                                         Err(e) => {
                                             error!("Error getting RecordBatch: {:?}", e);
+                                            let elapsed = start.elapsed();
+                                            let e = ExecutionError {
+                                                query: sql.to_string(),
+                                                error: e.to_string(),
+                                                duration: elapsed,
+                                            };
+                                            sender.send(AppEvent::ExecutionResultsError(e))?;
                                         }
                                     }
                                 }
