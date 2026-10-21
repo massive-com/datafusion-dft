@@ -992,3 +992,102 @@ fn test_output_vortex_zone_maps_disabled() {
 
     assert_eq!(count_vortex_layouts(&column_path, "vortex.zoned"), 1);
 }
+
+/// Rows with one column per vortex encoding kind, varied enough that the compressor uses a
+/// forced encoding rather than leaving the column uncompressed.
+#[cfg(feature = "vortex")]
+const VORTEX_ENCODING_SOURCE: &str = "SELECT value::bigint AS int_col, (value % 1000)::double * 0.25 AS float_col, 'v' || (value % 100) AS string_col, arrow_cast('b' || (value % 37), 'Binary') AS binary_col, arrow_cast(value / 100.0, 'Decimal128(12, 2)') AS decimal_col, to_timestamp_seconds(value * 60) AS ext_col FROM generate_series(1, 65536)";
+
+#[test]
+#[cfg(feature = "vortex")]
+fn test_output_vortex_every_listed_encoding_round_trips() {
+    let listing = Command::cargo_bin("dft")
+        .unwrap()
+        .args(["--print-format-options", "vortex"])
+        .output()
+        .unwrap();
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    let encodings: Vec<(String, String)> = listing
+        .split("Available encodings by column type:")
+        .nth(1)
+        .expect("listing has an encodings section")
+        .lines()
+        .filter_map(|line| line.trim().split_once(": "))
+        .flat_map(|(kind, shorts)| {
+            shorts
+                .split(", ")
+                .map(move |short| (kind.to_string(), short.to_string()))
+        })
+        .collect();
+    assert!(!encodings.is_empty());
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut failures = Vec::new();
+    for (kind, encoding) in encodings {
+        let column = format!("{kind}_col");
+        assert!(
+            VORTEX_ENCODING_SOURCE.contains(&format!("AS {column}")),
+            "no source column for {kind} encodings"
+        );
+        let path = dir.path().join(format!("{kind}_{encoding}.vortex"));
+        let write = Command::cargo_bin("dft")
+            .unwrap()
+            .arg("-c")
+            .arg(VORTEX_ENCODING_SOURCE)
+            .arg("-o")
+            .arg(&path)
+            .arg("--format-option")
+            .arg(format!("encoding::{column}={encoding}"))
+            .output()
+            .unwrap();
+        if !write.status.success() {
+            failures.push(format!(
+                "{kind}.{encoding}: write failed: {}",
+                String::from_utf8_lossy(&write.stderr)
+            ));
+            continue;
+        }
+
+        // Rows that differ between the source and the file, in either direction.
+        let file = path.to_str().unwrap();
+        let check = format!(
+            "SELECT (SELECT count(*) FROM (({VORTEX_ENCODING_SOURCE}) EXCEPT ALL (SELECT * FROM '{file}'))) + (SELECT count(*) FROM ((SELECT * FROM '{file}') EXCEPT ALL ({VORTEX_ENCODING_SOURCE}))) AS mismatched"
+        );
+        let read = Command::cargo_bin("dft")
+            .unwrap()
+            .arg("-c")
+            .arg(check)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&read.stdout);
+        if !read.status.success() || !stdout.contains("| 0          |") {
+            failures.push(format!(
+                "{kind}.{encoding}: read back differs: {stdout}{}",
+                String::from_utf8_lossy(&read.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+#[cfg(feature = "vortex")]
+fn test_output_vortex_encoding_outside_editions_fails_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("delta.vortex");
+
+    // Delta is registered but not in the default editions, so the writer would reject it.
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg("SELECT value AS id FROM generate_series(1, 65536)")
+        .arg("-o")
+        .arg(&path)
+        .arg("--format-option")
+        .arg("encoding::id=delta")
+        .assert()
+        .failure()
+        .stderr(contains_str("fastlanes.delta"));
+
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}

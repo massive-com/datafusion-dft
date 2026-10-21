@@ -59,6 +59,12 @@ restricts the candidate schemes for that column. Use
 `dictionary_enabled::COLUMN=false` to skip dictionary encoding when you want a
 single encoding.
 
+Only encodings permitted by the Vortex editions dft writes with can be forced,
+and `--print-format-options vortex` lists only those. Forcing any other
+registered encoding (for example `delta`) fails before anything is written.
+When an encoding has several wire formats, such as `bitpacking` and `for`, dft
+writes the one the editions permit.
+
 `statistics_enabled=false` disables zone maps. It accepts a global value or a
 `statistics_enabled::COLUMN` override. Zone maps are what DataFusion uses to
 prune files and row blocks, so disabling them makes files smaller and writes
