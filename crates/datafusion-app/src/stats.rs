@@ -284,35 +284,38 @@ impl std::fmt::Display for ExecutionIOStats {
                 .map(|m| m.to_string())
                 .unwrap_or("None".to_string())
         )?;
-        writeln!(f)?;
-        writeln!(
-            f,
-            "Parquet Pruning Stats (Output Rows: {}, Row Groups: {} [{}ms per row group])",
-            self.parquet_output_rows
-                .as_ref()
-                .map(|m| m.to_string())
-                .unwrap_or("None".to_string()),
-            self.row_group_count(),
-            self.time_scanning
-                .as_ref()
-                .map(|ts| format!(
-                    "{:.2}",
-                    (ts.as_usize() / 1_000_000) as f64 / self.row_group_count() as f64
-                ))
-                .unwrap_or("None".to_string())
-        )?;
-        writeln!(
-            f,
-            "{:<20} {:<20} {:<20}",
-            "Matched RG Stats %", "Matched RG Bloom %", "Matched Page Index %"
-        )?;
-        writeln!(
-            f,
-            "{:<20.2} {:<20.2} {:<20.2}",
-            self.parquet_rg_pruned_stats_ratio(),
-            self.parquet_rg_pruned_bloom_filter_ratio(),
-            self.parquet_rg_pruned_page_index_ratio()
-        )?;
+        if self.parquet_output_rows.is_some() {
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Parquet Pruning Stats (Output Rows: {}, Row Groups: {} [{}ms per row group])",
+                self.parquet_output_rows
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or("None".to_string()),
+                self.row_group_count(),
+                self.time_scanning
+                    .as_ref()
+                    .filter(|_| self.row_group_count() > 0)
+                    .map(|ts| format!(
+                        "{:.2}",
+                        (ts.as_usize() / 1_000_000) as f64 / self.row_group_count() as f64
+                    ))
+                    .unwrap_or("None".to_string())
+            )?;
+            writeln!(
+                f,
+                "{:<20} {:<20} {:<20}",
+                "Matched RG Stats %", "Matched RG Bloom %", "Matched Page Index %"
+            )?;
+            writeln!(
+                f,
+                "{:<20.2} {:<20.2} {:<20.2}",
+                self.parquet_rg_pruned_stats_ratio(),
+                self.parquet_rg_pruned_bloom_filter_ratio(),
+                self.parquet_rg_pruned_page_index_ratio()
+            )?;
+        }
         Ok(())
     }
 }
@@ -732,8 +735,11 @@ impl ExecutionPlanVisitor for PlanComputeVisitor {
 }
 
 fn is_io_plan(plan: &dyn ExecutionPlan) -> bool {
-    let io_plans = ["CsvExec", "ParquetExec", "ArrowExec"];
-    io_plans.contains(&plan.name())
+    plan.downcast_ref::<DataSourceExec>().is_some_and(|exec| {
+        exec.data_source()
+            .downcast_ref::<FileScanConfig>()
+            .is_some()
+    })
 }
 
 pub fn collect_plan_io_stats(plan: Arc<dyn ExecutionPlan>) -> Option<ExecutionIOStats> {
