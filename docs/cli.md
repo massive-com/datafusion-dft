@@ -326,6 +326,13 @@ This feature is still in it's early stages and is expected to evolve.  Once it h
 dft -c "SELECT ..." --analyze
 ```
 
+For Vortex files, the IO summary also shows the segments the scan requested, the
+I/O requests it made after merging nearby segments, and the bytes it read. A
+query that reads far more bytes than it returns usually means the scan could not
+skip chunks with zone maps. When a Vortex file is local, dft reads it directly
+rather than through the object store, and `EXPLAIN ANALYZE` reports the scan's
+reads as `bytes_scanned` and `io_requests`.
+
 ## Generate TPC-H Data
 
 Generate TPC-H data into your configured DB path

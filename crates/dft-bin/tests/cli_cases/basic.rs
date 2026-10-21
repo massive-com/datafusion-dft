@@ -22,6 +22,7 @@ use parquet::{
     basic::Encoding,
     file::{reader::FileReader, serialized_reader::SerializedFileReader},
 };
+use predicates::prelude::PredicateBooleanExt;
 use std::{io::Read, path::PathBuf};
 
 use super::{assert_output_contains, contains_str, sql_in_file};
@@ -742,6 +743,34 @@ fn test_output_vortex() {
 +-----+-------+"#;
 
     assert.stdout(contains_str(expected));
+}
+
+#[test]
+#[cfg(feature = "vortex")]
+fn test_analyze_vortex_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ids.vortex");
+
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg("SELECT value AS id FROM generate_series(1, 1000)")
+        .arg("-o")
+        .arg(&path)
+        .assert()
+        .success();
+
+    let sql = format!("SELECT * FROM '{}' WHERE id > 990", path.to_str().unwrap());
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg(sql)
+        .arg("--analyze")
+        .assert()
+        .success()
+        .stdout(contains_str("Vortex Scan Stats"))
+        .stdout(contains_str("Segments Requested"))
+        .stdout(contains_str("Parquet Pruning Stats").not());
 }
 
 #[test]
