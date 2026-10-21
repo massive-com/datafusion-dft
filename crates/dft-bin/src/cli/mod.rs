@@ -62,7 +62,7 @@ use {
 #[cfg(feature = "vortex")]
 use {
     std::sync::Arc,
-    vortex::{arrow::ArrowSessionExt, layout::LayoutStrategy, VortexSessionDefault},
+    vortex::{arrow::ArrowSessionExt, layout::LayoutStrategy},
     vortex_file::VortexWriteOptions,
     vortex_session::VortexSession,
 };
@@ -1072,7 +1072,7 @@ fn path_to_writer(
         #[cfg(feature = "vortex")]
         "vortex" => {
             let config = vortex_write_options::VortexWriteConfig::parse(format_options)?;
-            let session = VortexSession::default();
+            let session = config.session()?;
             let strategy = config.build_strategy(schema.as_ref(), &session)?;
             let file = File::create(file_path)?;
             Ok(AnyWriter::Vortex(VortexFileWriter::new(

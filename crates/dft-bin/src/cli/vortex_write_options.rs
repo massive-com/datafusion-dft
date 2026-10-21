@@ -37,7 +37,10 @@ use vortex::compressor::{
     BtrBlocksCompressor, BtrBlocksCompressorBuilder, CompressionSessionExt, Scheme,
 };
 use vortex::dtype::FieldPath;
-use vortex::editions::{ComponentKind, EditionSessionExt};
+use vortex::editions::{
+    ComponentKind, Edition, EditionDeclaration, EditionFamily, EditionId, EditionMember,
+    EditionSessionExt,
+};
 use vortex::error::VortexResult;
 use vortex::layout::layouts::buffered::BufferedStrategy;
 use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
@@ -66,6 +69,30 @@ const DEFAULT_DATA_BLOCK_TARGET_BYTES: u64 = 1 << 20;
 /// Buffer size between compression and layout emission. Matches `vortex_file::WriteStrategyBuilder`.
 const BUFFER_SIZE: u64 = 2 * (1 << 20);
 
+/// dft's edition family, for Vortex components dft writes that no Vortex edition lists yet.
+static DFT_EDITION_FAMILY: EditionFamily = EditionFamily {
+    name: "dft",
+    origin: "datafusion-dft",
+    doc: "Vortex components that datafusion-dft writes on request and that no Vortex edition \
+lists yet. Files that use them need a Vortex reader that decodes those components.",
+};
+
+/// The edition `blocked_encodings` enables.
+const BLOCKED_ENCODINGS_EDITION: EditionId = EditionId::new("dft", 2026, 10, 0);
+
+/// Vortex's blocked FoR (a reference per chunk of values) and blocked bit-packing (a bit width
+/// per 1024 values), new in Vortex 0.89 and in no Vortex edition.
+static BLOCKED_ENCODINGS_DECLARATION: EditionDeclaration = EditionDeclaration {
+    edition: Edition {
+        id: BLOCKED_ENCODINGS_EDITION,
+        min_library_version: None,
+    },
+    added: &[
+        EditionMember::array(&"fastlanes.for.v2"),
+        EditionMember::array(&"fastlanes.bitpacked.v2"),
+    ],
+};
+
 /// Parsed `--format-option` values for a `.vortex` output file.
 #[derive(Debug)]
 pub struct VortexWriteConfig {
@@ -73,6 +100,7 @@ pub struct VortexWriteConfig {
     data_block_target_bytes: Option<u64>,
     compact: bool,
     statistics: bool,
+    blocked_encodings: bool,
     columns: Vec<ColumnOverride>,
 }
 
@@ -91,6 +119,7 @@ impl Default for VortexWriteConfig {
             data_block_target_bytes: Some(DEFAULT_DATA_BLOCK_TARGET_BYTES),
             compact: false,
             statistics: true,
+            blocked_encodings: false,
             columns: Vec::new(),
         }
     }
@@ -138,6 +167,9 @@ impl VortexWriteConfig {
                 "statistics_enabled" => {
                     config.statistics = parse_bool(value)?;
                 }
+                "blocked_encodings" => {
+                    config.blocked_encodings = parse_bool(value)?;
+                }
                 _ => {
                     if let Some(column) = key.strip_prefix("encoding::") {
                         if column.is_empty() {
@@ -169,6 +201,19 @@ impl VortexWriteConfig {
             }
         }
         Ok(config)
+    }
+
+    /// The session to write with: Vortex's defaults, plus [`BLOCKED_ENCODINGS_EDITION`] when
+    /// `blocked_encodings` is set. The strategy and the writer both take what they may write from
+    /// the session's enabled editions.
+    pub fn session(&self) -> Result<VortexSession> {
+        let session = VortexSession::default();
+        if self.blocked_encodings {
+            session.editions().declare_family(&DFT_EDITION_FAMILY)?;
+            session.register_edition(&BLOCKED_ENCODINGS_DECLARATION)?;
+            session.enable_edition(BLOCKED_ENCODINGS_EDITION)?;
+        }
+        Ok(session)
     }
 
     fn column(&mut self, name: &str) -> &mut ColumnOverride {
@@ -642,6 +687,10 @@ pub fn print_options() {
         "statistics_enabled", "true"
     );
     println!(
+        "{:<44} {:<18} Allow blocked FoR and bit-packing (needs a Vortex 0.89+ reader)",
+        "blocked_encodings", "false"
+    );
+    println!(
         "{:<44} {:<18} Write zone maps for a top-level column",
         "statistics_enabled::COLUMN", "true"
     );
@@ -699,18 +748,28 @@ mod tests {
     /// Write `column` as column `c` with an override to `encoding`, then return the chunks of `c`
     /// read back from the file.
     async fn written_chunks(column: ArrowArrayRef, encoding: &str) -> Vec<ArrayRef> {
+        written_chunks_with(column, encoding, &[]).await
+    }
+
+    /// [`written_chunks`], with `extra` format options.
+    async fn written_chunks_with(
+        column: ArrowArrayRef,
+        encoding: &str,
+        extra: &[(&str, &str)],
+    ) -> Vec<ArrayRef> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "c",
             column.data_type().clone(),
             false,
         )]));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
-        let session = VortexSession::default();
-        let config = VortexWriteConfig::parse(&options(&[
+        let mut pairs = vec![
             ("encoding::c", encoding),
             ("dictionary_enabled::c", "false"),
-        ]))
-        .unwrap();
+        ];
+        pairs.extend_from_slice(extra);
+        let config = VortexWriteConfig::parse(&options(&pairs)).unwrap();
+        let session = config.session().unwrap();
         let strategy = config.build_strategy(&schema, &session).unwrap();
 
         let array = session
@@ -825,6 +884,44 @@ mod tests {
                 chunk.encoding_id()
             );
         }
+    }
+
+    /// Whether any chunk has a child named `name`.
+    fn has_child(chunks: &[ArrayRef], name: &str) -> bool {
+        chunks.iter().any(|chunk| {
+            chunk
+                .named_children()
+                .iter()
+                .any(|(child, _)| child == name)
+        })
+    }
+
+    #[tokio::test]
+    async fn blocked_encodings_write_blocked_bit_packing() {
+        // Increasing values need a different bit width per block. Only blocked bit-packing stores
+        // one, with the offsets of its blocks as a child.
+        let values = || Arc::new(Int64Array::from_iter_values(0..ROWS));
+        let default = written_chunks(values(), "bitpacking").await;
+        assert!(!has_child(&default, "block_offsets"));
+
+        let blocked =
+            written_chunks_with(values(), "bitpacking", &[("blocked_encodings", "true")]).await;
+        assert!(has_child(&blocked, "block_offsets"));
+    }
+
+    #[tokio::test]
+    async fn blocked_encodings_write_blocked_for() {
+        // Drifting values favour a reference per chunk, which only blocked FoR stores.
+        let values = || {
+            Arc::new(Int64Array::from_iter_values(
+                (0..ROWS).map(|i| 1_000_000_000 + i),
+            ))
+        };
+        let default = written_chunks(values(), "for").await;
+        assert!(!has_child(&default, "blocked_references"));
+
+        let blocked = written_chunks_with(values(), "for", &[("blocked_encodings", "true")]).await;
+        assert!(has_child(&blocked, "blocked_references"));
     }
 
     #[test]

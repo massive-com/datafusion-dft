@@ -1072,6 +1072,36 @@ fn test_output_vortex_every_listed_encoding_round_trips() {
 
 #[test]
 #[cfg(feature = "vortex")]
+fn test_output_vortex_blocked_encodings_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blocked.vortex");
+
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg(VORTEX_ENCODING_SOURCE)
+        .arg("-o")
+        .arg(&path)
+        .arg("--format-option")
+        .arg("blocked_encodings=true")
+        .assert()
+        .success();
+
+    let file = path.to_str().unwrap();
+    let check = format!(
+        "SELECT (SELECT count(*) FROM (({VORTEX_ENCODING_SOURCE}) EXCEPT ALL (SELECT * FROM '{file}'))) + (SELECT count(*) FROM ((SELECT * FROM '{file}') EXCEPT ALL ({VORTEX_ENCODING_SOURCE}))) AS mismatched"
+    );
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg(check)
+        .assert()
+        .success()
+        .stdout(contains_str("| 0          |"));
+}
+
+#[test]
+#[cfg(feature = "vortex")]
 fn test_output_vortex_encoding_outside_editions_fails_before_writing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("delta.vortex");

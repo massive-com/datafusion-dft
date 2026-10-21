@@ -68,6 +68,14 @@ registered encoding (for example `delta`) fails before anything is written.
 When an encoding has several wire formats, such as `bitpacking` and `for`, dft
 writes the one the editions permit.
 
+`blocked_encodings=true` also permits Vortex's blocked FoR (a reference per
+chunk of values) and blocked bit-packing (a bit width per 1024 values). No
+Vortex edition lists them yet, so dft enables its own `dft` edition for them.
+Both adaptive compression and `encoding` overrides then use them where they
+help, which can make files noticeably smaller. Reading such a file needs
+Vortex 0.89 or later; older readers fail with `Unknown encoding:
+fastlanes.for.v2`.
+
 `statistics_enabled=false` disables zone maps. It accepts a global value or a
 `statistics_enabled::COLUMN` override. Zone maps are what DataFusion uses to
 prune files and row blocks, so disabling them makes files smaller and writes
