@@ -36,7 +36,7 @@ use vortex::array::{ArrayId, ArrayRef, Canonical, ExecutionCtx};
 use vortex::compressor::{
     BtrBlocksCompressor, BtrBlocksCompressorBuilder, CompressionSessionExt, Scheme,
 };
-use vortex::dtype::FieldPath;
+use vortex::dtype::{FieldName, FieldPath};
 use vortex::editions::{
     ComponentKind, Edition, EditionDeclaration, EditionFamily, EditionId, EditionMember,
     EditionSessionExt,
@@ -55,11 +55,14 @@ use vortex::layout::layouts::table::TableStrategy;
 use vortex::layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
 use vortex::layout::{LayoutStrategy, VTable};
 use vortex::VortexSessionDefault;
-use vortex_btrblocks::schemes::integer;
+use vortex_btrblocks::schemes::{binary, float, integer, string};
 use vortex_btrblocks::{
     ArrayAndStats, CascadingCompressor, CompressorContext, GenerateStatsOptions, SchemeExt,
+    SchemeId,
 };
-use vortex_compressor::scheme::{AncestorExclusion, CompressionEstimate, DescendantExclusion};
+use vortex_compressor::scheme::{
+    AncestorExclusion, CompressionEstimate, DescendantExclusion, EstimateVerdict,
+};
 use vortex_session::VortexSession;
 
 /// Default row block size. Matches `vortex_file::WriteStrategyBuilder`.
@@ -264,23 +267,50 @@ impl VortexWriteConfig {
         let writable_ids = writable_array_ids(session);
         let writable = |id: &ArrayId| writable_ids.contains(id);
 
+        // The builder each level of an override chain starts from: the column's adaptive schemes,
+        // with the compact preset for a forced Zstd or Pco, which the default preset excludes.
+        let data_builder = base.clone().exclude_schemes([integer::IntDictScheme.id()]);
+        let level_builder = |scheme: &'static dyn Scheme| {
+            if !self.compact && default_preset_excludes(scheme) {
+                data_builder.clone().with_compact()
+            } else {
+                data_builder.clone()
+            }
+        };
+
         let mut field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>> = HashMap::new();
         for column in &self.columns {
-            let field = schema
-                .field_with_name(&column.name)
-                .map_err(|_| eyre!("Unknown column '{}' in vortex format option", column.name))?;
-            let kind = scheme_kind(field.data_type()).ok_or_else(|| {
+            let (path, data_type) = resolve_field(schema, &column.name)?;
+            if let Some(other) = field_writers.keys().find(|other| path.overlap(other)) {
+                return Err(eyre!(
+                    "Vortex format options for '{}' and '{other}' overlap; set options on one of them",
+                    column.name
+                ));
+            }
+            let kind = scheme_kind(&data_type).ok_or_else(|| {
                 eyre!(
                     "Column '{}' has type {} and cannot use a vortex encoding override",
                     column.name,
-                    field.data_type()
+                    data_type
                 )
             })?;
             let data_compressor: Arc<dyn CompressorPlugin> = match &column.encoding {
                 Some(raw) => {
-                    let scheme = resolve_scheme(raw, kind, &column.name)?;
-                    check_writable(scheme, &column.name, &writable)?;
-                    override_compressor(scheme.refine(&writable), adaptive_data_compressor.clone())
+                    let mut chain = Vec::new();
+                    for (index, step) in raw.split('/').enumerate() {
+                        let scheme = if index == 0 {
+                            resolve_scheme(step, kind, &column.name)?
+                        } else {
+                            resolve_scheme_any(step, &column.name)?
+                        };
+                        check_writable(scheme, &column.name, &writable)?;
+                        chain.push(scheme.refine(&writable));
+                    }
+                    Arc::new(override_compressor(
+                        &chain,
+                        &level_builder,
+                        &adaptive_data_compressor,
+                    ))
                 }
                 None => Arc::clone(&default_data_compressor),
             };
@@ -292,7 +322,7 @@ impl VortexWriteConfig {
                 column.dictionary.unwrap_or(true),
                 column.statistics.unwrap_or(self.statistics),
             );
-            field_writers.insert(FieldPath::from_name(column.name.clone()), leaf);
+            field_writers.insert(path, leaf);
         }
 
         let validity: Arc<dyn LayoutStrategy> = Arc::new(CollectStrategy::new(
@@ -383,39 +413,69 @@ fn check_writable(
     ))
 }
 
-/// Build a compressor that encodes each chunk of a column with `scheme`.
+/// Build a compressor that forces `chain` down a column.
 ///
-/// `scheme` is forced at the top of the column only. Its children (FoR's residuals, the integer
-/// part of decimal byte parts) are compressed by `adaptive`, the column's default compressor, as
-/// they would be had BtrBlocks picked `scheme` itself. A chunk `scheme` declines (FoR skips values
-/// that bit-pack as narrowly) or cannot shrink is compressed by `adaptive` instead of being stored
-/// uncompressed.
+/// `chain[0]` encodes the top of every chunk, and each later scheme encodes the direct children of
+/// the one before it that it applies to (`byte_parts/for` forces FoR on the integer part of decimal
+/// byte parts). Everything else, including children a scheme does not apply to and the children of
+/// the last scheme, is compressed adaptively. A forced scheme is used even where its own estimate
+/// would skip the data, unless it fails or does not shrink it, in which case the data is compressed
+/// adaptively instead.
+///
+/// Each level is the adaptive compressor with its scheme replaced by a [`ForcedScheme`], so the
+/// schemes it does not force still compete as usual.
 fn override_compressor(
-    scheme: &'static dyn Scheme,
-    adaptive: BtrBlocksCompressor,
-) -> Arc<dyn CompressorPlugin> {
-    // `CascadingCompressor` takes `&'static` schemes, so one is leaked per overridden column.
-    let forced: &'static ForcedScheme = Box::leak(Box::new(ForcedScheme {
-        inner: scheme,
-        children: adaptive.0.clone(),
-    }));
-    let root = CascadingCompressor::new(vec![forced]);
-    Arc::new(
-        move |chunk: &ArrayRef, ctx: &mut ExecutionCtx| -> VortexResult<ArrayRef> {
-            let compressed = root.compress(chunk, ctx)?;
-            if compressed.is_canonical() {
-                return adaptive.compress(chunk, ctx);
-            }
-            Ok(compressed)
-        },
-    )
+    chain: &[&'static dyn Scheme],
+    level_builder: &dyn Fn(&'static dyn Scheme) -> BtrBlocksCompressorBuilder,
+    adaptive: &BtrBlocksCompressor,
+) -> BtrBlocksCompressor {
+    let mut children = adaptive.0.clone();
+    let mut compressor = None;
+    for (index, &scheme) in chain.iter().enumerate().rev() {
+        // `CascadingCompressor` takes `&'static` schemes, so one is leaked per chain step.
+        let forced: &'static ForcedScheme = Box::leak(Box::new(ForcedScheme {
+            inner: scheme,
+            parent: index.checked_sub(1).map(|parent| chain[parent].id()),
+            children,
+            fallback: adaptive.0.clone(),
+        }));
+        let level = level_builder(scheme)
+            .exclude_schemes([scheme.id()])
+            .with_new_scheme(forced)
+            .build();
+        children = level.0.clone();
+        compressor = Some(level);
+    }
+    compressor.expect("an override chain has at least one scheme")
 }
 
-/// `inner`, compressing its children with `children` rather than the compressor that chose it.
+/// Whether `BtrBlocksCompressorBuilder::from_session`'s default preset leaves `scheme` out.
+fn default_preset_excludes(scheme: &dyn Scheme) -> bool {
+    [
+        string::ZstdScheme.id(),
+        binary::ZstdScheme.id(),
+        binary::ZstdBuffersScheme.id(),
+        integer::PcoScheme.id(),
+        float::PcoScheme.id(),
+    ]
+    .contains(&scheme.id())
+}
+
+/// `inner`, forced on the direct children of `parent` (or on the top of a column, for `None`):
+/// there it is always chosen, and its children are compressed with `children`. Anywhere else it
+/// is `inner`, competing as usual.
 #[derive(Debug)]
 struct ForcedScheme {
     inner: &'static dyn Scheme,
+    parent: Option<SchemeId>,
     children: CascadingCompressor,
+    fallback: CascadingCompressor,
+}
+
+impl ForcedScheme {
+    fn is_forced(&self, compress_ctx: &CompressorContext) -> bool {
+        compress_ctx.cascade_history().last().map(|(id, _)| *id) == self.parent
+    }
 }
 
 impl Scheme for ForcedScheme {
@@ -453,19 +513,40 @@ impl Scheme for ForcedScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> CompressionEstimate {
+        if self.is_forced(&compress_ctx) {
+            return CompressionEstimate::Verdict(EstimateVerdict::AlwaysUse);
+        }
         self.inner
             .expected_compression_ratio(data, compress_ctx, exec_ctx)
     }
 
     fn compress(
         &self,
-        _compressor: &CascadingCompressor,
+        compressor: &CascadingCompressor,
         data: &ArrayAndStats,
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        self.inner
+        if !self.is_forced(&compress_ctx) {
+            return self
+                .inner
+                .compress(compressor, data, compress_ctx, exec_ctx);
+        }
+        let before = data.array().nbytes();
+        match self
+            .inner
             .compress(&self.children, data, compress_ctx, exec_ctx)
+        {
+            Ok(compressed) if compressed.nbytes() < before => Ok(compressed),
+            Ok(_) => self.fallback.compress(data.array(), exec_ctx),
+            Err(err) => {
+                log::debug!(
+                    "Forced vortex encoding {} failed, compressing adaptively: {err}",
+                    self.inner.scheme_name()
+                );
+                self.fallback.compress(data.array(), exec_ctx)
+            }
+        }
     }
 }
 
@@ -621,6 +702,72 @@ fn resolve_scheme(raw: &str, kind: &str, column: &str) -> Result<&'static dyn Sc
     ))
 }
 
+/// Resolve a column option's name to its field path and type: a top-level column, or failing that
+/// a dot-separated path through struct fields (`ohlc.open`).
+fn resolve_field(schema: &Schema, name: &str) -> Result<(FieldPath, DataType)> {
+    if let Ok(field) = schema.field_with_name(name) {
+        return Ok((
+            FieldPath::from_name(name.to_string()),
+            field.data_type().clone(),
+        ));
+    }
+    let unknown = || eyre!("Unknown column '{name}' in vortex format option");
+    let mut parts = name.split('.');
+    let first = parts.next().ok_or_else(unknown)?;
+    let mut data_type = schema
+        .field_with_name(first)
+        .map_err(|_| unknown())?
+        .data_type()
+        .clone();
+    let mut path = FieldPath::from_name(first.to_string());
+    for part in parts {
+        let DataType::Struct(fields) = &data_type else {
+            return Err(unknown());
+        };
+        let field = fields
+            .iter()
+            .find(|field| field.name() == part)
+            .ok_or_else(unknown)?;
+        data_type = field.data_type().clone();
+        path = path.push(FieldName::from(part));
+    }
+    Ok((path, data_type))
+}
+
+/// Resolve an encoding below the top of an override chain, where the type of the array it applies
+/// to is not known up front: a full or kind-qualified name, or a short name only one kind has.
+fn resolve_scheme_any(raw: &str, column: &str) -> Result<&'static dyn Scheme> {
+    let entries = scheme_entries();
+    if let Some(entry) = entries.iter().find(|entry| entry.name == raw) {
+        return Ok(entry.scheme);
+    }
+    if let Some((prefix, short)) = raw.split_once('.') {
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.kind == prefix && entry.short == short)
+        {
+            return Ok(entry.scheme);
+        }
+    }
+    let matching: Vec<&SchemeEntry> = entries.iter().filter(|entry| entry.short == raw).collect();
+    match matching.as_slice() {
+        [entry] => Ok(entry.scheme),
+        [] => Err(eyre!(
+            "Unknown vortex encoding '{raw}' in the override for column '{column}'"
+        )),
+        _ => {
+            let qualified: Vec<String> = matching
+                .iter()
+                .map(|entry| format!("{}.{}", entry.kind, entry.short))
+                .collect();
+            Err(eyre!(
+                "Vortex encoding '{raw}' in the override for column '{column}' is ambiguous below the top of the column; use one of: {}",
+                qualified.join(", ")
+            ))
+        }
+    }
+}
+
 /// Map an Arrow type to the Vortex scheme kind prefix.
 fn scheme_kind(dtype: &DataType) -> Option<&'static str> {
     match dtype {
@@ -675,7 +822,7 @@ pub fn print_options() {
         "compressor", "default"
     );
     println!(
-        "{:<44} {:<18} Force a compression scheme for a top-level column",
+        "{:<44} {:<18} Force a compression scheme; COLUMN may be a.b, VALUE may be a/b",
         "encoding::COLUMN", "<adaptive>"
     );
     println!(
@@ -729,6 +876,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{
         ArrayRef as ArrowArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray,
+        StructArray,
     };
     use datafusion::arrow::datatypes::Field;
     use futures::StreamExt;
@@ -757,18 +905,32 @@ mod tests {
         encoding: &str,
         extra: &[(&str, &str)],
     ) -> Vec<ArrayRef> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "c",
-            column.data_type().clone(),
-            false,
-        )]));
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
         let mut pairs = vec![
             ("encoding::c", encoding),
             ("dictionary_enabled::c", "false"),
         ];
         pairs.extend_from_slice(extra);
-        let config = VortexWriteConfig::parse(&options(&pairs)).unwrap();
+        written_field_chunks(single_column_batch(column), &pairs, &["c"]).await
+    }
+
+    fn single_column_batch(column: ArrowArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            column.data_type().clone(),
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![column]).unwrap()
+    }
+
+    /// Write `batch` with the format options `pairs`, then return the chunks of the field at
+    /// `path` read back from the file.
+    async fn written_field_chunks(
+        batch: RecordBatch,
+        pairs: &[(&str, &str)],
+        path: &[&str],
+    ) -> Vec<ArrayRef> {
+        let schema = batch.schema();
+        let config = VortexWriteConfig::parse(&options(pairs)).unwrap();
         let session = config.session().unwrap();
         let strategy = config.build_strategy(&schema, &session).unwrap();
 
@@ -787,15 +949,22 @@ mod tests {
         let mut stream = file.scan().unwrap().into_array_stream().unwrap();
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let (_, column) = chunk
-                .unwrap()
-                .named_children()
-                .into_iter()
-                .find(|(name, _)| name == "c")
-                .expect("chunk has column c");
-            chunks.push(column);
+            let mut array = chunk.unwrap();
+            for name in path {
+                array = child(&array, name);
+            }
+            chunks.push(array);
         }
         chunks
+    }
+
+    fn child(array: &ArrayRef, name: &str) -> ArrayRef {
+        array
+            .named_children()
+            .into_iter()
+            .find(|(child, _)| child == name)
+            .map(|(_, child)| child)
+            .unwrap_or_else(|| panic!("{} has no child {name}", array.encoding_id()))
     }
 
     /// Whether `array` is encoded with `family`. Arrays read back report their in-memory encoding
@@ -871,11 +1040,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declined_override_is_compressed_adaptively() {
-        // With a minimum of 1, FoR narrows nothing that bit-packing doesn't, so it declines these
-        // values. They must still be compressed rather than stored as is.
+    async fn forced_override_ignores_the_scheme_estimate() {
+        // With a minimum of 1, FoR narrows nothing that bit-packing doesn't, so its own estimate
+        // skips these values. Forced, it encodes them anyway.
         let values = Int64Array::from_iter_values((0..ROWS).map(|i| 1 + (i * 7919) % 1000));
-        let chunks = written_chunks(Arc::new(values), "for").await;
+        assert_written_with(Arc::new(values), "for", "fastlanes.for").await;
+    }
+
+    #[tokio::test]
+    async fn forced_override_that_fails_is_compressed_adaptively() {
+        // These values are not a sequence, so the sequence encoding cannot represent them.
+        let values = Int64Array::from_iter_values((0..ROWS).map(|i| (i * 7919) % 1000));
+        let chunks = written_chunks(Arc::new(values), "sequence").await;
         assert!(!chunks.is_empty());
         for chunk in &chunks {
             assert!(
@@ -883,7 +1059,107 @@ mod tests {
                 "uncompressed {}",
                 chunk.encoding_id()
             );
+            assert!(!is_family(chunk, "vortex.sequence"));
         }
+    }
+
+    #[tokio::test]
+    async fn override_applies_to_a_struct_field() {
+        let field = |name: &str| Arc::new(Field::new(name, DataType::Int64, false));
+        let a: ArrowArrayRef = Arc::new(Int64Array::from_iter_values(0..ROWS));
+        let b: ArrowArrayRef = Arc::new(Int64Array::from_iter_values(0..ROWS));
+        let s: ArrowArrayRef = Arc::new(StructArray::from(vec![(field("a"), a), (field("b"), b)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            s.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![s]).unwrap();
+        let pairs = [
+            ("encoding::s.a", "bitpacking"),
+            ("dictionary_enabled::s.a", "false"),
+        ];
+
+        // The sequence 0, 1, 2, ... is left as a sequence unless the field is forced otherwise.
+        let a = written_field_chunks(batch.clone(), &pairs, &["s", "a"]).await;
+        assert!(a
+            .iter()
+            .all(|chunk| is_family(chunk, "fastlanes.bitpacked")));
+        let b = written_field_chunks(batch, &pairs, &["s", "b"]).await;
+        assert!(b
+            .iter()
+            .all(|chunk| !is_family(chunk, "fastlanes.bitpacked")));
+    }
+
+    /// Sorted values in a few drifting levels, like prices of a few tickers: the integer part of
+    /// their decimal byte parts suits a FoR reference per block, which FoR's estimate skips.
+    fn sorted_levels() -> ArrowArrayRef {
+        let values = (0..ROWS).map(|i| {
+            let level = 100_000 + (i / 4096) * 250_000;
+            (level + (i * 7919) % 50) as i128
+        });
+        Arc::new(
+            Decimal128Array::from_iter_values(values)
+                .with_precision_and_scale(16, 4)
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn override_chain_forces_a_child_encoding() {
+        let msp = |chunks: &[ArrayRef]| -> Vec<ArrayRef> {
+            chunks
+                .iter()
+                .map(|chunk| chunk.children()[0].clone())
+                .collect()
+        };
+        let adaptive =
+            assert_written_with(sorted_levels(), "byte_parts", "vortex.decimal_byte_parts").await;
+        assert!(msp(&adaptive)
+            .iter()
+            .all(|part| !is_family(part, "fastlanes.for")));
+
+        let chained = assert_written_with(
+            sorted_levels(),
+            "byte_parts/for",
+            "vortex.decimal_byte_parts",
+        )
+        .await;
+        assert!(msp(&chained)
+            .iter()
+            .all(|part| is_family(part, "fastlanes.for")));
+    }
+
+    #[test]
+    fn override_chain_step_must_be_unambiguous() {
+        let schema = Schema::new(vec![Field::new("c", DataType::Decimal128(16, 4), false)]);
+        let Err(err) = VortexWriteConfig::parse(&options(&[("encoding::c", "byte_parts/dict")]))
+            .unwrap()
+            .build_strategy(&schema, &VortexSession::default())
+        else {
+            panic!("expected an ambiguous chain step to be rejected");
+        };
+        assert!(err.to_string().contains("int.dict"), "{err}");
+    }
+
+    #[test]
+    fn unknown_struct_field_is_rejected() {
+        let inner = Field::new("a", DataType::Int64, false);
+        let schema = Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(vec![inner].into()),
+            false,
+        )]);
+        let Err(err) = VortexWriteConfig::parse(&options(&[("encoding::s.missing", "bitpacking")]))
+            .unwrap()
+            .build_strategy(&schema, &VortexSession::default())
+        else {
+            panic!("expected an unknown struct field to be rejected");
+        };
+        assert!(
+            err.to_string().contains("Unknown column 's.missing'"),
+            "{err}"
+        );
     }
 
     /// Whether any chunk has a child named `name`.

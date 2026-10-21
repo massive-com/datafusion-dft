@@ -38,7 +38,8 @@ dft -c "SELECT id, name FROM users" -o users.csv \
 ```
 
 Vortex writer options use a different set of keys. Column-specific keys use
-`KEY::COLUMN=VALUE` and apply to top-level columns only:
+`KEY::COLUMN=VALUE`. `COLUMN` is a top-level column or a dot-separated path to
+a struct field, such as `ohlc.open`:
 
 ```sh
 dft -c "SELECT id, name FROM users" -o users.vortex \
@@ -55,12 +56,19 @@ An encoding name can be a full scheme name (`vortex.string.fsst`), a
 kind-qualified name (`string.fsst`), or a short name (`fsst`) when the column
 type disambiguates it. Zone maps are written by default, including for columns
 with an encoding override. Vortex selects encodings adaptively; `encoding`
-forces the top-level encoding of each chunk of that column. Whatever that
-encoding produces (FoR's residuals, the integer part of `byte_parts`) is still
-compressed adaptively. A chunk the encoding declines or cannot shrink, such as
-values that bit-pack as narrowly as FoR would store them, is compressed
-adaptively too. Use `dictionary_enabled::COLUMN=false` to skip dictionary
-encoding when you want the forced encoding at the top of every chunk.
+forces the top-level encoding of each chunk of that column, even where Vortex's
+own estimate would skip it. Whatever that encoding produces (FoR's residuals,
+the integer part of `byte_parts`) is still compressed adaptively. A chunk the
+encoding fails on or cannot shrink is compressed adaptively instead. Use
+`dictionary_enabled::COLUMN=false` to skip dictionary encoding when you want
+the forced encoding at the top of every chunk.
+
+Separate encodings with `/` to force one below another: each encoding applies
+to the direct children of the one before it that it fits, and everything else
+stays adaptive. For example, `encoding::ohlc.open=byte_parts/for` stores the
+`open` field as decimal byte parts and forces FoR on their integer part. Below
+the first step the column type no longer picks the encoding's kind, so a name
+that several kinds share (such as `dict`) must be qualified, as in `int.dict`.
 
 Only encodings permitted by the Vortex editions dft writes with can be forced,
 and `--print-format-options vortex` lists only those. Forcing any other
