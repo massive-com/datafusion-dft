@@ -18,7 +18,7 @@
 //! Command line argument parsing: [`DftArgs`]
 
 use crate::config::get_data_dir;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use http::{HeaderName, HeaderValue};
 #[cfg(any(feature = "http", feature = "flightsql"))]
 use std::net::SocketAddr;
@@ -141,13 +141,64 @@ pub struct DftArgs {
 
     #[clap(
         long,
+        help = "Print the response headers received from the FlightSQL server. Only used for FlightSQL"
+    )]
+    pub print_headers: bool,
+
+    #[clap(
+        long,
+        help = "Only print the FlightSQL response headers, trailers, and a summary of the schema and record count, without printing the results. Implies --print-headers. Only used for FlightSQL",
+        conflicts_with_all = ["output", "json", "bench"]
+    )]
+    pub headers_only: bool,
+
+    #[clap(
+        long,
         short,
         help = "Path to save output to. Type is inferred from file suffix"
     )]
     pub output: Option<PathBuf>,
 
+    #[clap(
+        long = "format-option",
+        requires = "output",
+        help = "Output format option as KEY=VALUE. Can be repeated; the format is inferred from --output",
+        value_parser(parse_format_option),
+        action = clap::ArgAction::Append
+    )]
+    pub format_options: Vec<(String, String)>,
+
+    #[clap(
+        long,
+        value_name = "FORMAT",
+        help = "Print the available options for an output format, then exit"
+    )]
+    pub print_format_options: Option<Format>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum Format {
+    Csv,
+    Json,
+    Parquet,
+    #[cfg(feature = "vortex")]
+    Vortex,
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Csv => "csv",
+            Self::Json => "json",
+            Self::Parquet => "parquet",
+            #[cfg(feature = "vortex")]
+            Self::Vortex => "vortex",
+        };
+        f.write_str(name)
+    }
 }
 
 impl DftArgs {
@@ -293,6 +344,20 @@ fn parse_config_override(pair: &str) -> std::result::Result<(String, String), St
     if key.trim().is_empty() {
         return Err(format!(
             "Invalid config override: '{pair}'\n       Key cannot be empty"
+        ));
+    }
+    Ok((key.trim().to_string(), value.trim().to_string()))
+}
+
+fn parse_format_option(pair: &str) -> std::result::Result<(String, String), String> {
+    let (key, value) = pair.split_once('=').ok_or_else(|| {
+        format!(
+            "Invalid format option: '{pair}'\n       Expected format: 'KEY=VALUE', e.g. 'encoding::column=delta_binary_packed'"
+        )
+    })?;
+    if key.trim().is_empty() {
+        return Err(format!(
+            "Invalid format option: '{pair}'\n       Key cannot be empty"
         ));
     }
     Ok((key.trim().to_string(), value.trim().to_string()))

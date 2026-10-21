@@ -119,6 +119,74 @@ impl ExecutionContext {
             "parquet_page_index",
             Arc::new(datafusion_functions_parquet::ParquetPageIndexFunc {}),
         );
+        session_ctx.register_udtf(
+            "parquet_kv_metadata",
+            Arc::new(datafusion_functions_parquet::ParquetKvMetadataFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_arrow_schema",
+            Arc::new(datafusion_functions_parquet::ParquetArrowSchemaFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_row_groups",
+            Arc::new(datafusion_functions_parquet::ParquetRowGroupsFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_bloom_filter",
+            Arc::new(datafusion_functions_parquet::ParquetBloomFilterFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_bloom_filter_check",
+            Arc::new(datafusion_functions_parquet::ParquetBloomFilterCheckFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_dictionary",
+            Arc::new(datafusion_functions_parquet::ParquetDictionaryFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_compression",
+            Arc::new(datafusion_functions_parquet::ParquetCompressionFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_pages",
+            Arc::new(datafusion_functions_parquet::ParquetPagesFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_schema",
+            Arc::new(datafusion_functions_parquet::ParquetSchemaFunc {}),
+        );
+        session_ctx.register_udtf(
+            "parquet_file_metadata",
+            Arc::new(datafusion_functions_parquet::ParquetFileMetadataFunc {}),
+        );
+
+        #[cfg(feature = "functions-arrow")]
+        {
+            session_ctx.register_udtf(
+                "arrow_schema",
+                Arc::new(datafusion_functions_arrow::ArrowSchemaFunc {}),
+            );
+            session_ctx.register_udtf(
+                "arrow_metadata",
+                Arc::new(datafusion_functions_arrow::ArrowMetadataFunc {}),
+            );
+            session_ctx.register_udtf(
+                "arrow_batches",
+                Arc::new(datafusion_functions_arrow::ArrowBatchesFunc {}),
+            );
+            session_ctx.register_udtf(
+                "arrow_dictionaries",
+                Arc::new(datafusion_functions_arrow::ArrowDictionariesFunc {}),
+            );
+            session_ctx.register_udtf(
+                "arrow_file_metadata",
+                Arc::new(datafusion_functions_arrow::ArrowFileMetadataFunc {}),
+            );
+            session_ctx.register_udtf(
+                "arrow_batch",
+                Arc::new(datafusion_functions_arrow::ArrowBatchFunc {}),
+            );
+        }
 
         #[cfg(feature = "websocket")]
         session_ctx.register_udtf(
@@ -160,6 +228,26 @@ impl ExecutionContext {
             session_ctx.register_udtf(
                 "capture_wide",
                 Arc::new(datafusion_net::CaptureWideFunc::new(geoip_db_path)),
+            );
+        }
+
+        #[cfg(feature = "functions-rocksdb")]
+        {
+            session_ctx.register_udtf(
+                "rocksdb_metadata",
+                Arc::new(datafusion_functions_rocksdb::RocksDbMetadataFunc {}),
+            );
+            session_ctx.register_udtf(
+                "rocksdb_sstables",
+                Arc::new(datafusion_functions_rocksdb::RocksDbSstablesFunc {}),
+            );
+            session_ctx.register_udtf(
+                "rocksdb_cf_metadata",
+                Arc::new(datafusion_functions_rocksdb::RocksDbCfMetadataFunc {}),
+            );
+            session_ctx.register_udtf(
+                "rocksdb_cf_metrics",
+                Arc::new(datafusion_functions_rocksdb::RocksDbCfMetricsFunc {}),
             );
         }
 

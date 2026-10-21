@@ -27,6 +27,8 @@ mod clickhouse;
 mod deltalake;
 #[cfg(feature = "flightsql")]
 mod flightsql;
+#[cfg(feature = "functions-arrow")]
+mod functions_arrow;
 #[cfg(feature = "functions-json")]
 mod functions_json;
 #[cfg(feature = "huggingface")]
@@ -35,6 +37,8 @@ mod huggingface;
 mod mongodb;
 #[cfg(feature = "net")]
 mod net;
+#[cfg(feature = "functions-rocksdb")]
+mod rocksdb;
 #[cfg(feature = "s3")]
 mod s3;
 #[cfg(feature = "udfs-wasm")]

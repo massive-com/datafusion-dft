@@ -12,6 +12,109 @@ Includes functions from [datafusion-function-parquet] for querying Parquet files
 SELECT * FROM parquet_metadata('my_parquet_file.parquet')
 ```
 
+Or for reading the key-value metadata from a file's footer:
+
+```sql
+SELECT * FROM parquet_kv_metadata('my_parquet_file.parquet')
+```
+
+The Arrow schema embedded in the `ARROW:schema` key-value metadata entry (written by Arrow-based writers) can be decoded and printed with one row per field:
+
+```sql
+SELECT * FROM parquet_arrow_schema('my_parquet_file.parquet')
+```
+
+The data from specific row groups can be read by passing either a single row group index or an inclusive start and end index:
+
+```sql
+SELECT * FROM parquet_row_groups('my_parquet_file.parquet', 1)
+SELECT * FROM parquet_row_groups('my_parquet_file.parquet', 1, 3)
+```
+
+Bloom filter details (presence, location, and size per column chunk) can be inspected with:
+
+```sql
+SELECT * FROM parquet_bloom_filter('my_parquet_file.parquet')
+```
+
+And a column's bloom filter can be probed for a value, returning one row per row group. A `false` in `might_contain` guarantees the value is absent from that row group, while `true` means it might be present (subject to the filter's false positive probability):
+
+```sql
+SELECT * FROM parquet_bloom_filter_check('my_parquet_file.parquet', 'user_id', 'abc123')
+```
+
+The dictionary for a column can be read with one row per dictionary entry per row group (row groups where the column has no dictionary page produce no rows):
+
+```sql
+SELECT * FROM parquet_dictionary('my_parquet_file.parquet', 'user_id')
+```
+
+Compression details can be inspected with one row per column chunk per row group, including the codec, encodings, uncompressed (pre-compression) and compressed (post-compression) sizes, and the compression efficiency as the percentage of space saved:
+
+```sql
+SELECT * FROM parquet_compression('my_parquet_file.parquet')
+```
+
+The physical page layout can be inspected with one row per page (dictionary and data pages), including the page type, encoding, value counts, and sizes. An optional column name restricts the output to a single column. The `offset`, `compressed_page_size`, and `first_row_index` columns come from the offset index and are null for files written without a page index:
+
+```sql
+SELECT * FROM parquet_pages('my_parquet_file.parquet')
+SELECT * FROM parquet_pages('my_parquet_file.parquet', 'user_id')
+```
+
+The raw Parquet schema tree (as opposed to the embedded Arrow schema shown by `parquet_arrow_schema`) can be inspected with one row per schema node in depth-first order, including each node's repetition, physical/logical/converted type, field id, and, for leaf columns, the maximum definition and repetition levels:
+
+```sql
+SELECT * FROM parquet_schema('my_parquet_file.parquet')
+```
+
+And a single-row file summary (writer and format version, row/row group/column counts, file and footer sizes, total compressed and uncompressed data sizes, and whether the file has column statistics, a page index, or bloom filters) can be read with:
+
+```sql
+SELECT * FROM parquet_file_metadata('my_parquet_file.parquet')
+```
+
+### Arrow Functions (`--features=functions-arrow`)
+
+Includes functions from [datafusion-functions-arrow] for inspecting Arrow IPC files (the Arrow "file format", also used by Feather V2) in `dft`.
+
+The file's schema can be inspected with one row per top-level field:
+
+```sql
+SELECT * FROM arrow_schema('my_arrow_file.arrow')
+```
+
+The custom key-value metadata stored in the file's footer can be read with:
+
+```sql
+SELECT * FROM arrow_metadata('my_arrow_file.arrow')
+```
+
+Details on each record batch block (file offset, metadata and body sizes, row count, and compression codec) can be inspected with:
+
+```sql
+SELECT * FROM arrow_batches('my_arrow_file.arrow')
+```
+
+The data from specific record batches can be read by passing either a single batch index or an inclusive start and end index (the indexes match the `batch_index` column of `arrow_batches`):
+
+```sql
+SELECT * FROM arrow_batch('my_arrow_file.arrow', 1)
+SELECT * FROM arrow_batch('my_arrow_file.arrow', 1, 3)
+```
+
+Details on each dictionary block (dictionary id, delta flag, offset, sizes, and entry count) can be inspected with:
+
+```sql
+SELECT * FROM arrow_dictionaries('my_arrow_file.arrow')
+```
+
+And a single-row file summary (IPC metadata version, batch and dictionary counts, total rows, and total body bytes) can be read with:
+
+```sql
+SELECT * FROM arrow_file_metadata('my_arrow_file.arrow')
+```
+
 ### WASM UDF Functions (`--features=udfs-wasm`)
 
 Adds the ability to register WASM UDFs. Currently two different input types are supported:
@@ -134,6 +237,42 @@ SELECT tls_sni(payload) AS host, count(*) AS hellos
 FROM pcap('capture.pcap') WHERE tls_sni(payload) IS NOT NULL GROUP BY host ORDER BY hellos DESC
 ```
 
+### RocksDB (`--features=functions-rocksdb`)
+
+Adds table functions from [datafusion-functions-rocksdb](https://github.com/datafusion-contrib/datafusion-dft/tree/main/crates/datafusion-functions-rocksdb) for inspecting RocksDB databases with SQL.  Databases are opened read-only and the LOCK file is never taken, so a database another process has open read-write can be inspected safely.  Data still in the WAL is not visible to a read-only handle: memtable-related metrics read 0 and key estimates exclude unflushed writes.
+
+`rocksdb_metadata` returns a single database-level summary row: column families, latest sequence number, live SST file count and total size, estimated key count, snapshot count, and MANIFEST / WAL file details:
+
+```sql
+SELECT * FROM rocksdb_metadata('/path/to/db')
+```
+
+`rocksdb_sstables` returns one row per live SST file — column family, file name, LSM level, size, entry and deletion counts, and the key range (keys are arbitrary bytes, so the range is exposed both as lossless hex and as lossy UTF-8).  An optional second argument filters to a single column family:
+
+```sql
+SELECT column_family, file_name, level, size_bytes, num_entries
+FROM rocksdb_sstables('/path/to/db') ORDER BY size_bytes DESC;
+
+SELECT * FROM rocksdb_sstables('/path/to/db', 'my_cf');
+```
+
+This function exposes RocksDB's `GetLiveFilesMetaData()` API. `rocksdb_cf_metadata` exposes the companion `GetColumnFamilyMetaData()` API, returning total live SST size and file count for each column family. It accepts the same optional column-family filter:
+
+```sql
+SELECT * FROM rocksdb_cf_metadata('/path/to/db');
+SELECT * FROM rocksdb_cf_metadata('/path/to/db', 'my_cf');
+```
+
+`rocksdb_cf_metrics` returns one row per column family and RocksDB property (long format: `column_family`, `property`, `value`), covering key counts, SST and memtable sizes, compaction state, block cache usage, and per-level file counts (`rocksdb.num-files-at-level0` and up).  An optional second argument filters to a single column family:
+
+```sql
+SELECT column_family, property, value
+FROM rocksdb_cf_metrics('/path/to/db')
+WHERE property IN ('rocksdb.estimate-num-keys', 'rocksdb.total-sst-files-size');
+```
+
+Per-SST table properties (compression, block counts) and SST sequence number ranges are not exposed by the Rust `rocksdb` binding and are therefore not included.
+
 ## External Features
 
 `dft` also has several external optional (conditionally compiled features) integrations which are controlled by [Rust Crate Features]
@@ -196,6 +335,10 @@ CREATE EXTERNAL TABLE table_name STORED AS DELTATABLE LOCATION 's3://bucket/tabl
 
 ### ClickHouse (`--features=clickhouse`)
 
+> **Temporarily unavailable.** The `clickhouse` feature is disabled because
+> [datafusion-table-providers] has no DataFusion 55 release yet. The configuration below
+> applies once the feature is restored.
+
 Register an entire ClickHouse instance as a catalog (backed by [datafusion-table-providers]).  Each non-system database in the instance becomes a schema in the catalog and all of its tables are queryable.  For example use the following config:
 
 ```toml
@@ -221,6 +364,10 @@ SELECT * FROM clickhouse.my_db.my_table
 Multiple `[[execution.clickhouse]]` entries can be defined, each registered as its own catalog.  Databases and table names are discovered once at startup; the data itself is queried from ClickHouse on demand.
 
 ### MongoDB (`--features=mongodb`)
+
+> **Temporarily unavailable.** The `mongodb` feature is disabled because
+> [datafusion-table-providers] has no DataFusion 55 release yet. The configuration below
+> applies once the feature is restored.
 
 Register an entire MongoDB instance as a catalog (backed by [datafusion-table-providers]).  Each non-system database in the instance becomes a schema in the catalog and its collections are queryable as tables.  For example use the following config:
 
@@ -264,6 +411,7 @@ select * from foo where json_get(attributes, 'bar')::string='ham'
 ```
 
 [datafusion-function-json]: https://github.com/datafusion-contrib/datafusion-functions-json
+[datafusion-functions-arrow]: https://github.com/datafusion-contrib/datafusion-dft/tree/main/crates/datafusion-functions-arrow
 
 ### HuggingFace (`--features=huggingface`)
 
@@ -283,5 +431,4 @@ CREATE EXTERNAL TABLE hf4 STORED AS PARQUET LOCATION 'hf://HuggingFaceTB-finemat
 ```
 
 The "/" in the `repo_id` is replaced with a "-" for the base url that is registered with DataFusion to work better with its path parsing.
-
 
