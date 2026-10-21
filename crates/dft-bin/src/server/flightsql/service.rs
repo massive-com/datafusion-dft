@@ -517,7 +517,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let start = Timestamp::now();
         let request_id =
             try_request_id_from_request(request).map_err(|e| Status::internal(e.to_string()))?;
-        debug!("do_get_statement for request_id: {}", &request_id);
+        debug!("do_get_statement for request_id: {}", request_id);
         let res = self
             .do_get_statement_handler(request_id.clone(), ticket)
             .await;
@@ -543,7 +543,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let start = Timestamp::now();
         let request_id =
             try_request_id_from_request(request).map_err(|e| Status::internal(e.to_string()))?;
-        debug!("do_get_fallback for request_id: {}", &request_id);
+        debug!("do_get_fallback for request_id: {}", request_id);
         let res = self
             .do_get_fallback_handler(request_id.clone(), message)
             .await;
@@ -795,7 +795,7 @@ impl FlightSqlService for FlightSqlServiceImpl {
         let request_id =
             try_request_id_from_request(request).map_err(|e| Status::internal(e.to_string()))?;
 
-        debug!("do_get_prepared_statement for request_id: {}", &request_id);
+        debug!("do_get_prepared_statement for request_id: {}", request_id);
 
         // The request_id in the ticket should correspond to a logical plan in the requests HashMap
         // that was created by get_flight_info_prepared_statement
