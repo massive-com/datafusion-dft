@@ -27,11 +27,15 @@
 
 use color_eyre::eyre::{eyre, Result};
 use datafusion::arrow::datatypes::{DataType, Schema};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use vortex::compressor::{BtrBlocksCompressorBuilder, CompressionSessionExt, Scheme};
+use vortex::array::session::ArraySessionExt;
+use vortex::array::ArrayId;
+use vortex::compressor::{
+    BtrBlocksCompressor, BtrBlocksCompressorBuilder, CompressionSessionExt, Scheme, SchemeId,
+};
 use vortex::dtype::FieldPath;
 use vortex::editions::{ComponentKind, EditionSessionExt};
 use vortex::layout::layouts::buffered::BufferedStrategy;
@@ -47,7 +51,7 @@ use vortex::layout::layouts::table::TableStrategy;
 use vortex::layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
 use vortex::layout::{LayoutStrategy, VTable};
 use vortex::VortexSessionDefault;
-use vortex_btrblocks::schemes::integer;
+use vortex_btrblocks::schemes::{binary, integer};
 use vortex_btrblocks::SchemeExt;
 use vortex_session::VortexSession;
 
@@ -207,6 +211,9 @@ impl VortexWriteConfig {
             self.statistics,
         );
 
+        let writable_ids = writable_array_ids(session);
+        let writable = |id: &ArrayId| writable_ids.contains(id);
+
         let mut field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>> = HashMap::new();
         for column in &self.columns {
             let field = schema
@@ -222,11 +229,8 @@ impl VortexWriteConfig {
             let data_compressor: Arc<dyn CompressorPlugin> = match &column.encoding {
                 Some(raw) => {
                     let scheme = resolve_scheme(raw, kind, &column.name)?;
-                    Arc::new(
-                        BtrBlocksCompressorBuilder::empty()
-                            .with_new_scheme(scheme)
-                            .build(),
-                    )
+                    check_writable(scheme, &column.name, &writable)?;
+                    Arc::new(override_compressor(scheme, session))
                 }
                 None => Arc::clone(&default_data_compressor),
             };
@@ -284,6 +288,75 @@ impl VortexWriteConfig {
 
 fn flat_strategy() -> Arc<dyn LayoutStrategy> {
     Arc::new(FlatLayoutStrategy::default())
+}
+
+/// The serialized array IDs a write with `session` accepts: registered in the session and
+/// permitted by its enabled editions. `VortexWriteOptions::write` rejects any other ID while
+/// serializing, after the query has run and part of the file is written.
+fn writable_array_ids(session: &VortexSession) -> HashSet<ArrayId> {
+    let editions: HashSet<ArrayId> = session
+        .enabled_component_ids(ComponentKind::Array)
+        .into_iter()
+        .collect();
+    session.arrays().registry().read(|registry| {
+        registry
+            .keys()
+            .copied()
+            .filter(|id| editions.contains(id))
+            .collect()
+    })
+}
+
+/// Fail before writing when a forced scheme can only produce encodings the writer rejects.
+///
+/// This is the check `BtrBlocksCompressorBuilder::build` uses to drop such a scheme, which would
+/// otherwise turn the override into a silent no-op.
+fn check_writable(
+    scheme: &'static dyn Scheme,
+    column: &str,
+    writable: &dyn Fn(&ArrayId) -> bool,
+) -> Result<()> {
+    let rejected: Vec<String> = scheme
+        .refine(writable)
+        .produced_encodings()
+        .iter()
+        .filter(|id| !writable(id))
+        .map(|id| id.to_string())
+        .collect();
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    Err(eyre!(
+        "Encoding '{}' for column '{column}' writes {}, which the enabled Vortex editions do not permit",
+        scheme.scheme_name(),
+        rejected.join(", ")
+    ))
+}
+
+/// Build a compressor that may only use `scheme`.
+///
+/// Starting from the session, rather than `BtrBlocksCompressorBuilder::empty`, restricts the
+/// scheme to the encodings the session's editions permit, so a scheme with several wire formats
+/// (bitpacking, FoR, decimal byte parts) picks one the writer accepts. Presets only exclude
+/// schemes: compact keeps every scheme except buffer-level Zstd, which only the CUDA preset keeps.
+fn override_compressor(
+    scheme: &'static dyn Scheme,
+    session: &VortexSession,
+) -> BtrBlocksCompressor {
+    let others: Vec<SchemeId> = session
+        .compression()
+        .schemes()
+        .iter()
+        .map(|other| other.id())
+        .filter(|id| *id != scheme.id())
+        .collect();
+    let builder = BtrBlocksCompressorBuilder::from_session(session);
+    let builder = if scheme.id() == binary::ZstdBuffersScheme.id() {
+        builder.only_cuda_compatible()
+    } else {
+        builder.with_compact()
+    };
+    builder.exclude_schemes(others).build()
 }
 
 /// Compose the leaf pipeline used for a single column.
@@ -513,12 +586,20 @@ pub fn print_options() {
         "Use KEY::COLUMN=VALUE for column-specific keys (for example, encoding::id=bitpacking)."
     );
 
+    // List only the encodings the default editions let the writer use.
+    let writable_ids = writable_array_ids(&VortexSession::default());
+    let writable = |id: &ArrayId| writable_ids.contains(id);
+    let entries: Vec<&SchemeEntry> = scheme_entries()
+        .iter()
+        .filter(|entry| check_writable(entry.scheme, "", &writable).is_ok())
+        .collect();
+
     println!("\nAvailable encodings by column type:");
-    let mut kinds: Vec<&str> = scheme_entries().iter().map(|entry| entry.kind).collect();
+    let mut kinds: Vec<&str> = entries.iter().map(|entry| entry.kind).collect();
     kinds.sort_unstable();
     kinds.dedup();
     for kind in kinds {
-        let mut shorts: Vec<&str> = scheme_entries()
+        let mut shorts: Vec<&str> = entries
             .iter()
             .filter(|entry| entry.kind == kind)
             .map(|entry| entry.short)
@@ -526,5 +607,140 @@ pub fn print_options() {
         shorts.sort_unstable();
         shorts.dedup();
         println!("  {kind}: {}", shorts.join(", "));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{
+        ArrayRef as ArrowArrayRef, Decimal128Array, Int64Array, RecordBatch, StringArray,
+    };
+    use datafusion::arrow::datatypes::Field;
+    use futures::StreamExt;
+    use vortex::array::ArrayRef;
+    use vortex::arrow::ArrowSessionExt;
+    use vortex::file::OpenOptionsSessionExt;
+    use vortex_file::VortexWriteOptions;
+
+    const ROWS: i64 = 65_536;
+
+    fn options(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn collect_encoding_ids(array: &ArrayRef, ids: &mut Vec<String>) {
+        ids.push(array.encoding_id().to_string());
+        for child in array.children() {
+            collect_encoding_ids(&child, ids);
+        }
+    }
+
+    /// Write `column` as column `c` with an override to `encoding`, then return the encoding IDs
+    /// of every array read back from the file.
+    async fn written_encodings(column: ArrowArrayRef, encoding: &str) -> Vec<String> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            column.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap();
+        let session = VortexSession::default();
+        let config = VortexWriteConfig::parse(&options(&[
+            ("encoding::c", encoding),
+            ("dictionary_enabled::c", "false"),
+        ]))
+        .unwrap();
+        let strategy = config.build_strategy(&schema, &session).unwrap();
+
+        let array = session
+            .arrow()
+            .from_arrow_record_batch(batch, &schema)
+            .unwrap();
+        let mut buffer = Vec::new();
+        VortexWriteOptions::new(session.clone())
+            .with_strategy(strategy)
+            .write(&mut buffer, array.to_array_stream())
+            .await
+            .unwrap();
+
+        let file = session.open_options().open_buffer(buffer).unwrap();
+        let mut stream = file.scan().unwrap().into_array_stream().unwrap();
+        let mut ids = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            collect_encoding_ids(&chunk.unwrap(), &mut ids);
+        }
+        ids
+    }
+
+    /// Arrays read back report their in-memory encoding ID, which is the newest wire format's ID
+    /// (for example `fastlanes.bitpacked.v2`) even when the file stores an older one, so this
+    /// matches the encoding family. The write itself only succeeds when every serialized ID is in
+    /// the enabled editions.
+    async fn assert_written_with(column: ArrowArrayRef, encoding: &str, family: &str) {
+        let ids = written_encodings(column, encoding).await;
+        assert!(
+            ids.iter()
+                .any(|id| id == family || id.starts_with(&format!("{family}."))),
+            "expected {family} for encoding '{encoding}', got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bitpacking_override_is_written() {
+        // Increasing values need a different bit width per block, which bitpacking's v2 wire
+        // format stores. v2 is outside the default editions, so the override must fall back to
+        // v1 rather than fail while writing.
+        let values = Int64Array::from_iter_values(0..ROWS);
+        assert_written_with(Arc::new(values), "bitpacking", "fastlanes.bitpacked").await;
+    }
+
+    #[tokio::test]
+    async fn for_override_is_written() {
+        // Drifting values favour a reference per chunk, which only FoR's v2 wire format stores.
+        let values = Int64Array::from_iter_values((0..ROWS).map(|i| 1_000_000_000 + i));
+        assert_written_with(Arc::new(values), "for", "fastlanes.for").await;
+    }
+
+    #[tokio::test]
+    async fn byte_parts_override_is_written() {
+        let values =
+            Decimal128Array::from_iter_values((0..ROWS).map(|i| ((i * 7919) % 100_000) as i128))
+                .with_precision_and_scale(12, 2)
+                .unwrap();
+        assert_written_with(Arc::new(values), "byte_parts", "vortex.decimal_byte_parts").await;
+    }
+
+    #[tokio::test]
+    async fn fsst_override_is_written() {
+        let values = StringArray::from_iter_values(
+            (0..ROWS).map(|i| format!("https://example.com/item/{}", (i * 7919) % 5000)),
+        );
+        assert_written_with(Arc::new(values), "fsst", "vortex.fsst").await;
+    }
+
+    #[test]
+    fn override_outside_enabled_editions_is_rejected() {
+        // Delta is registered but not in the default editions, so the writer would reject it.
+        let schema = Schema::new(vec![Field::new("c", DataType::Int64, false)]);
+        let Err(err) = VortexWriteConfig::parse(&options(&[("encoding::c", "delta")]))
+            .unwrap()
+            .build_strategy(&schema, &VortexSession::default())
+        else {
+            panic!("expected the delta override to be rejected");
+        };
+        assert!(err.to_string().contains("fastlanes.delta"), "{err}");
+    }
+
+    #[test]
+    fn check_writable_rejects_encodings_not_permitted() {
+        let fsst = resolve_scheme("fsst", "string", "c").unwrap();
+        let produced = fsst.produced_encodings();
+        let err = check_writable(fsst, "c", &|id: &ArrayId| !produced.contains(id)).unwrap_err();
+        assert!(err.to_string().contains("vortex.fsst"), "{err}");
+        assert!(check_writable(fsst, "c", &|_: &ArrayId| true).is_ok());
     }
 }
