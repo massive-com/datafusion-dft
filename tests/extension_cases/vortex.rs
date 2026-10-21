@@ -94,6 +94,78 @@ async fn test_vortex_options_from_config() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_vortex_create_external_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ids.vortex");
+    let path = path.to_str().unwrap();
+    let test_exec = TestExecution::new().await;
+    test_exec
+        .run(&format!(
+            "COPY (SELECT value AS id FROM generate_series(1, 1000)) TO '{path}' STORED AS VORTEX"
+        ))
+        .await
+        .unwrap();
+    test_exec
+        .run(&format!(
+            "CREATE EXTERNAL TABLE ids STORED AS VORTEX LOCATION '{path}'"
+        ))
+        .await
+        .unwrap();
+    test_exec
+        .run(&format!(
+            "CREATE EXTERNAL TABLE ids_unpushed STORED AS VORTEX LOCATION '{path}' \
+             OPTIONS (predicate_pushdown 'false')"
+        ))
+        .await
+        .unwrap();
+
+    let output = test_exec
+        .run_and_format("SELECT count(*) AS n FROM ids WHERE id > 990")
+        .await;
+    assert!(
+        output.iter().any(|line| line == "| 10 |"),
+        "unexpected output: {output:?}"
+    );
+
+    // Table options reach the Vortex format.
+    let explain = "EXPLAIN SELECT count(*) FROM {table} WHERE id = 5";
+    assert!(!filters_after_scan(
+        &test_exec
+            .run_and_format(&explain.replace("{table}", "ids"))
+            .await
+    ));
+    assert!(filters_after_scan(
+        &test_exec
+            .run_and_format(&explain.replace("{table}", "ids_unpushed"))
+            .await
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_vortex_keeps_default_table_factories() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ids.csv");
+    let path = path.to_str().unwrap();
+    let test_exec = TestExecution::new().await;
+    test_exec
+        .run(&format!("COPY (SELECT 1 AS id) TO '{path}' STORED AS CSV"))
+        .await
+        .unwrap();
+
+    test_exec
+        .run(&format!(
+            "CREATE EXTERNAL TABLE ids STORED AS CSV LOCATION '{path}' OPTIONS ('format.has_header' 'true')"
+        ))
+        .await
+        .unwrap();
+    let output = test_exec.run_and_format("SELECT id FROM ids").await;
+    assert!(
+        output.iter().any(|line| line == "| 1  |"),
+        "unexpected output: {output:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_vortex_local_scan_reports_reads() {
     let dir = tempfile::tempdir().unwrap();
     // The space checks that the file's object store path is decoded before it is opened.
