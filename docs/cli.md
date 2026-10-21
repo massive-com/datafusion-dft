@@ -55,9 +55,12 @@ An encoding name can be a full scheme name (`vortex.string.fsst`), a
 kind-qualified name (`string.fsst`), or a short name (`fsst`) when the column
 type disambiguates it. Zone maps are written by default, including for columns
 with an encoding override. Vortex selects encodings adaptively; `encoding`
-restricts the candidate schemes for that column. Use
-`dictionary_enabled::COLUMN=false` to skip dictionary encoding when you want a
-single encoding.
+forces the top-level encoding of each chunk of that column. Whatever that
+encoding produces (FoR's residuals, the integer part of `byte_parts`) is still
+compressed adaptively. A chunk the encoding declines or cannot shrink, such as
+values that bit-pack as narrowly as FoR would store them, is compressed
+adaptively too. Use `dictionary_enabled::COLUMN=false` to skip dictionary
+encoding when you want the forced encoding at the top of every chunk.
 
 Only encodings permitted by the Vortex editions dft writes with can be forced,
 and `--print-format-options vortex` lists only those. Forcing any other

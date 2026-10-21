@@ -91,6 +91,7 @@ url = { features = ["serde"], version = "2.5.2" }
 uuid = "1.10.0"
 vortex = "0.89"
 vortex-btrblocks = "0.89"
+vortex-compressor = "0.89"
 vortex-datafusion = "0.89"
 vortex-file = "0.89"
 vortex-session = "0.89"
