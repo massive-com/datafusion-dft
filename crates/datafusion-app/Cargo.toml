@@ -56,6 +56,7 @@ tokio-tungstenite = { features = [
 ], optional = true, workspace = true }
 tonic = { optional = true, workspace = true }
 url = { optional = true, workspace = true }
+vortex = { optional = true, workspace = true }
 vortex-datafusion = { optional = true, workspace = true }
 
 [dev-dependencies]
@@ -74,7 +75,7 @@ net = ["datafusion-net/live", "dep:datafusion-net"]
 observability = ["dep:metrics", "dep:tokio-metrics"]
 s3 = ["object_store/aws", "url"]
 udfs-wasm = ["dep:datafusion-udfs-wasm"]
-vortex = ["dep:vortex-datafusion"]
+vortex = ["dep:vortex", "dep:vortex-datafusion"]
 websocket = ["dep:rustls", "dep:tokio-tungstenite"]
 
 [lints]

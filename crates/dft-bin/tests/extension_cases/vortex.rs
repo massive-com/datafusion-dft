@@ -91,3 +91,37 @@ async fn test_vortex_options_from_config() {
 
     assert!(filters_after_scan(&test_exec.run_and_format(&query).await));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_vortex_local_scan_reports_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    // The space checks that the file's object store path is decoded before it is opened.
+    let path = dir.path().join("local ids.vortex");
+    let path = path.to_str().unwrap();
+    let test_exec = TestExecution::new().await;
+    test_exec
+        .run(&format!(
+            "COPY (SELECT value AS id FROM generate_series(1, 1000)) TO '{path}' STORED AS VORTEX"
+        ))
+        .await
+        .unwrap();
+
+    let query = format!("SELECT count(*) AS n FROM '{path}' WHERE id > 990");
+    let output = test_exec.run_and_format(&query).await;
+    assert!(
+        output.iter().any(|line| line == "| 10 |"),
+        "unexpected output: {output:?}"
+    );
+
+    let explain = test_exec
+        .run_and_format(&format!("EXPLAIN ANALYZE {query}"))
+        .await;
+    let scan = explain
+        .iter()
+        .find(|line| line.contains("DataSourceExec"))
+        .expect("plan has a scan");
+    assert!(
+        scan.contains("bytes_scanned=") && scan.contains("io_requests="),
+        "scan reports no reads: {scan}"
+    );
+}
