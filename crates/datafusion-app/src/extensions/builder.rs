@@ -28,6 +28,7 @@ use datafusion::datasource::file_format::{
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::prelude::SessionConfig;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -61,6 +62,7 @@ pub struct DftSessionStateBuilder {
     table_factories: Option<HashMap<String, Arc<dyn TableProviderFactory>>>,
     file_format_factories: Vec<Arc<dyn FileFormatFactory>>,
     catalog_providers: Option<HashMap<String, Arc<dyn CatalogProvider>>>,
+    physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
     runtime_env: Option<Arc<RuntimeEnv>>,
 }
 
@@ -89,6 +91,7 @@ impl Default for DftSessionStateBuilder {
                 Arc::new(JsonFormatFactory::new()),
             ],
             catalog_providers: None,
+            physical_optimizer_rules: Vec::new(),
             runtime_env: None,
         }
     }
@@ -114,6 +117,7 @@ impl DftSessionStateBuilder {
             ],
 
             catalog_providers: None,
+            physical_optimizer_rules: Vec::new(),
             runtime_env: None,
         };
         Ok(builder)
@@ -172,6 +176,14 @@ impl DftSessionStateBuilder {
         }
     }
 
+    /// Add a physical optimizer rule that runs after DataFusion's default rules
+    pub fn add_physical_optimizer_rule(
+        &mut self,
+        rule: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+    ) {
+        self.physical_optimizer_rules.push(rule);
+    }
+
     /// Return the current [`RuntimeEnv`], creating a default if it doesn't exist
     pub fn runtime_env(&mut self) -> &RuntimeEnv {
         if self.runtime_env.is_none() {
@@ -210,6 +222,7 @@ impl DftSessionStateBuilder {
             table_factories,
             file_format_factories,
             catalog_providers,
+            physical_optimizer_rules,
             runtime_env,
             ..
         } = self;
@@ -225,6 +238,9 @@ impl DftSessionStateBuilder {
             builder = builder.with_table_factories(table_factories);
         }
         builder = builder.with_file_formats(file_format_factories);
+        for rule in physical_optimizer_rules {
+            builder = builder.with_physical_optimizer_rule(rule);
+        }
 
         if let Some(catalog_providers) = catalog_providers {
             let catalogs_list = MemoryCatalogProviderList::new();
