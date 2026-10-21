@@ -201,6 +201,54 @@ pub struct ExecutionIOStats {
     parquet_rg_matched_stats: Option<MetricValue>,
     parquet_rg_pruned_bloom_filter: Option<MetricValue>,
     parquet_rg_matched_bloom_filter: Option<MetricValue>,
+    vortex: Option<VortexScanStats>,
+}
+
+/// Totals from the metrics Vortex records for its scans outside the plan's metrics
+#[derive(Clone, Debug, Default)]
+pub struct VortexScanStats {
+    segment_requests: u64,
+    io_requests: u64,
+    bytes_read: u64,
+}
+
+impl VortexScanStats {
+    #[cfg(feature = "vortex")]
+    fn add_scan(&mut self, source: &vortex_datafusion::VortexSource) {
+        use vortex::metrics::MetricValue;
+
+        for metric in source.metrics_registry().snapshot() {
+            let MetricValue::Counter(counter) = metric.value() else {
+                continue;
+            };
+            match metric.name().as_ref() {
+                "vortex.file.segments.cache.hits" | "vortex.file.segments.cache.misses" => {
+                    self.segment_requests += counter.value()
+                }
+                "io.requests.individual" | "io.requests.coalesced" => {
+                    self.io_requests += counter.value()
+                }
+                "vortex.io.read.total_size" => self.bytes_read += counter.value(),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for VortexScanStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Vortex Scan Stats")?;
+        writeln!(
+            f,
+            "{:<20} {:<20} {:<20}",
+            "Segments Requested", "I/O Requests", "Bytes Read"
+        )?;
+        writeln!(
+            f,
+            "{:<20} {:<20} {:<20}",
+            self.segment_requests, self.io_requests, self.bytes_read
+        )
+    }
 }
 
 impl ExecutionIOStats {
@@ -316,6 +364,10 @@ impl std::fmt::Display for ExecutionIOStats {
                 self.parquet_rg_pruned_page_index_ratio()
             )?;
         }
+        if let Some(vortex) = &self.vortex {
+            writeln!(f)?;
+            write!(f, "{vortex}")?;
+        }
         Ok(())
     }
 }
@@ -335,6 +387,7 @@ struct PlanIOVisitor {
     parquet_rg_matched_stats: Option<MetricValue>,
     parquet_rg_pruned_bloom_filter: Option<MetricValue>,
     parquet_rg_matched_bloom_filter: Option<MetricValue>,
+    vortex: Option<VortexScanStats>,
 }
 
 impl PlanIOVisitor {
@@ -350,6 +403,7 @@ impl PlanIOVisitor {
             parquet_rg_matched_stats: None,
             parquet_rg_pruned_bloom_filter: None,
             parquet_rg_matched_bloom_filter: None,
+            vortex: None,
         }
     }
 
@@ -377,6 +431,20 @@ impl PlanIOVisitor {
                     self.parquet_rg_matched_stats =
                         metrics.sum_by_name("row_groups_matched_statistics");
                 }
+                #[cfg(feature = "vortex")]
+                if let Some(source) = data_source_exec
+                    .data_source()
+                    .downcast_ref::<FileScanConfig>()
+                    .and_then(|config| {
+                        config
+                            .file_source()
+                            .downcast_ref::<vortex_datafusion::VortexSource>()
+                    })
+                {
+                    self.vortex
+                        .get_or_insert_with(VortexScanStats::default)
+                        .add_scan(source);
+                }
             }
         }
     }
@@ -395,6 +463,7 @@ impl From<PlanIOVisitor> for ExecutionIOStats {
             parquet_rg_matched_stats: value.parquet_rg_matched_stats,
             parquet_rg_pruned_bloom_filter: value.parquet_rg_pruned_bloom_filter,
             parquet_rg_matched_bloom_filter: value.parquet_rg_matched_bloom_filter,
+            vortex: value.vortex,
         }
     }
 }
