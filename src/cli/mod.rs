@@ -893,9 +893,10 @@ impl CliApp {
 /// Wrapper for Vortex writer to handle Arrow RecordBatch conversion
 #[cfg(feature = "vortex")]
 struct VortexFileWriter {
-    path: PathBuf,
+    file: tokio::fs::File,
     batches: Vec<RecordBatch>,
     strategy: Arc<dyn LayoutStrategy>,
+    session: VortexSession,
 }
 
 #[cfg(feature = "vortex")]
@@ -903,15 +904,14 @@ impl VortexFileWriter {
     fn new(
         file: File,
         _schema: SchemaRef,
-        path: &Path,
         strategy: Arc<dyn LayoutStrategy>,
+        session: VortexSession,
     ) -> Result<Self> {
-        // We need to drop the std::fs::File and use tokio::fs::File later
-        drop(file);
         Ok(Self {
-            path: path.to_path_buf(),
+            file: tokio::fs::File::from_std(file),
             batches: Vec::new(),
             strategy,
+            session,
         })
     }
 
@@ -926,16 +926,13 @@ impl VortexFileWriter {
             return Ok(());
         }
 
-        // Open file using tokio::fs::File which implements VortexWrite
-        let file = tokio::fs::File::create(&self.path).await?;
-
         // Concatenate all batches into a single batch
         let schema = self.batches[0].schema();
         let concatenated = datafusion::arrow::compute::concat_batches(&schema, &self.batches)?;
 
         // Convert to Vortex array
-        let session = VortexSession::default();
-        let vortex_array = session
+        let vortex_array = self
+            .session
             .arrow()
             .from_arrow_record_batch(concatenated, &schema)
             .map_err(|e| eyre!("{}", e))?;
@@ -944,9 +941,9 @@ impl VortexFileWriter {
         let stream = vortex_array.to_array_stream();
 
         // Write using async API
-        VortexWriteOptions::new(session)
+        VortexWriteOptions::new(self.session)
             .with_strategy(self.strategy)
-            .write(file, stream)
+            .write(self.file, stream)
             .await
             .map_err(|e| eyre!("Failed to write Vortex file: {}", e))?;
 
@@ -1031,10 +1028,11 @@ fn path_to_writer(
                 #[cfg(feature = "vortex")]
                 "vortex" => {
                     let config = vortex_write_options::VortexWriteConfig::parse(format_options)?;
-                    let strategy = config.build_strategy(schema.as_ref())?;
+                    let session = VortexSession::default();
+                    let strategy = config.build_strategy(schema.as_ref(), &session)?;
                     let file = std::fs::File::create(path)?;
                     Ok(AnyWriter::Vortex(VortexFileWriter::new(
-                        file, schema, path, strategy,
+                        file, schema, strategy, session,
                     )?))
                 }
                 _ => {

@@ -31,8 +31,9 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use vortex::compressor::{BtrBlocksCompressorBuilder, Scheme};
+use vortex::compressor::{BtrBlocksCompressorBuilder, CompressionSessionExt, Scheme};
 use vortex::dtype::FieldPath;
+use vortex::editions::{ComponentKind, EditionSessionExt};
 use vortex::layout::layouts::buffered::BufferedStrategy;
 use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
 use vortex::layout::layouts::collect::CollectStrategy;
@@ -40,12 +41,15 @@ use vortex::layout::layouts::compressed::{CompressingStrategy, CompressorPlugin}
 use vortex::layout::layouts::dict::writer::{DictLayoutOptions, DictStrategy};
 use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex::layout::layouts::list::writer::ListLayoutStrategy;
+use vortex::layout::layouts::list::List;
 use vortex::layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
-use vortex::layout::layouts::table::{use_experimental_list_layout, TableStrategy};
+use vortex::layout::layouts::table::TableStrategy;
 use vortex::layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
-use vortex::layout::LayoutStrategy;
-use vortex_btrblocks::schemes::{binary, float, integer, string};
-use vortex_btrblocks::{SchemeExt, ALL_SCHEMES};
+use vortex::layout::{LayoutStrategy, VTable};
+use vortex::VortexSessionDefault;
+use vortex_btrblocks::schemes::integer;
+use vortex_btrblocks::SchemeExt;
+use vortex_session::VortexSession;
 
 /// Default row block size. Matches `vortex_file::WriteStrategyBuilder`.
 const DEFAULT_ROW_BLOCK_SIZE: usize = 8192;
@@ -53,14 +57,6 @@ const DEFAULT_ROW_BLOCK_SIZE: usize = 8192;
 const DEFAULT_DATA_BLOCK_TARGET_BYTES: u64 = 1 << 20;
 /// Buffer size between compression and layout emission. Matches `vortex_file::WriteStrategyBuilder`.
 const BUFFER_SIZE: u64 = 2 * (1 << 20);
-
-/// Schemes that are not part of `ALL_SCHEMES` and need the `zstd` and `pco` features.
-const COMPACT_SCHEMES: &[&dyn Scheme] = &[
-    &string::ZstdScheme,
-    &binary::ZstdScheme,
-    &integer::PcoScheme,
-    &float::PcoScheme,
-];
 
 /// Parsed `--format-option` values for a `.vortex` output file.
 #[derive(Debug)]
@@ -182,11 +178,15 @@ impl VortexWriteConfig {
 
     /// Build the layout strategy. Every column uses the same pipeline; only the compressor and
     /// the zone-map layer differ per column, so overrides keep zone maps unless disabled.
-    pub fn build_strategy(&self, schema: &Schema) -> Result<Arc<dyn LayoutStrategy>> {
+    pub fn build_strategy(
+        &self,
+        schema: &Schema,
+        session: &VortexSession,
+    ) -> Result<Arc<dyn LayoutStrategy>> {
         let base = if self.compact {
-            BtrBlocksCompressorBuilder::default().with_compact()
+            BtrBlocksCompressorBuilder::from_session(session).with_compact()
         } else {
-            BtrBlocksCompressorBuilder::default()
+            BtrBlocksCompressorBuilder::from_session(session)
         };
         let stats_compressor: Arc<dyn CompressorPlugin> = Arc::new(base.clone().build());
         let default_data_compressor: Arc<dyn CompressorPlugin> = Arc::new(
@@ -248,7 +248,12 @@ impl VortexWriteConfig {
         let mut table = TableStrategy::new(validity, Arc::clone(&default_leaf))
             .with_field_writers(field_writers);
 
-        if use_experimental_list_layout() {
+        // Matches `vortex_file::WriteStrategyBuilder`: list fields use the list layout only when
+        // an enabled edition includes it.
+        if session
+            .enabled_component_ids(ComponentKind::Layout)
+            .contains(&List.id())
+        {
             let stats_compressor = Arc::clone(&stats_compressor);
             table = table.with_list_layout_factory(
                 move |list_layout: ListLayoutStrategy| -> Arc<dyn LayoutStrategy> {
@@ -358,10 +363,7 @@ fn scheme_entries() -> &'static [SchemeEntry] {
     static ENTRIES: OnceLock<Vec<SchemeEntry>> = OnceLock::new();
     ENTRIES.get_or_init(|| {
         let mut entries = Vec::new();
-        for scheme in ALL_SCHEMES {
-            push_scheme_entry(&mut entries, *scheme);
-        }
-        for scheme in COMPACT_SCHEMES {
+        for scheme in VortexSession::default().compression().schemes() {
             push_scheme_entry(&mut entries, *scheme);
         }
         entries

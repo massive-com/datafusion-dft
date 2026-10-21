@@ -71,14 +71,14 @@ tui-logger = { features = [
 ], optional = true, version = "0.18" }
 url = { features = ["serde"], version = "2.5.2" }
 uuid = { optional = true, version = "1.10.0" }
-vortex = { optional = true, version = "0.86" }
+vortex = { optional = true, version = "0.89" }
 vortex-btrblocks = { features = [
   "pco",
   "zstd",
-], optional = true, version = "0.86" }
-vortex-datafusion = { optional = true, version = "0.86" }
-vortex-file = { optional = true, version = "0.86" }
-vortex-session = { optional = true, version = "0.86" }
+], optional = true, version = "0.89" }
+vortex-datafusion = { optional = true, version = "0.89" }
+vortex-file = { optional = true, version = "0.89" }
+vortex-session = { optional = true, version = "0.89" }
 
 [dev-dependencies]
 assert_cmd = "2.0.16"
