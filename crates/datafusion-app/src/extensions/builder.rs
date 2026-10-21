@@ -226,8 +226,12 @@ impl DftSessionStateBuilder {
         if let Some(runtime_env) = runtime_env {
             builder = builder.with_runtime_env(runtime_env);
         }
+        // Added to DataFusion's default factories, which `with_table_factories` would replace.
         if let Some(table_factories) = table_factories {
-            builder = builder.with_table_factories(table_factories);
+            builder
+                .table_factories()
+                .get_or_insert_with(HashMap::new)
+                .extend(table_factories);
         }
         builder = builder.with_file_formats(file_format_factories);
         for rule in physical_optimizer_rules {
@@ -243,5 +247,22 @@ impl DftSessionStateBuilder {
         }
 
         Ok(builder.build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::datasource::provider::DefaultTableFactory;
+
+    #[test]
+    fn added_table_factories_keep_the_defaults() {
+        let mut builder = DftSessionStateBuilder::try_new(None).unwrap();
+        builder.add_table_factory("EXTRA", Arc::new(DefaultTableFactory::new()));
+        let state = builder.build().unwrap();
+
+        let factories = state.table_factories();
+        assert!(factories.contains_key("EXTRA"));
+        assert!(factories.contains_key("CSV"));
     }
 }

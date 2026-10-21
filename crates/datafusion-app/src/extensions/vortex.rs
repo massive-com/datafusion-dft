@@ -25,6 +25,7 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, FileSource};
+use datafusion::datasource::provider::DefaultTableFactory;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::object_store::{ObjectStoreRegistry, ObjectStoreUrl};
 use datafusion::object_store::local::LocalFileSystem;
@@ -69,6 +70,9 @@ impl Extension for VortexExtension {
         builder.add_config_extension(VortexTableOptions::default())?;
         builder.add_config_extension(DftVortexOptions::default())?;
         builder.add_file_format_factory(Arc::new(VortexFormatFactory::new()));
+        // `CREATE EXTERNAL TABLE ... STORED AS VORTEX`, created the way DataFusion creates its
+        // built-in formats' tables.
+        builder.add_table_factory("VORTEX", Arc::new(DefaultTableFactory::new()));
         let stores = Arc::clone(&builder.runtime_env().object_store_registry);
         builder.add_physical_optimizer_rule(Arc::new(VortexReaders { stores }));
         Ok(())

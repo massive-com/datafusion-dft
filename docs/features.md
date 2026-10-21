@@ -348,6 +348,19 @@ Register deltalake tables.  For example:
 CREATE EXTERNAL TABLE table_name STORED AS DELTATABLE LOCATION 's3://bucket/table'
 ```
 
+### Vortex (`--features=vortex`)
+
+Query and write [Vortex](https://vortex.dev) files. Query a file by its path, or register a file or directory as a table:
+
+```sql
+SELECT * FROM 'data/trades.vortex';
+
+CREATE EXTERNAL TABLE trades STORED AS VORTEX LOCATION 's3://bucket/trades/'
+OPTIONS (predicate_pushdown 'true');
+```
+
+The table options are the Vortex reader options described in the [config guide](config.md). See the [CLI guide](cli.md) for writing Vortex files with `--output`.
+
 ### ClickHouse (`--features=clickhouse`)
 
 > **Temporarily unavailable.** The `clickhouse` feature is disabled because
