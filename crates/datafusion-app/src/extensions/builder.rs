@@ -21,10 +21,7 @@ use color_eyre::{eyre, Result};
 use datafusion::catalog::MemoryCatalogProviderList;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, TableProviderFactory};
 use datafusion::config::ConfigExtension;
-use datafusion::datasource::file_format::{
-    csv::CsvFormatFactory, json::JsonFormatFactory, parquet::ParquetFormatFactory,
-    FileFormatFactory,
-};
+use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -85,11 +82,7 @@ impl Default for DftSessionStateBuilder {
             session_config: SessionConfig::default().with_information_schema(true),
             execution_config: None,
             table_factories: None,
-            file_format_factories: vec![
-                Arc::new(ParquetFormatFactory::new()),
-                Arc::new(CsvFormatFactory::new()),
-                Arc::new(JsonFormatFactory::new()),
-            ],
+            file_format_factories: Vec::new(),
             catalog_providers: None,
             physical_optimizer_rules: Vec::new(),
             runtime_env: None,
@@ -110,12 +103,7 @@ impl DftSessionStateBuilder {
             session_config,
             execution_config: config,
             table_factories: None,
-            file_format_factories: vec![
-                Arc::new(ParquetFormatFactory::new()),
-                Arc::new(CsvFormatFactory::new()),
-                Arc::new(JsonFormatFactory::new()),
-            ],
-
+            file_format_factories: Vec::new(),
             catalog_providers: None,
             physical_optimizer_rules: Vec::new(),
             runtime_env: None,
@@ -241,7 +229,11 @@ impl DftSessionStateBuilder {
                 .get_or_insert_with(HashMap::new)
                 .extend(table_factories);
         }
-        builder = builder.with_file_formats(file_format_factories);
+        // Added to DataFusion's default formats, which `with_file_formats` would replace.
+        builder
+            .file_formats()
+            .get_or_insert_with(Vec::new)
+            .extend(file_format_factories);
         for rule in physical_optimizer_rules {
             builder = builder.with_physical_optimizer_rule(rule);
         }
@@ -272,5 +264,20 @@ mod tests {
         let factories = state.table_factories();
         assert!(factories.contains_key("EXTRA"));
         assert!(factories.contains_key("CSV"));
+    }
+
+    #[test]
+    fn default_file_formats_are_registered() {
+        let state = DftSessionStateBuilder::try_new(None)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        for ext in ["parquet", "csv", "json", "arrow"] {
+            assert!(
+                state.get_file_format_factory(ext).is_some(),
+                "missing file format: {ext}"
+            );
+        }
     }
 }
