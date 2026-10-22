@@ -19,7 +19,7 @@
 
 use color_eyre::{eyre, Result};
 use datafusion::catalog::MemoryCatalogProviderList;
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, TableProviderFactory};
+use datafusion::catalog::{CatalogProvider, TableProviderFactory};
 use datafusion::config::ConfigExtension;
 use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::execution::context::SessionState;
@@ -28,7 +28,6 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::prelude::SessionConfig;
 use std::collections::HashMap;
-use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::config::ExecutionConfig;
@@ -37,60 +36,31 @@ use super::{enabled_extensions, Extension};
 
 /// Builds a DataFusion [`SessionState`] with any necessary configuration
 ///
-/// Ideally we would use the DataFusion [`SessionStateBuilder`], but it doesn't
-/// currently have all the needed APIs. Once we have a good handle on the needed
-/// APIs we can upstream them to DataFusion.
-///
-/// List of things that would be nice to add upstream:
-/// TODO: Implement Debug for SessionStateBuilder upstream
-///  <https://github.com/apache/datafusion/issues/12555>
-/// TODO: Implement some way to get access to the current RuntimeEnv (to register object stores)
-///  <https://github.com/apache/datafusion/issues/12553>
-/// TODO: Implement a way to add just a single TableProviderFactory
-///  <https://github.com/apache/datafusion/issues/12552>
-/// TODO: Make TableFactoryProvider implement Debug
-///   <https://github.com/apache/datafusion/pull/12557>
-/// TODO: rename RuntimeEnv::new() to RuntimeEnv::try_new() as it returns a Result:
-///   <https://github.com/apache/datafusion/issues/12554>
-//#[derive(Debug)]
+/// Wraps a [`SessionStateBuilder`] with DataFusion's default features, adding the
+/// [`ExecutionConfig`] settings and `&mut` methods that let each [`Extension`] add to
+/// those defaults rather than replace them.
+#[derive(Debug)]
 pub struct DftSessionStateBuilder {
     execution_config: Option<ExecutionConfig>,
-    session_config: SessionConfig,
-    table_factories: Option<HashMap<String, Arc<dyn TableProviderFactory>>>,
-    file_format_factories: Vec<Arc<dyn FileFormatFactory>>,
-    catalog_providers: Option<HashMap<String, Arc<dyn CatalogProvider>>>,
-    physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
-    runtime_env: Option<Arc<RuntimeEnv>>,
-}
-
-impl Debug for DftSessionStateBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DftSessionStateBuilder")
-            .field("session_config", &self.session_config)
-            .field(
-                "table_factories",
-                &"TODO TableFactory does not implement Debug",
-            )
-            .field("runtime_env", &self.runtime_env)
-            .finish()
-    }
+    inner: SessionStateBuilder,
 }
 
 impl Default for DftSessionStateBuilder {
     fn default() -> Self {
-        Self {
-            session_config: SessionConfig::default().with_information_schema(true),
-            execution_config: None,
-            table_factories: None,
-            file_format_factories: Vec::new(),
-            catalog_providers: None,
-            physical_optimizer_rules: Vec::new(),
-            runtime_env: None,
-        }
+        Self::new(None, SessionConfig::default().with_information_schema(true))
     }
 }
 
 impl DftSessionStateBuilder {
+    fn new(execution_config: Option<ExecutionConfig>, session_config: SessionConfig) -> Self {
+        Self {
+            execution_config,
+            inner: SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(session_config),
+        }
+    }
+
     /// Create a new builder
     pub fn try_new(config: Option<ExecutionConfig>) -> Result<Self> {
         let session_config = if let Some(cfg) = config.clone().unwrap_or_default().datafusion {
@@ -98,29 +68,23 @@ impl DftSessionStateBuilder {
         } else {
             SessionConfig::default().with_information_schema(true)
         };
-
-        let builder = Self {
-            session_config,
-            execution_config: config,
-            table_factories: None,
-            file_format_factories: Vec::new(),
-            catalog_providers: None,
-            physical_optimizer_rules: Vec::new(),
-            runtime_env: None,
-        };
-        Ok(builder)
+        Ok(Self::new(config, session_config))
     }
 
     /// Add a table factory to the list of factories on this builder
     pub fn add_table_factory(&mut self, name: &str, factory: Arc<dyn TableProviderFactory>) {
-        self.table_factories
-            .get_or_insert_default()
+        self.inner
+            .table_factories()
+            .get_or_insert_with(HashMap::new)
             .insert(name.to_string(), factory);
     }
 
     /// Add a file format factory to the list of file format factories on this builder
     pub fn add_file_format_factory(&mut self, factory: Arc<dyn FileFormatFactory>) {
-        self.file_format_factories.push(factory);
+        self.inner
+            .file_formats()
+            .get_or_insert_with(Vec::new)
+            .push(factory);
     }
 
     /// Register a configuration extension, so its options can be changed with
@@ -129,7 +93,11 @@ impl DftSessionStateBuilder {
         &mut self,
         extension: T,
     ) -> datafusion::common::Result<()> {
-        let options = self.session_config.options_mut();
+        let options = self
+            .inner
+            .config()
+            .get_or_insert_with(SessionConfig::default)
+            .options_mut();
         options.extensions.insert(extension);
 
         // `SessionConfig::from_string_hash_map` only reads built-in options, so this extension's
@@ -149,9 +117,10 @@ impl DftSessionStateBuilder {
 
     /// Add a catalog provider to the list of providers on this builder
     pub fn add_catalog_provider(&mut self, name: &str, factory: Arc<dyn CatalogProvider>) {
-        self.catalog_providers
-            .get_or_insert_default()
-            .insert(name.to_string(), factory);
+        self.inner
+            .catalog_list()
+            .get_or_insert_with(|| Arc::new(MemoryCatalogProviderList::new()))
+            .register_catalog(name.to_string(), factory);
     }
 
     /// Add a physical optimizer rule that runs after DataFusion's default rules
@@ -159,15 +128,15 @@ impl DftSessionStateBuilder {
         &mut self,
         rule: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
     ) {
-        self.physical_optimizer_rules.push(rule);
+        self.inner
+            .physical_optimizer_rules()
+            .get_or_insert_with(Vec::new)
+            .push(rule);
     }
 
     /// Return the current [`RuntimeEnv`], creating a default if it doesn't exist
     pub fn runtime_env(&mut self) -> &RuntimeEnv {
-        if self.runtime_env.is_none() {
-            self.runtime_env = Some(Arc::new(RuntimeEnv::default()));
-        }
-        self.runtime_env.as_ref().unwrap()
+        self.inner.runtime_env().get_or_insert_with(Arc::default)
     }
 
     pub async fn register_extension(
@@ -195,54 +164,14 @@ impl DftSessionStateBuilder {
 
     /// Build the [`SessionState`] from the specified configuration
     pub fn build(self) -> datafusion::common::Result<SessionState> {
-        let Self {
-            session_config,
-            table_factories,
-            file_format_factories,
-            catalog_providers,
-            physical_optimizer_rules,
-            runtime_env,
-            ..
-        } = self;
-
-        let mut builder = SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(session_config);
-
-        if let Some(runtime_env) = runtime_env {
-            builder = builder.with_runtime_env(runtime_env);
-        }
-        // Added to DataFusion's default factories, which `with_table_factories` would replace.
-        if let Some(table_factories) = table_factories {
-            builder
-                .table_factories()
-                .get_or_insert_with(HashMap::new)
-                .extend(table_factories);
-        }
-        // Added to DataFusion's default formats, which `with_file_formats` would replace.
-        builder
-            .file_formats()
-            .get_or_insert_with(Vec::new)
-            .extend(file_format_factories);
-        for rule in physical_optimizer_rules {
-            builder = builder.with_physical_optimizer_rule(rule);
-        }
-
-        if let Some(catalog_providers) = catalog_providers {
-            let catalogs_list = MemoryCatalogProviderList::new();
-            for (k, v) in catalog_providers {
-                catalogs_list.register_catalog(k, v);
-            }
-            builder = builder.with_catalog_list(Arc::new(catalogs_list));
-        }
-
-        Ok(builder.build())
+        Ok(self.inner.build())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::catalog::MemoryCatalogProvider;
     use datafusion::datasource::provider::DefaultTableFactory;
 
     #[test]
@@ -254,6 +183,17 @@ mod tests {
         let factories = state.table_factories();
         assert!(factories.contains_key("EXTRA"));
         assert!(factories.contains_key("CSV"));
+    }
+
+    #[test]
+    fn added_catalogs_keep_the_default_catalog() {
+        let mut builder = DftSessionStateBuilder::try_new(None).unwrap();
+        builder.add_catalog_provider("extra", Arc::new(MemoryCatalogProvider::new()));
+        let state = builder.build().unwrap();
+
+        let catalogs = state.catalog_list().catalog_names();
+        assert!(catalogs.contains(&"extra".to_string()));
+        assert!(catalogs.contains(&"datafusion".to_string()));
     }
 
     #[test]
