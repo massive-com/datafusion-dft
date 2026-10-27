@@ -9,8 +9,9 @@
 //! - [`ohlc`]: a bar's parts from its prices, and back.
 //! - [`compress`]: FoR + FastLanes for decimal and integer chunks, under DecimalByteParts.
 //! - [`strategy`]: the write strategy that sends each column through it.
-//! - [`layout`]: the OHLC struct's layout, which prunes a filter on a price from the parts'
-//!   zone maps. A session reading the files needs it registered (see [`register`]).
+//! - [`layout`]: the layout at the root of the table, which prunes a filter on a price from the
+//!   OHLC parts' zone maps, and skips the projections of splits a filter rules out. A session
+//!   reading the files needs it registered (see [`register`]).
 //! - [`edition`]: the edition that lets a writer emit that layout, and Vortex's blocked FoR and
 //!   bit-packing.
 
@@ -22,7 +23,7 @@ pub mod plan;
 pub mod profile;
 pub mod strategy;
 
-/// Register what reading the files takes beyond Vortex's defaults: the OHLC layout.
+/// Register what reading the files takes beyond Vortex's defaults: the bars layout.
 pub fn register(session: &vortex::session::VortexSession) {
     layout::register(session);
 }

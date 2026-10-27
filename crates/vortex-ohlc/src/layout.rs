@@ -1,16 +1,20 @@
-//! `vortex_ohlc.ohlc`: the layout of the [`OHLC`](crate::plan::OHLC) struct, so that Vortex's
-//! own scan can prune a filter on a price.
+//! `vortex_ohlc.bars`: the layout at the root of a table of bars, which wraps the table's own
+//! layout with no data of its own. Its reader hands everything to the table's reader, except:
 //!
-//! A filter on high, low or close is an expression over two or three of the struct's parts (see
-//! [`OHLC_PARTS`](crate::plan::OHLC_PARTS)). Each part has its own zone map, but Vortex's struct
-//! reader only prunes an expression that reads a single field, so it scans every chunk for these.
-//!
-//! This layout wraps the struct layout as it is, with no data of its own. Its reader hands
-//! everything to the struct's reader, except that pruning also bounds the expression from the
-//! parts' zone maps: a part is within its zone's min and max, a sum within the sum of its
-//! operands' bounds, and a `zip` within the bounds of the branch the zone's bounds pick (or of
-//! either). A zone can be skipped when those bounds rule out every comparison the expression
-//! needs.
+//! - **Pruning on the prices.** A filter on high, low or close is an expression over two or three
+//!   of the [`OHLC`] struct's parts (see [`OHLC_PARTS`](crate::plan::OHLC_PARTS)). Each part has
+//!   its own zone map, but Vortex's struct reader only prunes an expression that reads a single
+//!   field, so it scans every chunk for these. This reader also bounds the expression from the
+//!   parts' zone maps: a part is within its zone's min and max, a sum within the sum of its
+//!   operands' bounds, and a `zip` within the bounds of the branch the zone's bounds pick (or of
+//!   either). A zone can be skipped when those bounds rule out every comparison the expression
+//!   needs.
+//! - **Projections wait for the filter.** Vortex's scan asks every split for its projection
+//!   before the split's filter has run, so the reader can start its I/O early, and throws that
+//!   work away for a split the filter rules out entirely: with a selective filter, most of them.
+//!   This reader asks the table's reader for a projection only once the split's mask is known,
+//!   so a ruled-out split costs nothing, and a kept split's I/O starts after its filter rather
+//!   than alongside it.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -50,32 +54,34 @@ use vortex::scalar_fn::fns::zip::Zip;
 use vortex::session::registry::CachedId;
 use vortex::session::{SessionExt, SessionVar, VortexSession};
 
+use crate::plan::OHLC;
+
 /// Register the layout, so files that use it can be read back.
 pub fn register(session: &VortexSession) {
     use vortex::layout::session::LayoutSessionExt;
     use vortex::layout::LayoutEncoding;
     session
         .layouts()
-        .register(&OhlcLayout as &dyn LayoutEncoding);
+        .register(&BarsLayout as &dyn LayoutEncoding);
 }
 
-/// Where the OHLC layout's readers record what their pruning did, when a session carries one
+/// Where the bars layout's readers record what their pruning did, when a session carries one
 /// (see [`record_metrics`]):
 ///
-/// - `vortex_ohlc.ohlc.zones`: the zones a pruning evaluation looked at;
-/// - `vortex_ohlc.ohlc.zones_kept`: those its bounds couldn't rule out.
+/// - `vortex_ohlc.bars.zones`: the zones a pruning evaluation of a price filter looked at;
+/// - `vortex_ohlc.bars.zones_kept`: those its bounds couldn't rule out.
 #[derive(Clone)]
-pub struct OhlcMetrics {
+pub struct BarsMetrics {
     registry: Arc<dyn MetricsRegistry>,
 }
 
-impl std::fmt::Debug for OhlcMetrics {
+impl std::fmt::Debug for BarsMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OhlcMetrics").finish_non_exhaustive()
+        f.debug_struct("BarsMetrics").finish_non_exhaustive()
     }
 }
 
-impl SessionVar for OhlcMetrics {
+impl SessionVar for BarsMetrics {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -85,10 +91,10 @@ impl SessionVar for OhlcMetrics {
     }
 }
 
-/// Have the OHLC layout's readers on `session` record their pruning in `registry` (see
-/// [`OhlcMetrics`]). Readers made before this record nothing.
+/// Have the bars layout's readers on `session` record their pruning in `registry` (see
+/// [`BarsMetrics`]). Readers made before this record nothing.
 pub fn record_metrics(session: &VortexSession, registry: Arc<dyn MetricsRegistry>) {
-    session.register(OhlcMetrics { registry });
+    session.register(BarsMetrics { registry });
 }
 
 /// The counters one reader records into.
@@ -100,24 +106,24 @@ struct PruneCounters {
 
 impl PruneCounters {
     fn new(session: &VortexSession) -> Option<Self> {
-        let metrics = session.get_opt::<OhlcMetrics>()?;
+        let metrics = session.get_opt::<BarsMetrics>()?;
         let counter = |name| MetricBuilder::new(metrics.registry.as_ref()).counter(name);
         Some(Self {
-            zones: counter("vortex_ohlc.ohlc.zones"),
-            kept: counter("vortex_ohlc.ohlc.zones_kept"),
+            zones: counter("vortex_ohlc.bars.zones"),
+            kept: counter("vortex_ohlc.bars.zones_kept"),
         })
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct OhlcLayout;
+pub struct BarsLayout;
 
-impl VTable for OhlcLayout {
+impl VTable for BarsLayout {
     type LayoutData = ();
     type Metadata = EmptyMetadata;
 
     fn id(&self) -> LayoutId {
-        static ID: CachedId = CachedId::new("vortex_ohlc.ohlc");
+        static ID: CachedId = CachedId::new("vortex_ohlc.bars");
         *ID
     }
 
@@ -132,7 +138,7 @@ impl VTable for OhlcLayout {
     ) -> VortexResult<()> {
         vortex_ensure!(
             args.children.nchildren() == 1,
-            "an OHLC layout has exactly one child, its struct"
+            "a bars layout has exactly one child, its table"
         );
         vortex_ensure!(args.children.child_row_count(0) == args.row_count);
         args.children.child(0, args.dtype)?;
@@ -142,7 +148,7 @@ impl VTable for OhlcLayout {
     fn child_dtype(layout: &Layout<Self>, slot: usize) -> VortexResult<DType> {
         match slot {
             0 => Ok(layout.dtype().clone()),
-            _ => vortex_bail!("an OHLC layout has no child {slot}"),
+            _ => vortex_bail!("a bars layout has no child {slot}"),
         }
     }
 
@@ -160,7 +166,7 @@ impl VTable for OhlcLayout {
         let data = data_child(&layout.to_layout());
         let inner =
             data.new_reader(Arc::clone(&name), Arc::clone(&segment_source), session, ctx)?;
-        Ok(Arc::new(OhlcReader {
+        Ok(Arc::new(BarsReader {
             name,
             inner,
             zones: PartZones::find(&data),
@@ -172,24 +178,24 @@ impl VTable for OhlcLayout {
     }
 }
 
-/// The struct an OHLC layout wraps.
+/// The table a bars layout wraps.
 pub fn data_child(layout: &LayoutRef) -> LayoutRef {
     Arc::clone(&layout.children().unwrap()[0])
 }
 
-/// Writes the struct with `inner` and wraps it in an [`OhlcLayout`].
-pub struct OhlcStrategy {
+/// Writes the table with `inner` and wraps it in a [`BarsLayout`].
+pub struct BarsStrategy {
     inner: Arc<dyn LayoutStrategy>,
 }
 
-impl OhlcStrategy {
+impl BarsStrategy {
     pub fn new(inner: Arc<dyn LayoutStrategy>) -> Self {
         Self { inner }
     }
 }
 
 #[async_trait]
-impl LayoutStrategy for OhlcStrategy {
+impl LayoutStrategy for BarsStrategy {
     async fn write_stream(
         &self,
         ctx: LayoutWriterContext,
@@ -203,7 +209,7 @@ impl LayoutStrategy for OhlcStrategy {
             .write_stream(ctx, segment_sink, stream, eof, session)
             .await?;
         Ok(LayoutParts::new(
-            OhlcLayout,
+            BarsLayout,
             data.dtype().clone(),
             data.row_count(),
             Vec::new(),
@@ -214,8 +220,8 @@ impl LayoutStrategy for OhlcStrategy {
     }
 }
 
-/// Where the struct's parts keep their zone maps: the zones layout of each part, all with the
-/// same zones.
+/// Where the [`OHLC`] struct's parts keep their zone maps: the zones layout of each part, all
+/// with the same zones.
 struct PartZones {
     zone_len: u64,
     row_count: u64,
@@ -224,11 +230,13 @@ struct PartZones {
 }
 
 impl PartZones {
-    /// `None` unless every field of the struct has a zone map, and they all share their zones.
+    /// `None` unless the table `data` has an [`OHLC`] struct, every field of which has a zone
+    /// map, all with the same zones.
     fn find(data: &LayoutRef) -> Option<Self> {
-        let fields = data.dtype().as_struct_fields_opt()?;
+        let ohlc = find_child(data, OHLC)?;
+        let fields = ohlc.dtype().as_struct_fields_opt()?;
         let names: HashMap<Arc<str>, LayoutRef> =
-            data.child_names().zip(data.children().ok()?).collect();
+            ohlc.child_names().zip(ohlc.children().ok()?).collect();
         let mut parts = Vec::new();
         let mut shape = None;
         for name in fields.names().iter() {
@@ -248,6 +256,16 @@ impl PartZones {
             parts,
         })
     }
+}
+
+/// The child named `name` of the first layout at or under `layout` that has one, depth first:
+/// a field of the table's struct layout, wherever that is.
+fn find_child(layout: &LayoutRef, name: &str) -> Option<LayoutRef> {
+    let children = layout.children().ok()?;
+    if let Some(index) = layout.child_names().position(|n| n.as_ref() == name) {
+        return children.get(index).map(Arc::clone);
+    }
+    children.iter().find_map(|child| find_child(child, name))
 }
 
 /// The first zoned layout at or under `layout`, depth first.
@@ -271,7 +289,7 @@ struct Bounds {
 
 type SharedBounds = Shared<BoxFuture<'static, Option<Arc<Bounds>>>>;
 
-struct OhlcReader {
+struct BarsReader {
     name: Arc<str>,
     inner: LayoutReaderRef,
     zones: Option<PartZones>,
@@ -279,11 +297,11 @@ struct OhlcReader {
     session: VortexSession,
     /// Read once per reader, on the first expression this layout can prune.
     bounds: OnceLock<SharedBounds>,
-    /// Where pruning is recorded, if the session asks for it (see [`OhlcMetrics`]).
+    /// Where pruning is recorded, if the session asks for it (see [`BarsMetrics`]).
     counters: Option<PruneCounters>,
 }
 
-impl OhlcReader {
+impl BarsReader {
     fn bounds(&self) -> SharedBounds {
         self.bounds
             .get_or_init(|| {
@@ -359,7 +377,7 @@ impl OhlcReader {
     }
 }
 
-impl LayoutReader for OhlcReader {
+impl LayoutReader for BarsReader {
     fn name(&self) -> &Arc<str> {
         &self.name
     }
@@ -449,18 +467,30 @@ impl LayoutReader for OhlcReader {
         self.inner.filter_evaluation(row_range, expr, mask)
     }
 
+    /// Asks the table's reader once the split's mask is known (see the module docs), or right
+    /// away when it already is.
     fn projection_evaluation(
         &self,
         row_range: &Range<u64>,
         expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
-        self.inner.projection_evaluation(row_range, expr, mask)
+        if mask.peek().is_some() {
+            return self.inner.projection_evaluation(row_range, expr, mask);
+        }
+        let (inner, row_range, expr) = (Arc::clone(&self.inner), row_range.clone(), expr.clone());
+        Ok(async move {
+            let mask = mask.await?;
+            let projection =
+                inner.projection_evaluation(&row_range, &expr, MaskFuture::ready(mask))?;
+            projection.await
+        }
+        .boxed())
     }
 }
 
-/// A decimal expression over the struct's parts (by field index) that can be bounded: every leaf
-/// has the same scale, so values and bounds are unscaled.
+/// A decimal expression over the [`OHLC`] struct's parts (by field index) that can be bounded:
+/// every leaf has the same scale, so values and bounds are unscaled.
 #[derive(Debug)]
 enum Term {
     Part(usize),
@@ -479,10 +509,12 @@ impl Term {
             return None;
         };
         let scale = decimal.scale();
+        // A part, `ohlc.<part>` in the table.
         if let Some(name) = expr.as_opt::<GetItem>() {
-            let root = expr.child(0);
-            let index = root.dtype().as_struct_fields_opt()?.find(name)?;
-            return root.is_root().then_some((Term::Part(index), scale));
+            let ohlc = expr.child(0);
+            let in_table = ohlc.as_opt::<GetItem>()?.as_ref() == OHLC && ohlc.child(0).is_root();
+            let index = ohlc.dtype().as_struct_fields_opt()?.find(name)?;
+            return in_table.then_some((Term::Part(index), scale));
         }
         if let Some(scalar) = expr.as_opt::<Literal>() {
             let value = scalar.as_decimal().decimal_value()?.cast::<i128>()?;
@@ -712,15 +744,28 @@ mod tests {
 
     use super::*;
 
-    fn parts_dtype(names: &'static [&'static str]) -> DType {
+    /// A table with an `ohlc` struct of the parts `names`.
+    fn table_dtype(names: &'static [&'static str]) -> DType {
         let decimal = DecimalDType::new(16, 4);
-        DType::Struct(
+        let parts = DType::Struct(
             StructFields::new(
                 names.into(),
                 vec![DType::Decimal(decimal, Nullability::NonNullable); names.len()],
             ),
             Nullability::NonNullable,
+        );
+        DType::Struct(
+            StructFields::new(
+                ["ticker", OHLC].into(),
+                vec![DType::Utf8(Nullability::NonNullable), parts],
+            ),
+            Nullability::NonNullable,
         )
+    }
+
+    /// The part `name`, read through the table's `ohlc` struct.
+    fn part(name: &str) -> Expression {
+        get_item(name, get_item(OHLC, root()))
     }
 
     /// A literal at the parts' precision.
@@ -741,7 +786,7 @@ mod tests {
     /// AND of its two comparisons, strict or not as its options say, and prunes like it.
     #[test]
     fn between_parses_as_two_comparisons() {
-        let dtype = parts_dtype(&["open", "body"]);
+        let dtype = table_dtype(&["open", "body"]);
         for (lower_strict, upper_strict) in [
             (StrictComparison::NonStrict, StrictComparison::Strict),
             (StrictComparison::Strict, StrictComparison::NonStrict),
@@ -751,7 +796,7 @@ mod tests {
                 upper_strict,
             };
             let expr: Expression =
-                Between.new_expr(options.clone(), [get_item("open", root()), x(100), x(200)]);
+                Between.new_expr(options.clone(), [part("open"), x(100), x(200)]);
             let predicate = Predicate::parse(&expr.bind(&dtype).unwrap(), false);
             let Predicate::And(above, below) = &predicate else {
                 panic!("{predicate:?}");
@@ -775,17 +820,17 @@ mod tests {
     /// comparison over a `zip`, and the zone bounds of body pick its branch.
     #[test]
     fn zip_parses_and_picks_its_branch() {
-        let dtype = parts_dtype(&["open", "body", "upper"]);
-        // As the benches' `ohlc_price` builds it: each operand cast to the precision its place
-        // needs, so both of zip's branches have one type.
-        let part = |name: &str, precision: u8| {
+        let dtype = table_dtype(&["open", "body", "upper"]);
+        // High built with `zip`: each operand cast to the precision its place needs, so both of
+        // zip's branches have one type.
+        let at = |name: &str, precision: u8| {
             let target = DType::Decimal(DecimalDType::new(precision, 4), Nullability::Nullable);
-            cast(get_item(name, root()), target)
+            cast(part(name), target)
         };
-        let close = checked_add(part("open", 16), part("body", 16));
-        let up = gt_eq(get_item("body", root()), x(0));
-        let top = zip_expr(up, close, part("open", 17));
-        let expr = gt(checked_add(top, part("upper", 17)), x_at(1000, 18));
+        let close = checked_add(at("open", 16), at("body", 16));
+        let up = gt_eq(part("body"), x(0));
+        let top = zip_expr(up, close, at("open", 17));
+        let expr = gt(checked_add(top, at("upper", 17)), x_at(1000, 18));
         let predicate = Predicate::parse(&expr.bind(&dtype).unwrap(), false);
         let Predicate::Compare(Operator::Gt, Term::Add(top, _), Term::Literal(1000)) = &predicate
         else {

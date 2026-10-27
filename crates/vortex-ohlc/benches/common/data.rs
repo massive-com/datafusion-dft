@@ -39,8 +39,9 @@ const DATA_DIR: &str = concat!(
     "/../../target/vortex-ohlc-bench"
 );
 
-/// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout.
-const VORTEX_VERSION: u32 = 2;
+/// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout, 3
+/// since the bars layout at the root.
+const VORTEX_VERSION: u32 = 3;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;

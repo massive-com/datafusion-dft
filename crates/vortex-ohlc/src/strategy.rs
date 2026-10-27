@@ -1,8 +1,8 @@
 //! The write strategy: Vortex's default, with every decimal column, the integer columns the plan
 //! packs ([`Transform::Packed`]) and each part of the [`OHLC`] struct compressed by
 //! [`compress_chunk`]. Each part of the OHLC struct is a column of its own with its own zone map,
-//! and the struct is wrapped in an [`OhlcLayout`](crate::layout::OhlcLayout), so a scan can prune
-//! on the prices.
+//! and the table is wrapped in a [`BarsLayout`](crate::layout::BarsLayout), so a scan can prune
+//! on the prices and skips the splits its filter rules out.
 
 use std::sync::{Arc, OnceLock};
 
@@ -20,7 +20,7 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 
 use crate::compress::compress_chunk;
-use crate::layout::OhlcStrategy;
+use crate::layout::BarsStrategy;
 use crate::plan::{Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES};
 
 /// Rows per chunk (row block) by default: 65,536, the row group size of the Parquet files the
@@ -45,8 +45,7 @@ pub fn write_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn
                 for part in OHLC_PARTS {
                     parts = parts.with_field_writer(FieldPath::from_name(part), packed(row_block));
                 }
-                let ohlc = OhlcStrategy::new(Arc::new(parts));
-                builder = builder.with_field_writer(FieldPath::from_name(OHLC), Arc::new(ohlc));
+                builder = builder.with_field_writer(FieldPath::from_name(OHLC), Arc::new(parts));
             }
             (Some(Transform::Ohlc(_)), _) => {}
             (Some(Transform::Packed), _) | (_, DataType::Decimal128(..)) => {
@@ -55,7 +54,7 @@ pub fn write_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn
             _ => {}
         }
     }
-    builder.build()
+    Arc::new(BarsStrategy::new(builder.build()))
 }
 
 /// A session with Vortex's defaults, for the compressors and write strategies Vortex builds from
