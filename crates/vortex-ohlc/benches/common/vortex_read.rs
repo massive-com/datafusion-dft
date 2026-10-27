@@ -107,8 +107,8 @@ pub fn read_plan(runtime: &CurrentThreadRuntime, session: &VortexSession, path: 
 }
 
 /// What the Vortex engine counted while `lookup` ran once by `path` against the file at
-/// `file_path`, opened on a session of its own: the file's I/O, and the OHLC layout's pruning
-/// (see [`vortex_ohlc::layout::OhlcMetrics`]). Counters are summed by name; returns the row
+/// `file_path`, opened on a session of its own: the file's I/O, and the bars layout's pruning
+/// (see [`vortex_ohlc::layout::BarsMetrics`]). Counters are summed by name; returns the row
 /// count too.
 #[allow(clippy::too_many_arguments)]
 pub fn lookup_stats(
