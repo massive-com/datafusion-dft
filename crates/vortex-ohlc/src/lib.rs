@@ -1,6 +1,6 @@
-//! Market aggregates (OHLC bars) in Vortex, stored with nothing but Vortex's own encodings and
-//! layouts. What is ours is how the columns are laid out before writing, and how they are
-//! compressed:
+//! Market aggregates (OHLC bars) in Vortex, stored with nothing but Vortex's own encodings, and
+//! one layout of ours that stores no data. What is ours is how the columns are laid out before
+//! writing, how they are compressed, and how a scan prunes on the prices:
 //!
 //! - [`plan`]: the transforms applied to columns before writing (decimals rescaled to drop the
 //!   trailing zeros every value has, and the four prices stored as one struct of parts), and the
@@ -9,11 +9,20 @@
 //! - [`ohlc`]: a bar's parts from its prices, and back.
 //! - [`compress`]: FoR + FastLanes for decimal and integer chunks, under DecimalByteParts.
 //! - [`strategy`]: the write strategy that sends each column through it.
-//! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
+//! - [`layout`]: the OHLC struct's layout, which prunes a filter on a price from the parts'
+//!   zone maps. A session reading the files needs it registered (see [`register`]).
+//! - [`edition`]: the edition that lets a writer emit that layout, and Vortex's blocked FoR and
+//!   bit-packing.
 
 pub mod compress;
 pub mod edition;
+pub mod layout;
 pub mod ohlc;
 pub mod plan;
 pub mod profile;
 pub mod strategy;
+
+/// Register what reading the files takes beyond Vortex's defaults: the OHLC layout.
+pub fn register(session: &vortex::session::VortexSession) {
+    layout::register(session);
+}

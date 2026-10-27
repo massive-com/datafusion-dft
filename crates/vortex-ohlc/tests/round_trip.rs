@@ -120,6 +120,7 @@ fn write_and_read(source: &RecordBatch, plan: &Plan) -> (Vec<ArrayRef>, RecordBa
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
+    vortex_ohlc::register(&session);
 
     let schema = planned_schema(plan, &source.schema());
     let dtype = session.arrow().from_arrow_schema(&schema).unwrap();

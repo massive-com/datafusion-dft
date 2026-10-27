@@ -78,6 +78,7 @@ pub enum Lookup<'a> {
 pub fn new_session(runtime: &CurrentThreadRuntime) -> VortexSession {
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
+    vortex_ohlc::register(&session);
     session
 }
 
