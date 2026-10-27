@@ -23,7 +23,8 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_ohlc::ohlc::ohlc_from_parts;
 use vortex_ohlc::plan::{
-    apply_plan, planned_schema, transforms_json, Plan, Transform, OHLC, OHLC_PRICES, TRANSFORMS_KEY,
+    apply_plan, plan_from_json, planned_schema, transforms_json, Plan, Transform, OHLC,
+    OHLC_PRICES, TRANSFORMS_KEY,
 };
 use vortex_ohlc::profile::{plan, DecimalProfiler};
 use vortex_ohlc::strategy::write_strategy;
@@ -113,8 +114,8 @@ fn source_plan(source: &RecordBatch) -> Plan {
     plan
 }
 
-/// Write `source` with `plan` as `ROW_BLOCK`-row chunks; return the chunks read back, as Vortex
-/// arrays, and as one Arrow batch.
+/// Write `source` with `plan` as `ROW_BLOCK`-row chunks, and check the file records the plan;
+/// return the chunks read back, as Vortex arrays, and as one Arrow batch.
 fn write_and_read(source: &RecordBatch, plan: &Plan) -> (Vec<ArrayRef>, RecordBatch) {
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
@@ -143,7 +144,15 @@ fn write_and_read(source: &RecordBatch, plan: &Plan) -> (Vec<ArrayRef>, RecordBa
         )
         .unwrap();
 
-    let file = session.open_options().open_buffer(bytes).unwrap();
+    // Metadata segments are only loaded when asked for.
+    let file = session
+        .open_options()
+        .include_metadata()
+        .open_buffer(bytes)
+        .unwrap();
+    let recorded = file.metadata_segment(TRANSFORMS_KEY).unwrap();
+    let recorded = serde_json::from_slice(recorded.as_ref()).unwrap();
+    assert_eq!(plan_from_json(&recorded).as_ref(), Some(plan));
     let chunks: Vec<ArrayRef> = file
         .scan()
         .unwrap()
