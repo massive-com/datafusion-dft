@@ -9837,6 +9837,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-ohlc"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "num-traits",
+ "serde_json",
+ "vortex",
+]
+
+[[package]]
 name = "vortex-onpair"
 version = "0.89.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
