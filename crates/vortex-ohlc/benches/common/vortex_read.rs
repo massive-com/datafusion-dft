@@ -486,7 +486,7 @@ fn expr_projection(
         match plan.get(name) {
             Some(Transform::Rescale(_)) => cast(get_item(name, root()), source_type(name)),
             Some(Transform::Ohlc(_)) => {
-                let (price, _, _) = ohlc_price(file.dtype(), name).unwrap();
+                let price = ohlc_price(file.dtype(), name).unwrap();
                 cast(price, source_type(name))
             }
             None | Some(Transform::Packed) => get_item(name, root()),
