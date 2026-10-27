@@ -9841,7 +9841,9 @@ name = "vortex-ohlc"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "criterion",
  "num-traits",
+ "parquet",
  "serde_json",
  "vortex",
 ]
