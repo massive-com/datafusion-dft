@@ -10,5 +10,17 @@ num-traits.workspace = true
 serde_json.workspace = true
 vortex.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+parquet = { features = ["snap", "zstd"], workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+harness = false
+name = "scan"
+
+[[bench]]
+harness = false
+name = "needle"
