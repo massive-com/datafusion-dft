@@ -2923,6 +2923,7 @@ dependencies = [
  "uuid",
  "vortex",
  "vortex-btrblocks",
+ "vortex-compressor",
  "vortex-datafusion",
  "vortex-file",
  "vortex-session",

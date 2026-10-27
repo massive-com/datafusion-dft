@@ -75,6 +75,7 @@ vortex-btrblocks = { features = [
   "pco",
   "zstd",
 ], optional = true, workspace = true }
+vortex-compressor = { optional = true, workspace = true }
 vortex-datafusion = { optional = true, workspace = true }
 vortex-file = { optional = true, workspace = true }
 vortex-session = { optional = true, workspace = true }
@@ -137,6 +138,7 @@ vortex = [
   "datafusion-app/vortex",
   "dep:vortex",
   "dep:vortex-btrblocks",
+  "dep:vortex-compressor",
   "dep:vortex-datafusion",
   "dep:vortex-file",
   "dep:vortex-session",
