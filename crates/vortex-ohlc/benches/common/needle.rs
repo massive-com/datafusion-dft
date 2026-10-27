@@ -100,12 +100,6 @@ pub struct Needle {
     pub terms: Vec<Term>,
 }
 
-/// Whether the needle `name` runs: all of them, unless `NEEDLES` lists the ones to run
-/// (comma-separated names).
-pub fn needle_selected(name: &str) -> bool {
-    std::env::var("NEEDLES").map_or(true, |list| list.split(',').any(|n| n.trim() == name))
-}
-
 /// The lookups, picked from the default source (August 2006, every ticker from A to ZZ, sorted
 /// by ticker):
 ///
