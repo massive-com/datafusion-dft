@@ -64,6 +64,7 @@ predicates = "3.1.2"
 prost = "0.14"
 ratatui = "0.30"
 ratatui-textarea = "0.8"
+regex = "1"
 reqwest = "0.12.23"
 rocksdb = "0.25"
 rustls = { default-features = false, features = [

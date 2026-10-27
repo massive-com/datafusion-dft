@@ -1,14 +1,11 @@
-//! The files the benches read, written once from the source and reused after that:
+//! The files the benches read, in [`DATA_DIR`], written once from [`SOURCE`] and reused after
+//! that:
 //!
 //! - `v2.parquet`: the source rewritten as Parquet v2 (zstd level 1, the source's row groups),
 //!   the Parquet baseline;
-//! - `upstream.vortex`: the source with the plan [`vortex_ohlc::profile`] picks for it (and
-//!   `transactions` packed), written with [`vortex_ohlc::strategy`].
-//!
-//! `VORTEX_OHLC_SOURCE` names the source (by default the month `decimal_parts_bench` reads),
-//! `VORTEX_OHLC_DATA` the directory to write to (by default `target/vortex-ohlc-bench` in the
-//! workspace), and `VORTEX_OHLC_REWRITE=1` writes the files again, which a change to the plan or
-//! the strategy needs.
+//! - `upstream-<VORTEX_VERSION>.vortex`: the source with the plan [`vortex_ohlc::profile`] picks
+//!   for it (and `transactions` packed), written with [`vortex_ohlc::strategy`]. Bump
+//!   [`VORTEX_VERSION`] whenever what the crate writes changes, so the file is written again.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -33,8 +30,17 @@ use crate::common::parquet_read::open_parquet;
 
 /// The month of minute bars `decimal_parts_bench` reads: August 2006, every ticker from A to ZZ,
 /// sorted by ticker.
-const DEFAULT_SOURCE: &str = "/Users/techpizza/parquet/stag/atlas-serve/us_stocks_sip/\
+const SOURCE: &str = "/Users/techpizza/parquet/stag/atlas-serve/us_stocks_sip/\
     minute_aggs_by_ticker_monthly_v3/year_month=2006-08/_v=1771756535542/data.01.parquet";
+
+/// Where the files are written, under the workspace's `target`.
+const DATA_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/vortex-ohlc-bench"
+);
+
+/// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout.
+const VORTEX_VERSION: u32 = 2;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;
@@ -51,34 +57,24 @@ pub struct Files {
 /// The source, and the files written from it (see the module docs), writing those that are
 /// missing.
 pub fn files(runtime: &CurrentThreadRuntime, session: &VortexSession) -> Files {
-    let source = PathBuf::from(
-        std::env::var("VORTEX_OHLC_SOURCE").unwrap_or_else(|_| DEFAULT_SOURCE.to_string()),
-    );
-    assert!(
-        source.exists(),
-        "no source at {} (set VORTEX_OHLC_SOURCE)",
-        source.display()
-    );
-    let dir = std::env::var_os("VORTEX_OHLC_DATA").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/vortex-ohlc-bench"),
-        PathBuf::from,
-    );
-    std::fs::create_dir_all(&dir).unwrap();
-    let rewrite = std::env::var("VORTEX_OHLC_REWRITE").is_ok_and(|v| v == "1");
+    let source = PathBuf::from(SOURCE);
+    assert!(source.exists(), "no source at {}", source.display());
+    let dir = Path::new(DATA_DIR);
+    std::fs::create_dir_all(dir).unwrap();
     let files = Files {
         parquet: dir.join("v2.parquet"),
-        vortex: dir.join("upstream.vortex"),
+        vortex: dir.join(format!("upstream-{VORTEX_VERSION}.vortex")),
         source,
     };
     // Each file is written under a temporary name and renamed once complete, so an interrupted
     // write isn't taken for a finished one.
     let tmp = |path: &Path| path.with_extension("tmp");
-    if rewrite || !files.parquet.exists() {
+    if !files.parquet.exists() {
         eprintln!("writing {}", files.parquet.display());
         write_parquet_v2(&files.source, &tmp(&files.parquet));
         std::fs::rename(tmp(&files.parquet), &files.parquet).unwrap();
     }
-    if rewrite || !files.vortex.exists() {
+    if !files.vortex.exists() {
         eprintln!("writing {}", files.vortex.display());
         write_vortex(runtime, session, &files.source, &tmp(&files.vortex));
         std::fs::rename(tmp(&files.vortex), &files.vortex).unwrap();
