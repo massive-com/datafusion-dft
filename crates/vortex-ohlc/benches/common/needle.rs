@@ -21,8 +21,8 @@ use parquet::arrow::ProjectionMask;
 use parquet::file::statistics::{Statistics, ValueStatistics};
 use vortex::dtype::{DType, DecimalDType, Nullability};
 use vortex::expr::{
-    and, and_collect, binary, cast as vortex_cast, checked_add, eq, get_item, gt, gt_eq, lit, lt,
-    or, root, zip_expr, BoundExpression, Expression,
+    and, and_collect, binary, cast as vortex_cast, checked_add, eq, fill_null, get_item, gt, gt_eq,
+    lit, lt, mask, or, root, BoundExpression, Expression,
 };
 use vortex::file::VortexFile;
 use vortex::scalar::{DecimalValue, Scalar as VortexScalar};
@@ -545,7 +545,7 @@ fn ohlc_term(dtype: &DType, term: &Term) -> Option<Expression> {
             binary(Operator::Sub, parts.part("open", p), parts.part("lower", p)),
             binary(Operator::Sub, parts.close(), parts.part("lower", p + 1)),
         ),
-        _ => return compare(ohlc_price(dtype, term.column)?.0),
+        _ => return compare(ohlc_price(dtype, term.column)?),
     };
     Some(or(
         and(parts.up(), compare(when_up)?),
@@ -554,24 +554,31 @@ fn ohlc_term(dtype: &DType, term: &Term) -> Option<Expression> {
 }
 
 /// A price as an expression over the [`OHLC`] struct's parts (in a table of `dtype`), with only
-/// Vortex's own functions, and that expression's precision and scale; `None` for anything but
-/// the four prices. close = open + body, high = max(open, close) + upper and low = min(open,
-/// close) - lower, where the body's sign picks the larger of open and close (`zip`).
-pub fn ohlc_price(dtype: &DType, price: &str) -> Option<(Expression, u8, i8)> {
+/// Vortex's own functions; `None` for anything but the four prices. close = open + body, high =
+/// (open + upper) + max(body, 0) and low = (open - lower) + min(body, 0): the larger and smaller
+/// of open and close are open plus the body where its sign is right. Keeping the body only there
+/// (`mask`, then `fill_null` with 0) runs vectorized, where a `zip` picking open or close slices
+/// both at every run of its mask, and the body's sign changes from one bar to the next.
+pub fn ohlc_price(dtype: &DType, price: &str) -> Option<Expression> {
     let parts = OhlcParts::new(dtype)?;
-    let (p, scale) = (parts.precision, parts.scale);
+    let p = parts.precision;
+    // The body where `sign` holds, 0 elsewhere, at p + 1 digits.
+    let body_where = |sign: Expression| {
+        let body = fill_null(mask(parts.raw("body"), sign), parts.zero());
+        let decimal = DecimalDType::new(p + 1, parts.scale);
+        vortex_cast(body, DType::Decimal(decimal, Nullability::Nullable))
+    };
     Some(match price {
-        "open" => (parts.part("open", p), p, scale),
-        "close" => (parts.close(), p + 1, scale),
+        "open" => parts.part("open", p),
+        "close" => parts.close(),
         // p + 2 digits.
         "high" => {
-            let top = zip_expr(parts.up(), parts.close(), parts.part("open", p + 1));
-            (checked_add(top, parts.part("upper", p + 1)), p + 2, scale)
+            let base = checked_add(parts.part("open", p), parts.part("upper", p));
+            checked_add(base, body_where(parts.up()))
         }
         "low" => {
-            let bottom = zip_expr(parts.up(), parts.part("open", p + 1), parts.close());
-            let low = binary(Operator::Sub, bottom, parts.part("lower", p + 1));
-            (low, p + 2, scale)
+            let base = binary(Operator::Sub, parts.part("open", p), parts.part("lower", p));
+            checked_add(base, body_where(parts.down()))
         }
         _ => return None,
     })
