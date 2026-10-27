@@ -104,6 +104,28 @@ pub fn transforms_json(plan: &Plan, source: &Schema) -> serde_json::Value {
     serde_json::json!({"version": TRANSFORMS_VERSION, "columns": columns})
 }
 
+/// The plan a file records (see [`transforms_json`]), or `None` if `json` isn't a record of this
+/// version.
+pub fn plan_from_json(json: &serde_json::Value) -> Option<Plan> {
+    if json["version"].as_u64()? != TRANSFORMS_VERSION as u64 {
+        return None;
+    }
+    json["columns"]
+        .as_object()?
+        .iter()
+        .map(|(name, entry)| {
+            let k = || u8::try_from(entry["k"].as_u64()?).ok();
+            let transform = match entry["transform"].as_str()? {
+                "rescale" => Transform::Rescale(k()?),
+                "ohlc" => Transform::Ohlc(k()?),
+                "packed" => Transform::Packed,
+                _ => return None,
+            };
+            Some((name.clone(), transform))
+        })
+        .collect()
+}
+
 pub fn decimal_params(field: &Field) -> (u8, i8) {
     match field.data_type() {
         DataType::Decimal128(precision, scale) => (*precision, *scale),
