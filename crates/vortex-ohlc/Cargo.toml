@@ -15,6 +15,7 @@ vortex.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 parquet = { features = ["snap", "zstd"], workspace = true }
+regex.workspace = true
 
 [lints]
 workspace = true
