@@ -39,6 +39,7 @@ use vortex::layout::{
     LayoutWriterContext, RowSplits, SplitRange, VTable,
 };
 use vortex::mask::Mask;
+use vortex::metrics::{Counter, MetricBuilder, MetricsRegistry};
 use vortex::scalar_fn::fns::between::{Between, StrictComparison};
 use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::cast::Cast;
@@ -47,7 +48,7 @@ use vortex::scalar_fn::fns::literal::Literal;
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::scalar_fn::fns::zip::Zip;
 use vortex::session::registry::CachedId;
-use vortex::session::VortexSession;
+use vortex::session::{SessionExt, SessionVar, VortexSession};
 
 /// Register the layout, so files that use it can be read back.
 pub fn register(session: &VortexSession) {
@@ -56,6 +57,56 @@ pub fn register(session: &VortexSession) {
     session
         .layouts()
         .register(&OhlcLayout as &dyn LayoutEncoding);
+}
+
+/// Where the OHLC layout's readers record what their pruning did, when a session carries one
+/// (see [`record_metrics`]):
+///
+/// - `vortex_ohlc.ohlc.zones`: the zones a pruning evaluation looked at;
+/// - `vortex_ohlc.ohlc.zones_kept`: those its bounds couldn't rule out.
+#[derive(Clone)]
+pub struct OhlcMetrics {
+    registry: Arc<dyn MetricsRegistry>,
+}
+
+impl std::fmt::Debug for OhlcMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OhlcMetrics").finish_non_exhaustive()
+    }
+}
+
+impl SessionVar for OhlcMetrics {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Have the OHLC layout's readers on `session` record their pruning in `registry` (see
+/// [`OhlcMetrics`]). Readers made before this record nothing.
+pub fn record_metrics(session: &VortexSession, registry: Arc<dyn MetricsRegistry>) {
+    session.register(OhlcMetrics { registry });
+}
+
+/// The counters one reader records into.
+#[derive(Clone)]
+struct PruneCounters {
+    zones: Counter,
+    kept: Counter,
+}
+
+impl PruneCounters {
+    fn new(session: &VortexSession) -> Option<Self> {
+        let metrics = session.get_opt::<OhlcMetrics>()?;
+        let counter = |name| MetricBuilder::new(metrics.registry.as_ref()).counter(name);
+        Some(Self {
+            zones: counter("vortex_ohlc.ohlc.zones"),
+            kept: counter("vortex_ohlc.ohlc.zones_kept"),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +167,7 @@ impl VTable for OhlcLayout {
             segment_source,
             session: session.clone(),
             bounds: OnceLock::new(),
+            counters: PruneCounters::new(session),
         }))
     }
 }
@@ -227,6 +279,8 @@ struct OhlcReader {
     session: VortexSession,
     /// Read once per reader, on the first expression this layout can prune.
     bounds: OnceLock<SharedBounds>,
+    /// Where pruning is recorded, if the session asks for it (see [`OhlcMetrics`]).
+    counters: Option<PruneCounters>,
 }
 
 impl OhlcReader {
@@ -346,14 +400,17 @@ impl LayoutReader for OhlcReader {
         }
         let bounds = self.bounds();
         let row_range = row_range.clone();
+        let counters = self.counters.clone();
         Ok(MaskFuture::new(mask.len(), async move {
             let Some(bounds) = bounds.await else {
                 return inner.await;
             };
             let zone_len = bounds.zone_len;
             let end = row_range.end.min(bounds.row_count);
+            let zones = row_range.start / zone_len..end.div_ceil(zone_len);
             let mut keep = Vec::new();
-            for zone in row_range.start / zone_len..end.div_ceil(zone_len) {
+            let mut kept = 0;
+            for zone in zones.clone() {
                 let zone = zone as usize;
                 let decided = predicate.decide(&|i| {
                     let (min, max) = bounds.parts.get(i)?;
@@ -362,6 +419,7 @@ impl LayoutReader for OhlcReader {
                 if decided == Decided::None {
                     continue;
                 }
+                kept += 1;
                 let zone = zone as u64;
                 let start = (zone * zone_len).max(row_range.start) - row_range.start;
                 let stop = ((zone + 1) * zone_len).min(end) - row_range.start;
@@ -369,6 +427,10 @@ impl LayoutReader for OhlcReader {
                     Some((_, last)) if *last == start as usize => *last = stop as usize,
                     _ => keep.push((start as usize, stop as usize)),
                 }
+            }
+            if let Some(counters) = counters {
+                counters.zones.add(zones.end - zones.start);
+                counters.kept.add(kept);
             }
             let pruned = &mask & &Mask::from_slices(mask.len(), keep);
             if pruned.all_false() {

@@ -360,7 +360,7 @@ fn in_range(stats: &ValueStatistics<i64>, v: i64, op: Op) -> bool {
     }
 }
 
-fn candidate_row_groups(
+pub fn candidate_row_groups(
     builder: &ParquetRecordBatchReaderBuilder<File>,
     terms: &[Term],
 ) -> Vec<usize> {
