@@ -21,8 +21,8 @@ use parquet::arrow::ProjectionMask;
 use parquet::file::statistics::{Statistics, ValueStatistics};
 use vortex::dtype::{DType, DecimalDType, Nullability};
 use vortex::expr::{
-    and_collect, binary, cast as vortex_cast, checked_add, eq, get_item, gt, gt_eq, lit, lt, root,
-    zip_expr, BoundExpression, Expression,
+    and, and_collect, binary, cast as vortex_cast, checked_add, eq, get_item, gt, gt_eq, lit, lt,
+    or, root, zip_expr, BoundExpression, Expression,
 };
 use vortex::file::VortexFile;
 use vortex::scalar::{DecimalValue, Scalar as VortexScalar};
@@ -514,59 +514,126 @@ fn vortex_literal(value: Value, dtype: &DType) -> Option<Expression> {
     })
 }
 
-/// A term on a price stored in the [`OHLC`] struct, as one comparison of the price
-/// [`ohlc_price`] rebuilds from the parts; `None` if the literal doesn't fit its type.
+/// A term on a price stored in the [`OHLC`] struct (in a table of `dtype`), over its parts;
+/// `None` if the literal doesn't fit the type it's compared in.
+///
+/// Open and close are compared as [`ohlc_price`] rebuilds them. High and low are compared without
+/// its `zip`, which Vortex evaluates by slicing both branches at every run of its mask, and the
+/// body's sign changes from one bar to the next: `high op x` is `(body >= 0 AND close + upper op
+/// x) OR (body < 0 AND open + upper op x)`, and low the same with open and close swapped. Each
+/// side is compared at its own type.
 fn ohlc_term(dtype: &DType, term: &Term) -> Option<Expression> {
-    let (price, precision, scale) = ohlc_price(dtype, term.column)?;
-    let decimal = DType::Decimal(
-        DecimalDType::new(precision, scale),
-        Nullability::NonNullable,
-    );
-    let literal = vortex_literal(term.value, &decimal)?;
-    Some(term.op.vortex(price, literal))
+    let compare = |price: Expression| -> Option<Expression> {
+        let price_dtype = price.bind(dtype).ok()?.dtype().clone();
+        let DType::Decimal(decimal, _) = price_dtype else {
+            panic!("{} rebuilds as {price_dtype}", term.column);
+        };
+        let literal_dtype = DType::Decimal(decimal, Nullability::NonNullable);
+        Some(
+            term.op
+                .vortex(price, vortex_literal(term.value, &literal_dtype)?),
+        )
+    };
+    let parts = OhlcParts::new(dtype)?;
+    let p = parts.precision;
+    let (when_up, when_down) = match term.column {
+        "high" => (
+            checked_add(parts.close(), parts.part("upper", p + 1)),
+            checked_add(parts.part("open", p), parts.part("upper", p)),
+        ),
+        "low" => (
+            binary(Operator::Sub, parts.part("open", p), parts.part("lower", p)),
+            binary(Operator::Sub, parts.close(), parts.part("lower", p + 1)),
+        ),
+        _ => return compare(ohlc_price(dtype, term.column)?.0),
+    };
+    Some(or(
+        and(parts.up(), compare(when_up)?),
+        and(parts.down(), compare(when_down)?),
+    ))
 }
 
 /// A price as an expression over the [`OHLC`] struct's parts (in a table of `dtype`), with only
 /// Vortex's own functions, and that expression's precision and scale; `None` for anything but
 /// the four prices. close = open + body, high = max(open, close) + upper and low = min(open,
 /// close) - lower, where the body's sign picks the larger of open and close (`zip`).
+pub fn ohlc_price(dtype: &DType, price: &str) -> Option<(Expression, u8, i8)> {
+    let parts = OhlcParts::new(dtype)?;
+    let (p, scale) = (parts.precision, parts.scale);
+    Some(match price {
+        "open" => (parts.part("open", p), p, scale),
+        "close" => (parts.close(), p + 1, scale),
+        // p + 2 digits.
+        "high" => {
+            let top = zip_expr(parts.up(), parts.close(), parts.part("open", p + 1));
+            (checked_add(top, parts.part("upper", p + 1)), p + 2, scale)
+        }
+        "low" => {
+            let bottom = zip_expr(parts.up(), parts.part("open", p + 1), parts.close());
+            let low = binary(Operator::Sub, bottom, parts.part("lower", p + 1));
+            (low, p + 2, scale)
+        }
+        _ => return None,
+    })
+}
+
+/// The [`OHLC`] struct's parts in a table, as the expressions over them are built.
 ///
 /// Vortex only adds and compares decimals of one type, and a sum is one digit wider than its
 /// operands, so each operand is cast to the precision its place needs: the parts start at their
 /// own precision `p` ([`vortex_ohlc::plan::OHLC_PRECISION`]), a sum of two at `p + 1` and of
 /// three at `p + 2`, at most 18 digits, so every value is an i64.
-pub fn ohlc_price(dtype: &DType, price: &str) -> Option<(Expression, u8, i8)> {
-    let fields = dtype.as_struct_fields();
-    let parts = fields.field(OHLC)?;
-    let DType::Decimal(decimal, _) = parts.as_struct_fields().field(OHLC_PARTS[0]).unwrap() else {
-        panic!("{OHLC} parts must be decimals");
-    };
-    let (p, scale) = (decimal.precision(), decimal.scale());
-    let at = |precision: u8| DecimalDType::new(precision, scale);
-    let raw = |name: &str| get_item(name, get_item(OHLC, root()));
-    let part = |name: &str, precision: u8| {
+struct OhlcParts {
+    precision: u8,
+    scale: i8,
+}
+
+impl OhlcParts {
+    /// `None` if the table of `dtype` has no [`OHLC`] struct.
+    fn new(dtype: &DType) -> Option<Self> {
+        let parts = dtype.as_struct_fields().field(OHLC)?;
+        let DType::Decimal(decimal, _) = parts.as_struct_fields().field(OHLC_PARTS[0]).unwrap()
+        else {
+            panic!("{OHLC} parts must be decimals");
+        };
+        Some(Self {
+            precision: decimal.precision(),
+            scale: decimal.scale(),
+        })
+    }
+
+    fn raw(&self, name: &str) -> Expression {
+        get_item(name, get_item(OHLC, root()))
+    }
+
+    /// The part `name`, cast to `precision`.
+    fn part(&self, name: &str, precision: u8) -> Expression {
+        let decimal = DecimalDType::new(precision, self.scale);
         vortex_cast(
-            raw(name),
-            DType::Decimal(at(precision), Nullability::Nullable),
+            self.raw(name),
+            DType::Decimal(decimal, Nullability::Nullable),
         )
-    };
-    // p + 1 digits.
-    let close = || checked_add(part("open", p), part("body", p));
-    let zero = VortexScalar::decimal(DecimalValue::I128(0), at(p), Nullability::NonNullable);
-    let up = || gt_eq(raw("body"), lit(zero.clone()));
-    Some(match price {
-        "open" => (part("open", p), p, scale),
-        "close" => (close(), p + 1, scale),
-        // p + 2 digits.
-        "high" => {
-            let top = zip_expr(up(), close(), part("open", p + 1));
-            (checked_add(top, part("upper", p + 1)), p + 2, scale)
-        }
-        "low" => {
-            let bottom = zip_expr(up(), part("open", p + 1), close());
-            let low = binary(Operator::Sub, bottom, part("lower", p + 1));
-            (low, p + 2, scale)
-        }
-        _ => return None,
-    })
+    }
+
+    /// open + body, at `p + 1` digits.
+    fn close(&self) -> Expression {
+        let p = self.precision;
+        checked_add(self.part("open", p), self.part("body", p))
+    }
+
+    fn zero(&self) -> Expression {
+        let decimal = DecimalDType::new(self.precision, self.scale);
+        let zero = VortexScalar::decimal(DecimalValue::I128(0), decimal, Nullability::NonNullable);
+        lit(zero)
+    }
+
+    /// Where close is at least open.
+    fn up(&self) -> Expression {
+        gt_eq(self.raw("body"), self.zero())
+    }
+
+    /// Where close is below open.
+    fn down(&self) -> Expression {
+        lt(self.raw("body"), self.zero())
+    }
 }
