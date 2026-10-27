@@ -1,9 +1,14 @@
-//! The edition a writer needs for what [`crate::strategy`] writes. Everything in those files is
-//! Vortex's own, but three of its wire formats are new in Vortex 0.89 and in no Vortex edition
-//! yet: blocked FoR and bit-packing (a reference and a bit width per 1024 values), and
-//! DecimalByteParts with lower parts (for chunks wider than an i64). A writer only emits them
-//! when an edition it has enabled lists them. Enabling [`VORTEX_OHLC_2026_10`] (see [`enable`])
-//! keeps Vortex's edition checks for everything else, rather than turning them off.
+//! The edition a writer needs for what [`crate::strategy`] writes, beyond Vortex's `core`
+//! editions:
+//!
+//! - our layout of the OHLC struct, [`crate::layout`];
+//! - three of Vortex's own wire formats, new in Vortex 0.89 and in no Vortex edition yet:
+//!   blocked FoR and bit-packing (a reference and a bit width per 1024 values), and
+//!   DecimalByteParts with lower parts (for chunks wider than an i64).
+//!
+//! A writer only emits them when an edition it has enabled lists them. Enabling
+//! [`VORTEX_OHLC_2026_10`] (see [`enable`]) keeps Vortex's edition checks for everything else,
+//! rather than turning them off.
 
 use vortex::editions::{
     Edition, EditionDeclaration, EditionFamily, EditionId, EditionMember, EditionSessionExt,
@@ -14,8 +19,8 @@ use vortex::session::VortexSession;
 pub static FAMILY: EditionFamily = EditionFamily {
     name: "vortex_ohlc",
     origin: "vortex-ohlc",
-    doc: "Vortex's own components that vortex-ohlc writes OHLC bars with and that no Vortex \
-edition lists yet. A draft: nothing is frozen.",
+    doc: "The components vortex-ohlc writes OHLC bars with that no Vortex edition lists: its OHLC \
+layout, and Vortex's own components that are in no edition yet. A draft: nothing is frozen.",
 };
 
 /// The first edition, a draft.
@@ -30,6 +35,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         EditionMember::array(&"fastlanes.for.v2"),
         EditionMember::array(&"fastlanes.bitpacked.v2"),
         EditionMember::array(&"vortex.decimal_byte_parts.v2"),
+        EditionMember::layout(&"vortex_ohlc.ohlc"),
     ],
 };
 

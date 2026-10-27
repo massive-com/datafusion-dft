@@ -9841,7 +9841,9 @@ name = "vortex-ohlc"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "criterion",
+ "futures",
  "num-traits",
  "parquet",
  "serde_json",
