@@ -6,20 +6,28 @@
 //!
 //! Criterion's filter picks the lookups, e.g. `cargo bench --bench needle -- 'high > 1000'`, or
 //! `-- 'needle/high > 1000/vortex expr two-phase$'`. Before timing a needle, every reader of it
-//! that runs is checked against Parquet. See `common::data` for the files.
+//! that runs is checked against Parquet, and what the Vortex engine counted for each lookup is
+//! printed: the I/O, and the zones the OHLC layout kept, next to the chunks that hold a match
+//! and the row groups Parquet keeps. See `common::data` for the files.
 
 #[allow(dead_code)]
 mod common;
 
+use std::fs::File;
 use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
-use common::needle::needles;
+use common::needle::{candidate_row_groups, needles, vortex_filter};
 use common::parquet_read::{parquet_needle_batches, scan_metadata};
-use common::vortex_read::{new_session, open_vortex, read_plan, vortex_batches, Lookup, ReadPath};
+use common::vortex_read::{
+    lookup_stats, matching_rows, new_session, open_vortex, read_plan, vortex_batches, Lookup,
+    ReadPath,
+};
 use common::{assert_same, data, drain, Selection};
 
 const PARQUET: &str = "parquet v2";
@@ -64,6 +72,43 @@ fn lookups(c: &mut Criterion) {
         for (name, path, lookup) in &ways {
             let label = format!("{}: {name}", needle.name);
             rows = assert_same(&label, parquet(&metadata), vortex(&open, *path, *lookup));
+        }
+
+        // What the engines did: the chunks that hold a match (where the whole needle goes into
+        // the Vortex filter), the row groups Parquet keeps (one per chunk), and what the Vortex
+        // engine counted for each lookup.
+        let file = File::open(&files.parquet).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone());
+        let row_groups = candidate_row_groups(&builder, &needle.terms).len();
+        let chunks = builder.metadata().num_row_groups();
+        let hit = match vortex_filter(&open, needle, &plan) {
+            (Some(filter), after) if after.is_empty() => {
+                let mut hit: Vec<u64> = matching_rows(&runtime, &session, &open, &filter)
+                    .into_iter()
+                    .map(|row| row / DEFAULT_ROW_BLOCK as u64)
+                    .collect();
+                hit.dedup();
+                hit.len().to_string()
+            }
+            _ => "?".to_string(),
+        };
+        println!(
+            "{}: {rows} rows in {hit} of {chunks} chunks; {PARQUET} keeps {row_groups} row groups",
+            needle.name
+        );
+        for (name, path, lookup) in &ways {
+            let (n, counters) = lookup_stats(
+                &runtime,
+                &files.vortex,
+                &plan,
+                &source,
+                None,
+                *path,
+                *lookup,
+            );
+            assert_eq!(n, rows, "{}: {name}, counted", needle.name);
+            let counters: Vec<String> = counters.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            println!("  {name}: {}", counters.join(" "));
         }
 
         let mut group = c.benchmark_group(format!("needle/{}", needle.name));
