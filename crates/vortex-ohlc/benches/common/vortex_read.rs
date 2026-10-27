@@ -8,6 +8,7 @@
 //!   the stored ones, cast to the source's type: what a DataFusion scan does once its
 //!   expressions are rewritten for the file.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -28,9 +29,11 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex::layout::scan::scan_builder::ScanBuilder;
+use vortex::metrics::{DefaultMetricsRegistry, MetricValue, MetricsRegistry};
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
+use vortex_ohlc::layout::record_metrics;
 use vortex_ohlc::ohlc::ohlc_from_parts;
 use vortex_ohlc::plan::{
     plan_from_json, stored_name, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES, TRANSFORMS_KEY,
@@ -103,9 +106,44 @@ pub fn read_plan(runtime: &CurrentThreadRuntime, session: &VortexSession, path: 
     plan_from_json(&serde_json::from_slice(json.as_ref()).unwrap()).expect("a plan of this version")
 }
 
+/// What the Vortex engine counted while `lookup` ran once by `path` against the file at
+/// `file_path`, opened on a session of its own: the file's I/O, and the OHLC layout's pruning
+/// (see [`vortex_ohlc::layout::OhlcMetrics`]). Counters are summed by name; returns the row
+/// count too.
+#[allow(clippy::too_many_arguments)]
+pub fn lookup_stats(
+    runtime: &CurrentThreadRuntime,
+    file_path: &Path,
+    plan: &Plan,
+    source: &SchemaRef,
+    columns: Option<&[&str]>,
+    path: ReadPath,
+    lookup: Lookup<'_>,
+) -> (usize, BTreeMap<String, u64>) {
+    let session = new_session(runtime);
+    let registry = Arc::new(DefaultMetricsRegistry::default());
+    record_metrics(&session, Arc::clone(&registry) as Arc<dyn MetricsRegistry>);
+    let open = session
+        .open_options()
+        .with_metrics_registry(Arc::clone(&registry) as Arc<dyn MetricsRegistry>)
+        .open_path(file_path);
+    let file = runtime.block_on(open).unwrap();
+    let batches = vortex_batches(
+        runtime, &session, &file, plan, source, columns, path, lookup,
+    );
+    let rows = batches.map(|batch| batch.num_rows()).sum();
+    let mut counters = BTreeMap::new();
+    for metric in registry.snapshot() {
+        if let MetricValue::Counter(counter) = metric.value() {
+            *counters.entry(metric.name().to_string()).or_default() += counter.value();
+        }
+    }
+    (rows, counters)
+}
+
 /// The rows of `file` matching `filter`, ascending: a filtered scan with only the row index
 /// projected (the two-phase lookup's first pass).
-fn matching_rows(
+pub fn matching_rows(
     runtime: &CurrentThreadRuntime,
     session: &VortexSession,
     file: &VortexFile,
