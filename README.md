@@ -146,6 +146,14 @@ dft -c "SELECT * FROM my_table" --bench --concurrent --save results.csv --append
 - **Concurrent**: Throughput measurement with parallel execution (reveals bottlenecks and contention)
 - Concurrent mode uses adaptive concurrency: `min(iterations, CPU cores)`
 
+**Allocator:** `dft` and its benchmarks, including the `vortex-ohlc` criterion benches, run on
+the system allocator. Services built on DataFusion often run on jemalloc instead, and the results
+differ: on macOS, the system allocator takes a lock for large blocks and returns them to the
+kernel, which scans decoding into large buffers hit from every thread at once. With jemalloc as
+the global allocator, the `vortex-ohlc` `df` bench ran 3-12% faster at one partition per core,
+for Parquet and Vortex alike; at one partition, Parquet was about the same and Vortex's needles
+up to 10% faster.
+
 ### Setting Up Tables with DDL
 
 `dft` can automatically load table definitions at startup, giving you a persistent "database-like" experience.
