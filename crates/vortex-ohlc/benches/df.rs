@@ -12,8 +12,8 @@
 //! `df scan/<projection>/<reader>/<partitions>`, e.g. `cargo bench --bench df -- 'high > 1000/.*/1$'`.
 //! Before timing, every reader that runs is checked against Parquet with DataFusion's defaults
 //! (the same rows, in any order), and what each scan counted is printed: DataFusion's metrics
-//! of the file scan, and for Vortex the zones the bars layout kept and the rows a scan's
-//! selection kept. See `common::data` for the files.
+//! of the file scan, and for Vortex the rows a scan's selection kept. See `common::data` for the
+//! files.
 //!
 //! For quicker iterations, `benches/quick.filter` holds a filter for one needle or scan of each
 //! kind of work, every Vortex reader at one partition per core:
@@ -25,7 +25,6 @@
 #[allow(dead_code)]
 mod common;
 
-use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,14 +55,12 @@ use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::std_file::FileReadAt;
 use vortex::io::VortexReadAt;
-use vortex::metrics::{DefaultMetricsRegistry, MetricValue, MetricsRegistry};
 use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
 use vortex_ohlc::datafusion::{vortex_format, BarsAdapterFactory, PrunedTable, ZonePruner};
-use vortex_ohlc::layout::record_metrics;
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
 use common::needle::{needles, vortex_filter, Needle, Op, Value};
@@ -80,16 +77,12 @@ enum Reader {
     /// Parquet with `pushdown_filters`: the filter decodes its columns first, and the others
     /// only for the rows that pass, as the needle bench's Parquet reader does.
     ParquetPushdown,
-    /// The file with the bars layout, its scans pruned by a `ZonePruner` before they start.
+    /// The Vortex file, its scans pruned by a `ZonePruner` before they start.
     Vortex,
-    /// The file with the bars layout, pruned by its readers as the scan runs.
-    VortexLayout,
-    /// The file without the bars layout, its scans pruned by a `ZonePruner`.
-    VortexZones,
-    /// The file without the bars layout, pruned on Vortex's own zone maps as the scan runs.
-    VortexPlain,
-    /// The file without the bars layout or the OHLC struct, the prices rescaled on their own,
-    /// its scans pruned by a `ZonePruner`.
+    /// The Vortex file, pruned on Vortex's own zone maps as the scan runs.
+    VortexUnpruned,
+    /// The file without the OHLC struct, the prices rescaled on their own, its scans pruned by a
+    /// `ZonePruner`.
     VortexPrices,
     /// Vortex with each needle's scan given exactly the zones that hold a match before it
     /// starts (see [`IdealSelection`]): the best that pruning before the scan can do.
@@ -97,13 +90,11 @@ enum Reader {
 }
 
 impl Reader {
-    const ALL: [Reader; 8] = [
+    const ALL: [Reader; 6] = [
         Reader::Parquet,
         Reader::ParquetPushdown,
         Reader::Vortex,
-        Reader::VortexLayout,
-        Reader::VortexZones,
-        Reader::VortexPlain,
+        Reader::VortexUnpruned,
         Reader::VortexPrices,
         Reader::VortexIdeal,
     ];
@@ -113,9 +104,7 @@ impl Reader {
             Reader::Parquet => "parquet",
             Reader::ParquetPushdown => "parquet pushdown",
             Reader::Vortex => "vortex",
-            Reader::VortexLayout => "vortex layout",
-            Reader::VortexZones => "vortex zones",
-            Reader::VortexPlain => "vortex plain",
+            Reader::VortexUnpruned => "vortex unpruned",
             Reader::VortexPrices => "vortex prices",
             Reader::VortexIdeal => "vortex ideal",
         }
@@ -125,10 +114,8 @@ impl Reader {
     fn vortex(self) -> Option<(VortexFile, bool)> {
         Some(match self {
             Reader::Parquet | Reader::ParquetPushdown => return None,
-            Reader::Vortex => (VortexFile::Bars, true),
-            Reader::VortexLayout | Reader::VortexIdeal => (VortexFile::Bars, false),
-            Reader::VortexZones => (VortexFile::Plain, true),
-            Reader::VortexPlain => (VortexFile::Plain, false),
+            Reader::Vortex => (VortexFile::Ohlc, true),
+            Reader::VortexUnpruned | Reader::VortexIdeal => (VortexFile::Ohlc, false),
             Reader::VortexPrices => (VortexFile::Prices, true),
         })
     }
@@ -137,8 +124,7 @@ impl Reader {
 /// The Vortex files (see `common::data`).
 #[derive(Clone, Copy)]
 enum VortexFile {
-    Bars,
-    Plain,
+    Ohlc,
     Prices,
 }
 
@@ -146,7 +132,6 @@ enum VortexFile {
 struct Tables {
     parquet: String,
     vortex: String,
-    vortex_plain: String,
     vortex_prices: String,
     schema: SchemaRef,
 }
@@ -157,7 +142,6 @@ impl Tables {
         let files = data::files(&setup, &new_session(&setup));
         let parquet = files.parquet.to_str().unwrap().to_string();
         let vortex = files.vortex.to_str().unwrap().to_string();
-        let vortex_plain = files.vortex_plain.to_str().unwrap().to_string();
         let vortex_prices = files.vortex_prices.to_str().unwrap().to_string();
         let ctx = SessionContext::new();
         runtime
@@ -167,20 +151,17 @@ impl Tables {
         Self {
             parquet,
             vortex,
-            vortex_plain,
             vortex_prices,
             schema,
         }
     }
 
-    /// A session on `partitions` partitions with [`TABLE`] read by `reader`; a Vortex table's
-    /// scans record what the bars layout pruned in `registry`.
+    /// A session on `partitions` partitions with [`TABLE`] read by `reader`.
     fn context(
         &self,
         runtime: &Runtime,
         reader: Reader,
         partitions: usize,
-        registry: Option<Arc<dyn MetricsRegistry>>,
         ideal: Option<&ScanSelection>,
     ) -> SessionContext {
         let mut config = SessionConfig::new().with_target_partitions(partitions);
@@ -195,17 +176,12 @@ impl Tables {
             _ => {
                 let (file, pruned) = reader.vortex().unwrap();
                 let path = match file {
-                    VortexFile::Bars => &self.vortex,
-                    VortexFile::Plain => &self.vortex_plain,
+                    VortexFile::Ohlc => &self.vortex,
                     VortexFile::Prices => &self.vortex_prices,
                 };
                 // Vortex does its I/O on the runtime it finds when the session is made.
                 let _runtime = runtime.enter();
                 let session = VortexSession::default();
-                vortex_ohlc::register(&session);
-                if let Some(registry) = registry {
-                    record_metrics(&session, registry);
-                }
                 let pruner = Arc::new(ZonePruner::new(session.clone()));
                 let options = ListingOptions::new(Arc::new(vortex_format(session)))
                     .with_file_extension(".vortex");
@@ -474,17 +450,6 @@ fn scan_metrics(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
     out
 }
 
-/// The counters in `registry`, summed by name.
-fn counters(registry: &DefaultMetricsRegistry) -> BTreeMap<String, u64> {
-    let mut counters: BTreeMap<String, u64> = BTreeMap::new();
-    for metric in registry.snapshot() {
-        if let MetricValue::Counter(counter) = metric.value() {
-            *counters.entry(metric.name().to_string()).or_default() += counter.value();
-        }
-    }
-    counters
-}
-
 /// `needle` as a query for every column of the rows it matches.
 fn needle_sql(needle: &Needle, schema: &Schema) -> String {
     let terms: Vec<String> = needle
@@ -576,24 +541,18 @@ impl Setup {
             return;
         }
         let rt = &self.runtime;
-        let baseline = self.tables.context(rt, Reader::Parquet, 1, None, None);
+        let baseline = self.tables.context(rt, Reader::Parquet, 1, None);
         let (expected, metrics) = rt.block_on(check(&baseline, sql));
         println!("{label}: {} rows; {sql}", expected.rows);
         println!("  parquet/1: {}", metrics.join(" "));
         for &(reader, partitions) in &runs {
-            let registry = Arc::new(DefaultMetricsRegistry::default());
-            let as_registry = Arc::clone(&registry) as Arc<dyn MetricsRegistry>;
-            let ctx = self
-                .tables
-                .context(rt, reader, partitions, Some(as_registry), ideal);
+            let ctx = self.tables.context(rt, reader, partitions, ideal);
             let name = format!("{}/{partitions}", reader.name());
             // Three times, a moment apart: the first reads the zone maps (see `ZonePruner`), and
             // the last runs as the timed ones do, with them cached.
-            let mut before = BTreeMap::new();
             let mut metrics = Vec::new();
             let mut first = Vec::new();
             for run in 0..3 {
-                before = counters(&registry);
                 let (actual, last) = rt.block_on(check(&ctx, sql));
                 assert_eq!(actual, expected, "{label}: {name}");
                 if run == 0 {
@@ -607,14 +566,6 @@ impl Setup {
                 std::thread::sleep(Duration::from_millis(100));
             }
             metrics.extend(first);
-            if reader.vortex().is_some() {
-                let after = counters(&registry);
-                metrics.extend(
-                    after
-                        .iter()
-                        .map(|(k, v)| format!("{k}={}", v - before.get(k).copied().unwrap_or(0))),
-                );
-            }
             if reader != Reader::Parquet || partitions != 1 {
                 println!("  {name}: {}", metrics.join(" "));
             }
@@ -630,7 +581,7 @@ impl Setup {
                 .measurement_time(Duration::from_secs(3));
         }
         for (reader, partitions) in runs {
-            let ctx = self.tables.context(rt, reader, partitions, None, ideal);
+            let ctx = self.tables.context(rt, reader, partitions, ideal);
             group.bench_function(format!("{}/{partitions}", reader.name()), |b| {
                 b.iter(|| rt.block_on(run(&ctx, sql)))
             });
