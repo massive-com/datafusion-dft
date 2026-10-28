@@ -7,6 +7,8 @@
 //!   record of them in the file, so a reader can undo them.
 //! - [`profile`]: measuring a source's decimal columns, and the plan that follows from that.
 //! - [`ohlc`]: a bar's parts from its prices, and back.
+//! - [`prices`]: the prices as Vortex expressions over the parts, to rebuild or filter on them
+//!   within a scan.
 //! - [`compress`]: FoR + FastLanes for decimal and integer chunks, under DecimalByteParts.
 //! - [`strategy`]: the write strategy that sends each column through it.
 //! - [`layout`]: the layout at the root of the table, which prunes a filter on a price from the
@@ -20,6 +22,7 @@ pub mod edition;
 pub mod layout;
 pub mod ohlc;
 pub mod plan;
+pub mod prices;
 pub mod profile;
 pub mod strategy;
 
