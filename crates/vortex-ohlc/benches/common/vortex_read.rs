@@ -34,10 +34,9 @@ use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_ohlc::ohlc::ohlc_from_parts;
-use vortex_ohlc::plan::{
-    plan_from_json, stored_name, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES, TRANSFORMS_KEY,
-};
+use vortex_ohlc::plan::{stored_name, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES};
 use vortex_ohlc::prices::price;
+use vortex_ohlc::write::file_plan;
 
 use crate::common::needle::{filter_rows, vortex_filter, Needle};
 
@@ -99,10 +98,7 @@ pub fn open_vortex(
 pub fn read_plan(runtime: &CurrentThreadRuntime, session: &VortexSession, path: &Path) -> Plan {
     let open = session.open_options().include_metadata().open_path(path);
     let file = runtime.block_on(open).unwrap();
-    let json = file
-        .metadata_segment(TRANSFORMS_KEY)
-        .expect("the file records its plan");
-    plan_from_json(&serde_json::from_slice(json.as_ref()).unwrap()).expect("a plan of this version")
+    file_plan(&file).expect("the file records a plan of this version")
 }
 
 /// What the Vortex engine counted while `lookup` ran once by `path` against the file at
