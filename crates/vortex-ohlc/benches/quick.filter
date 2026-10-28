@@ -1,0 +1,1 @@
+^df (needle/(high > 1000|AAPL 14:30-15:30|AAPL & close > 67|all @ 14:30|high = 50|dv > 1529338)|scan/(dollar_volume|all columns))/vortex[^/]*/14$
