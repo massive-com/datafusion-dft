@@ -44,7 +44,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::object_store::ObjectMeta;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use moka::sync::Cache;
@@ -169,8 +169,14 @@ impl ZonePruner {
             if !pruned {
                 return Ok(Transformed::no(plan));
             }
+            // DataFusion would split a big file into byte ranges, one scan each, to read in
+            // parallel; a scan of a few zones is quicker whole than set up once per range.
+            // Declaring the partitioning the scan has (which is what DataFusion takes it to have
+            // anyway) keeps it from being split.
+            let partitioning = Partitioning::UnknownPartitioning(conf.file_groups.len());
             let conf = FileScanConfigBuilder::from(conf.clone())
                 .with_file_groups(groups)
+                .with_output_partitioning(Some(partitioning))
                 .build();
             Ok(Transformed::yes(
                 DataSourceExec::from_data_source(conf) as Arc<dyn ExecutionPlan>
