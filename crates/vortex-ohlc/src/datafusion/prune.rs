@@ -62,7 +62,6 @@ use vortex::session::VortexSession;
 use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
 
-use crate::layout::{find_child, find_zoned};
 use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
 /// How many bytes of zone maps a [`ZonePruner`] keeps by default: tens of KB a file, so some
@@ -80,8 +79,6 @@ const CONCURRENT_READS: usize = 16;
 type ZonesRead = Shared<BoxFuture<'static, Option<Arc<FileZones>>>>;
 
 /// Gives each file of a plan's Vortex scans the zones a filter can match: see the module docs.
-///
-/// The session needs the crate registered (see [`crate::register`]).
 pub struct ZonePruner {
     session: VortexSession,
     /// Zone maps by object store and path, up to a number of bytes, the least recently used
@@ -245,6 +242,24 @@ impl fmt::Debug for ZonePruner {
 /// The cache key of `file` in the object store at `url`.
 fn key(url: &ObjectStoreUrl, file: &PartitionedFile) -> String {
     format!("{}{}", url.as_str(), file.path())
+}
+
+/// The child named `name` of the first layout at or under `layout` that has one, depth first:
+/// a field of the table's struct layout, wherever that is.
+fn find_child(layout: &LayoutRef, name: &str) -> Option<LayoutRef> {
+    let children = layout.children().ok()?;
+    if let Some(index) = layout.child_names().position(|n| n.as_ref() == name) {
+        return children.get(index).map(Arc::clone);
+    }
+    children.iter().find_map(|child| find_child(child, name))
+}
+
+/// The first zoned layout at or under `layout`, depth first.
+fn find_zoned(layout: &LayoutRef) -> Option<LayoutRef> {
+    if layout.is::<Zoned>() {
+        return Some(Arc::clone(layout));
+    }
+    layout.children().ok()?.iter().find_map(find_zoned)
 }
 
 /// `plan`'s file scan config and source, if it is a Vortex scan.

@@ -7,8 +7,8 @@
 //! Criterion's filter picks the lookups, e.g. `cargo bench --bench needle -- 'high > 1000'`, or
 //! `-- 'needle/high > 1000/vortex expr two-phase$'`. Before timing a needle, every reader of it
 //! that runs is checked against Parquet, and what the Vortex engine counted for each lookup is
-//! printed: the I/O, and the zones the bars layout kept, next to the chunks that hold a match
-//! and the row groups Parquet keeps. See `common::data` for the files.
+//! printed: the I/O, next to the chunks that hold a match and the row groups Parquet keeps. See
+//! `common::data` for the files.
 
 #[allow(dead_code)]
 mod common;

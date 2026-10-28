@@ -33,7 +33,6 @@ use vortex::metrics::{DefaultMetricsRegistry, MetricValue, MetricsRegistry};
 use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::layout::record_metrics;
 use vortex_ohlc::ohlc::ohlc_from_parts;
 use vortex_ohlc::plan::{
     plan_from_json, stored_name, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES, TRANSFORMS_KEY,
@@ -82,7 +81,6 @@ pub enum Lookup<'a> {
 pub fn new_session(runtime: &CurrentThreadRuntime) -> VortexSession {
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
-    vortex_ohlc::register(&session);
     session
 }
 
@@ -108,9 +106,8 @@ pub fn read_plan(runtime: &CurrentThreadRuntime, session: &VortexSession, path: 
 }
 
 /// What the Vortex engine counted while `lookup` ran once by `path` against the file at
-/// `file_path`, opened on a session of its own: the file's I/O, and the bars layout's pruning
-/// (see [`vortex_ohlc::layout::BarsMetrics`]). Counters are summed by name; returns the row
-/// count too.
+/// `file_path`, opened on a session of its own: the file's I/O. Counters are summed by name;
+/// returns the row count too.
 #[allow(clippy::too_many_arguments)]
 pub fn lookup_stats(
     runtime: &CurrentThreadRuntime,
@@ -123,7 +120,6 @@ pub fn lookup_stats(
 ) -> (usize, BTreeMap<String, u64>) {
     let session = new_session(runtime);
     let registry = Arc::new(DefaultMetricsRegistry::default());
-    record_metrics(&session, Arc::clone(&registry) as Arc<dyn MetricsRegistry>);
     let open = session
         .open_options()
         .with_metrics_registry(Arc::clone(&registry) as Arc<dyn MetricsRegistry>)
