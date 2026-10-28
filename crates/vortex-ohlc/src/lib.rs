@@ -14,10 +14,13 @@
 //! - [`layout`]: the layout at the root of the table, which prunes a filter on a price from the
 //!   OHLC parts' zone maps, and skips the projections of splits a filter rules out. A session
 //!   reading the files needs it registered (see [`register`]).
+//! - [`datafusion`]: reading the files from DataFusion with the source's schema: the planned
+//!   columns rebuilt, and filters on them pushed down into Vortex.
 //! - [`edition`]: the edition that lets a writer emit that layout, and Vortex's blocked FoR and
 //!   bit-packing.
 
 pub mod compress;
+pub mod datafusion;
 pub mod edition;
 pub mod layout;
 pub mod ohlc;
