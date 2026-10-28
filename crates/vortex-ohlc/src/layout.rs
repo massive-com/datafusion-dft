@@ -409,19 +409,19 @@ impl LayoutReader for BarsReader {
         expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
-        let inner = self
-            .inner
-            .pruning_evaluation(row_range, expr, mask.clone())?;
         let predicate = Predicate::parse(expr, true);
         if self.zones.is_none() || matches!(predicate, Predicate::Unknown) {
-            return Ok(inner);
+            return self.inner.pruning_evaluation(row_range, expr, mask);
         }
+        // The table's reader is asked only about the zones these bounds keep: its own pruning
+        // splits the expression up for every call, which costs more than a split it can't
+        // prune (most of them, for a price filter) is worth.
         let bounds = self.bounds();
-        let row_range = row_range.clone();
+        let (inner, row_range, expr) = (Arc::clone(&self.inner), row_range.clone(), expr.clone());
         let counters = self.counters.clone();
         Ok(MaskFuture::new(mask.len(), async move {
             let Some(bounds) = bounds.await else {
-                return inner.await;
+                return inner.pruning_evaluation(&row_range, &expr, mask)?.await;
             };
             let zone_len = bounds.zone_len;
             let end = row_range.end.min(bounds.row_count);
@@ -454,7 +454,7 @@ impl LayoutReader for BarsReader {
             if pruned.all_false() {
                 return Ok(pruned);
             }
-            Ok(&pruned & &inner.await?)
+            inner.pruning_evaluation(&row_range, &expr, pruned)?.await
         }))
     }
 
