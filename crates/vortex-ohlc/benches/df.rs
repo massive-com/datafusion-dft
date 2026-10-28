@@ -14,6 +14,13 @@
 //! (the same rows, in any order), and what each scan counted is printed: DataFusion's metrics
 //! of the file scan, and for Vortex the zones the bars layout kept and the rows a scan's
 //! selection kept. See `common::data` for the files.
+//!
+//! For quicker iterations, `benches/quick.filter` holds a filter for one needle or scan of each
+//! kind of work, every Vortex reader at one partition per core:
+//! `cargo bench --bench df -- "$(cat crates/vortex-ohlc/benches/quick.filter)"`. Run them all
+//! before relying on a result. Parquet's results don't change with this crate: they are kept in
+//! `target/vortex-ohlc-bench/parquet-results.txt`, to compare against without timing Parquet
+//! again.
 
 #[allow(dead_code)]
 mod common;
