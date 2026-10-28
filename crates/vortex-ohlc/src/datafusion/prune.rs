@@ -46,6 +46,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use moka::sync::Cache;
 use roaring::RoaringTreemap;
 use vortex::array::memory::MemorySessionExt;
 use vortex::array::{MaskFuture, VortexSessionExecute};
@@ -64,6 +65,10 @@ use vortex_datafusion::{VortexAccessPlan, VortexSource};
 use crate::layout::{find_child, find_zoned};
 use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
+/// How many bytes of zone maps [`BarsPruning`] keeps by default: tens of KB a file, so some
+/// thousands of files.
+pub const DEFAULT_CACHE_BYTES: u64 = 256 << 20;
+
 /// The largest share of a file's zones a selection keeps: a scan that keeps more than this skips
 /// too few splits to make up for checking its selection on the rest.
 const MAX_KEPT: f64 = 0.5;
@@ -75,16 +80,34 @@ pub struct BarsPruning {
     session: VortexSession,
     /// The object stores the scans read their files from, as DataFusion's runtime has them.
     stores: Arc<dyn ObjectStoreRegistry>,
-    /// By object store and path; shared with the tasks that read them.
-    files: Arc<Mutex<HashMap<String, Cached>>>,
+    /// Zone maps by object store and path, up to a number of bytes, the least recently used
+    /// evicted first.
+    files: Cache<String, Arc<FileZones>>,
+    /// The files whose zone maps are being read; shared with the tasks that read them.
+    reading: Arc<Mutex<HashSet<String>>>,
 }
 
 impl BarsPruning {
+    /// Keeping up to [`DEFAULT_CACHE_BYTES`] of zone maps.
     pub fn new(session: VortexSession, stores: Arc<dyn ObjectStoreRegistry>) -> Self {
+        Self::with_cache_bytes(session, stores, DEFAULT_CACHE_BYTES)
+    }
+
+    /// Keeping up to `cache_bytes` of zone maps.
+    pub fn with_cache_bytes(
+        session: VortexSession,
+        stores: Arc<dyn ObjectStoreRegistry>,
+        cache_bytes: u64,
+    ) -> Self {
+        let files = Cache::builder()
+            .weigher(|_, zones: &Arc<FileZones>| zones.bytes)
+            .max_capacity(cache_bytes)
+            .build();
         Self {
             session,
             stores,
-            files: Arc::default(),
+            files,
+            reading: Arc::default(),
         }
     }
 
@@ -94,22 +117,20 @@ impl BarsPruning {
     fn zones(&self, url: &ObjectStoreUrl, file: &PartitionedFile) -> Option<Arc<FileZones>> {
         let key = format!("{}{}", url.as_str(), file.path());
         let meta = &file.object_meta;
-        let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
-        match files.get(&key) {
-            Some(Cached::Read(zones))
-                if zones.meta.size == meta.size
-                    && zones.meta.last_modified == meta.last_modified =>
-            {
-                return Some(Arc::clone(zones));
+        if let Some(zones) = self.files.get(&key) {
+            if zones.meta.size == meta.size && zones.meta.last_modified == meta.last_modified {
+                return Some(zones);
             }
-            Some(Cached::Reading) => return None,
-            _ => {}
+        }
+        let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
+        if reading.contains(&key) {
+            return None;
         }
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         let store = self.stores.get_store(url.as_ref()).ok()?;
-        files.insert(key.clone(), Cached::Reading);
+        reading.insert(key.clone());
         let (session, path, meta) = (self.session.clone(), file.path().clone(), meta.clone());
-        let files = Arc::clone(&self.files);
+        let (files, reading) = (self.files.clone(), Arc::clone(&self.reading));
         runtime.spawn(async move {
             let read = async {
                 let read = ObjectStoreReadAt::new_with_allocator(
@@ -125,13 +146,14 @@ impl BarsPruning {
                     .await?;
                 FileZones::read(&session, &file, meta).await
             };
-            let read = read.await;
-            let mut files = files.lock().unwrap_or_else(|e| e.into_inner());
-            match read {
-                Ok(zones) => files.insert(key, Cached::Read(Arc::new(zones))),
-                // Left unpruned until the next query tries again.
-                Err(_) => files.remove(&key),
-            };
+            // On an error, left unpruned until the next query tries again.
+            if let Ok(zones) = read.await {
+                files.insert(key.clone(), Arc::new(zones));
+            }
+            reading
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
         });
         None
     }
@@ -234,16 +256,13 @@ impl PhysicalOptimizerRule for BarsPruning {
     }
 }
 
-enum Cached {
-    Reading,
-    Read(Arc<FileZones>),
-}
-
 /// A file's zone maps, as of its size and modification time (in `meta`): every zoned column's
 /// min and max per zone, as Arrow arrays of its stored type, null where the zone map has no
 /// bound. A column is named by its path, `ohlc.open` for a part.
 struct FileZones {
     meta: ObjectMeta,
+    /// What the min and max arrays take in memory, as the cache weighs them.
+    bytes: u32,
     zone_len: u64,
     row_count: u64,
     nzones: usize,
@@ -300,8 +319,13 @@ impl FileZones {
             columns.insert(path, bounds);
         }
         let (zone_len, nzones) = shape.ok_or_else(|| vortex_err!("no zoned columns"))?;
+        let bytes = columns
+            .values()
+            .map(|(min, max)| min.get_array_memory_size() + max.get_array_memory_size())
+            .sum::<usize>();
         Ok(Self {
             meta,
+            bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
             zone_len,
             row_count: file.row_count(),
             nzones,

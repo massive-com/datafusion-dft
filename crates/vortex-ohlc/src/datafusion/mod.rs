@@ -47,7 +47,7 @@ use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
 mod prune;
 use crate::prices::{compare_price, decimal_literal};
-pub use prune::BarsPruning;
+pub use prune::{BarsPruning, DEFAULT_CACHE_BYTES};
 
 /// A [`VortexFormat`] on `session` that hands Vortex what [`BarsExpressionConverter`] converts.
 /// The session needs the crate registered (see [`crate::register`]).
