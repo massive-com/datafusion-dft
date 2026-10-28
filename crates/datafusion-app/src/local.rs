@@ -98,7 +98,15 @@ impl ExecutionContext {
         }
 
         let mut session_ctx = SessionContext::new_with_state(session_state);
-        session_ctx = session_ctx.enable_url_table();
+        // With Vortex, its tables queried by path are pruned as its others are.
+        #[cfg(feature = "vortex")]
+        {
+            session_ctx = crate::extensions::enable_url_table(session_ctx);
+        }
+        #[cfg(not(feature = "vortex"))]
+        {
+            session_ctx = session_ctx.enable_url_table();
+        }
 
         #[cfg(feature = "functions-json")]
         datafusion_functions_json::register_all(&mut session_ctx)?;

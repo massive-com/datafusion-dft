@@ -37,6 +37,8 @@ mod s3;
 mod vortex;
 
 pub use builder::DftSessionStateBuilder;
+#[cfg(feature = "vortex")]
+pub(crate) use vortex::enable_url_table;
 
 #[async_trait::async_trait]
 pub trait Extension: Debug {
