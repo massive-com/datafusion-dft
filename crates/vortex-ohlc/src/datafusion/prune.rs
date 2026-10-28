@@ -7,8 +7,8 @@
 //! selective filter that walk is most of the query: about a millisecond for the 386 zones of a
 //! month of bars. A scan given a [`Selection`] doesn't start the splits it rules out at all.
 //!
-//! [`ZonePruner`] gives each file of a plan's Vortex scans the selection of the zones a filter
-//! can match. It keeps each file's zone maps, read once, as DataFusion [`PruningStatistics`] over
+//! [`ZonePruner`] gives each file of a Vortex scan the selection of the zones a filter can
+//! match. It keeps each file's zone maps, read once, as DataFusion [`PruningStatistics`] over
 //! the table's columns, and prunes them with DataFusion's own
 //! [`PruningPredicate`](datafusion::physical_optimizer::pruning::PruningPredicate), a zone to a
 //! container:
@@ -21,7 +21,7 @@
 //! [`ZonePruner::prune`] reads the zone maps it doesn't have yet and waits for them, so every
 //! query is pruned. It reads them through a [`VortexReaderFactory`], the one the scans read their
 //! data with, so the reads go wherever the data's do (S3, a disk cache in front of it, or a local
-//! file). [`PrunedTable`](super::PrunedTable) calls it when it's scanned.
+//! file). [`VortexExecFactory`](super::VortexExecFactory) calls it for every scan it builds.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -33,18 +33,14 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array};
 use arrow::compute::{cast, nullif};
 use arrow::datatypes::{DataType, Schema};
 use datafusion::common::pruning::PruningStatistics;
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue};
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::{
-    FileGroup, FileScanConfig, FileScanConfigBuilder, FileSource,
-};
-use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::object_store::ObjectMeta;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::Partitioning;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use moka::sync::Cache;
@@ -60,7 +56,7 @@ use vortex::layout::{LayoutReaderContext, LayoutRef};
 use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::VortexReaderFactory;
-use vortex_datafusion::{VortexAccessPlan, VortexSource};
+use vortex_datafusion::VortexAccessPlan;
 
 use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
@@ -78,7 +74,7 @@ const CONCURRENT_READS: usize = 16;
 /// A read of a file's zone maps, which every query that wants them joins; `None` if it failed.
 type ZonesRead = Shared<BoxFuture<'static, Option<Arc<FileZones>>>>;
 
-/// Gives each file of a plan's Vortex scans the zones a filter can match: see the module docs.
+/// Gives each file of a Vortex scan the zones a filter can match: see the module docs.
 pub struct ZonePruner {
     session: VortexSession,
     /// Zone maps by object store and path, up to a number of bytes, the least recently used
@@ -108,78 +104,64 @@ impl ZonePruner {
         }
     }
 
-    /// Give the Vortex scans in `plan` the zones `predicate` can match, or, without one, those
-    /// each scan's own pushed-down predicate can. The zone maps of every file it doesn't have
-    /// are read first, through `readers`.
+    /// `conf`, a Vortex scan's config, with each file given the zones `predicate` can match, as
+    /// Atlas's index prunes a scan's file groups. The zone maps of every file it doesn't have are
+    /// read first, through `readers`.
     pub async fn prune(
         &self,
-        plan: Arc<dyn ExecutionPlan>,
+        conf: FileScanConfig,
         predicate: Option<&Arc<dyn PhysicalExpr>>,
         readers: &dyn VortexReaderFactory,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    ) -> Result<FileScanConfig> {
+        let Some(predicate) = predicate else {
+            return Ok(conf);
+        };
+        let url = &conf.object_store_url;
         let mut reads = Vec::new();
-        plan.apply(|node| {
-            if let Some((conf, _)) = vortex_scan(node) {
-                for file in conf.file_groups.iter().flat_map(|group| group.iter()) {
-                    let url = &conf.object_store_url;
-                    if self.cached(url, file).is_none() {
-                        let reader = readers.create_reader(file, &self.session)?;
-                        reads.push(self.read(url, file, reader));
-                    }
-                }
+        for file in conf.file_groups.iter().flat_map(|group| group.iter()) {
+            if self.cached(url, file).is_none() {
+                let reader = readers.create_reader(file, &self.session)?;
+                reads.push(self.read(url, file, reader));
             }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
+        }
         futures::stream::iter(reads)
             .buffer_unordered(CONCURRENT_READS)
             .collect::<Vec<_>>()
             .await;
-        plan.transform_up(|plan| {
-            let Some((conf, source)) = vortex_scan(&plan) else {
-                return Ok(Transformed::no(plan));
-            };
-            let Some(predicate) = predicate.or(source.predicate()) else {
-                return Ok(Transformed::no(plan));
-            };
-            let (url, table) = (&conf.object_store_url, source.table_schema().table_schema());
-            let mut pruned = false;
-            let groups = conf
-                .file_groups
-                .iter()
-                .map(|group| {
-                    let files = group.iter().map(|file| {
-                        let mut file = file.clone();
-                        // A file whose zone maps couldn't be read is scanned whole.
-                        let Some(zones) = self.cached(url, &file) else {
-                            return file;
-                        };
-                        if let Some(selection) = selection(&zones, predicate, table) {
-                            file.extensions
-                                .insert(VortexAccessPlan::default().with_selection(selection));
-                            pruned = true;
-                        }
-                        file
-                    });
-                    FileGroup::new(files.collect())
-                })
-                .collect();
-            if !pruned {
-                return Ok(Transformed::no(plan));
-            }
-            // DataFusion would split a big file into byte ranges, one scan each, to read in
-            // parallel; a scan of a few zones is quicker whole than set up once per range.
-            // Declaring the partitioning the scan has (which is what DataFusion takes it to have
-            // anyway) keeps it from being split.
-            let partitioning = Partitioning::UnknownPartitioning(conf.file_groups.len());
-            let conf = FileScanConfigBuilder::from(conf.clone())
-                .with_file_groups(groups)
-                .with_output_partitioning(Some(partitioning))
-                .build();
-            Ok(Transformed::yes(
-                DataSourceExec::from_data_source(conf) as Arc<dyn ExecutionPlan>
-            ))
-        })
-        .data()
+        let table = conf.file_source().table_schema().table_schema();
+        let mut pruned = false;
+        let groups: Vec<FileGroup> = conf
+            .file_groups
+            .iter()
+            .map(|group| {
+                let files = group.iter().map(|file| {
+                    let mut file = file.clone();
+                    // A file whose zone maps couldn't be read is scanned whole.
+                    let Some(zones) = self.cached(url, &file) else {
+                        return file;
+                    };
+                    if let Some(selection) = selection(&zones, predicate, table) {
+                        file.extensions
+                            .insert(VortexAccessPlan::default().with_selection(selection));
+                        pruned = true;
+                    }
+                    file
+                });
+                FileGroup::new(files.collect())
+            })
+            .collect();
+        if !pruned {
+            return Ok(conf);
+        }
+        // DataFusion would split a big file into byte ranges, one scan each, to read in parallel;
+        // a scan of a few zones is quicker whole than set up once per range. Declaring the
+        // partitioning the scan has (which is what DataFusion takes it to have anyway) keeps it
+        // from being split.
+        let partitioning = Partitioning::UnknownPartitioning(groups.len());
+        Ok(FileScanConfigBuilder::from(conf)
+            .with_file_groups(groups)
+            .with_output_partitioning(Some(partitioning))
+            .build())
     }
 
     /// The zone maps of `file` in the object store at `url`, if they're kept and the file
@@ -260,16 +242,6 @@ fn find_zoned(layout: &LayoutRef) -> Option<LayoutRef> {
         return Some(Arc::clone(layout));
     }
     layout.children().ok()?.iter().find_map(find_zoned)
-}
-
-/// `plan`'s file scan config and source, if it is a Vortex scan.
-fn vortex_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<(&FileScanConfig, &VortexSource)> {
-    let conf = plan
-        .downcast_ref::<DataSourceExec>()?
-        .data_source()
-        .downcast_ref::<FileScanConfig>()?;
-    let source = conf.file_source().downcast_ref::<VortexSource>()?;
-    Some((conf, source))
 }
 
 /// The rows in the zones of a file with the zone maps `zones` that `predicate` (over `table`,

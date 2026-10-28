@@ -14,8 +14,9 @@
 //! [`vortex_format`] is a format that reads the files this way, given a table with the source's
 //! schema and a [`BarsAdapterFactory`].
 //!
-//! [`ZonePruner`] prunes a plan's Vortex scans before they start, so a scan doesn't start the
-//! zones its filter rules out; a [`PrunedTable`] has it prune its scans.
+//! [`ZonePruner`] prunes a Vortex scan before it starts, so the scan doesn't start the zones its
+//! filter rules out. A [`VortexExecFactory`] builds scans with it, as Atlas's factory of the same
+//! name builds its Vortex scans, and a [`PrunedTable`] has one build its scans.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -48,7 +49,7 @@ mod prune;
 mod table;
 use crate::prices::{compare_price, decimal_literal};
 pub use prune::{ZonePruner, DEFAULT_CACHE_BYTES};
-pub use table::PrunedTable;
+pub use table::{PrunedTable, VortexExecFactory};
 
 /// A [`VortexFormat`] on `session` that hands Vortex what [`BarsExpressionConverter`] converts.
 pub fn vortex_format(session: VortexSession) -> VortexFormat {

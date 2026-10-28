@@ -60,7 +60,9 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
-use vortex_ohlc::datafusion::{vortex_format, BarsAdapterFactory, PrunedTable, ZonePruner};
+use vortex_ohlc::datafusion::{
+    vortex_format, BarsAdapterFactory, PrunedTable, VortexExecFactory, ZonePruner,
+};
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
 use common::needle::{needles, vortex_filter, Needle, Op, Value};
@@ -189,14 +191,15 @@ impl Tables {
                     .with_listing_options(options)
                     .with_schema(Arc::clone(&self.schema))
                     .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
-                let mut table: Arc<dyn TableProvider> =
-                    Arc::new(ListingTable::try_new(config).unwrap());
+                let listing = Arc::new(ListingTable::try_new(config).unwrap());
+                let mut table: Arc<dyn TableProvider> = Arc::clone(&listing) as _;
                 // Pruned with zone maps read through the object store, as production reads S3.
                 if pruned {
                     let url = ObjectStoreUrl::local_filesystem();
                     let store = ctx.runtime_env().object_store(&url).unwrap();
                     let readers = Arc::new(DefaultVortexReaderFactory::new(store));
-                    table = Arc::new(PrunedTable::new(table, pruner, readers));
+                    let factory = VortexExecFactory::new(pruner, readers);
+                    table = Arc::new(PrunedTable::new(listing, factory));
                 }
                 ctx.register_table(TABLE, table).unwrap();
                 let mut state = SessionStateBuilder::new_from_existing(ctx.state())
