@@ -15,8 +15,8 @@
 //! [`vortex_format`] is a format that reads the files this way, given a table with the source's
 //! schema and a [`BarsAdapterFactory`].
 //!
-//! [`BarsPruning`] is a physical optimizer rule that prunes a scan's chunks while the query is
-//! planned, so the scan doesn't start the ones its filter rules out.
+//! [`ZonePruner`] prunes a plan's Vortex scans before they start, so a scan doesn't start the
+//! zones its filter rules out; a [`PrunedTable`] has it prune its scans.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -46,8 +46,10 @@ use vortex_datafusion::VortexFormat;
 use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
 mod prune;
+mod table;
 use crate::prices::{compare_price, decimal_literal};
-pub use prune::{BarsPruning, DEFAULT_CACHE_BYTES};
+pub use prune::{ZonePruner, DEFAULT_CACHE_BYTES};
+pub use table::PrunedTable;
 
 /// A [`VortexFormat`] on `session` that hands Vortex what [`BarsExpressionConverter`] converts.
 /// The session needs the crate registered (see [`crate::register`]).

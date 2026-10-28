@@ -12,8 +12,8 @@
 //! `df scan/<projection>/<reader>/<partitions>`, e.g. `cargo bench --bench df -- 'high > 1000/.*/1$'`.
 //! Before timing, every reader that runs is checked against Parquet with DataFusion's defaults
 //! (the same rows, in any order), and what each scan counted is printed: DataFusion's metrics
-//! of the file scan, and for Vortex the zones the bars layout kept. See `common::data` for the
-//! files.
+//! of the file scan, and for Vortex the zones the bars layout kept and the rows a scan's
+//! selection kept. See `common::data` for the files.
 
 #[allow(dead_code)]
 mod common;
@@ -27,6 +27,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::row::{RowConverter, SortField};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
+use datafusion::catalog::TableProvider;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::datasource::listing::PartitionedFile;
@@ -35,6 +36,7 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{collect, ExecutionPlan};
@@ -51,9 +53,9 @@ use vortex::metrics::{DefaultMetricsRegistry, MetricValue, MetricsRegistry};
 use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::reader::VortexReaderFactory;
+use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
-use vortex_ohlc::datafusion::{vortex_format, BarsAdapterFactory, BarsPruning};
+use vortex_ohlc::datafusion::{vortex_format, BarsAdapterFactory, PrunedTable, ZonePruner};
 use vortex_ohlc::layout::record_metrics;
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
@@ -71,17 +73,31 @@ enum Reader {
     /// Parquet with `pushdown_filters`: the filter decodes its columns first, and the others
     /// only for the rows that pass, as the needle bench's Parquet reader does.
     ParquetPushdown,
+    /// The file with the bars layout, its scans pruned by a `ZonePruner` before they start.
     Vortex,
+    /// The file with the bars layout, pruned by its readers as the scan runs.
+    VortexLayout,
+    /// The file without the bars layout, its scans pruned by a `ZonePruner`.
+    VortexZones,
+    /// The file without the bars layout, pruned on Vortex's own zone maps as the scan runs.
+    VortexPlain,
+    /// The file without the bars layout or the OHLC struct, the prices rescaled on their own,
+    /// its scans pruned by a `ZonePruner`.
+    VortexPrices,
     /// Vortex with each needle's scan given exactly the zones that hold a match before it
     /// starts (see [`IdealSelection`]): the best that pruning before the scan can do.
     VortexIdeal,
 }
 
 impl Reader {
-    const ALL: [Reader; 4] = [
+    const ALL: [Reader; 8] = [
         Reader::Parquet,
         Reader::ParquetPushdown,
         Reader::Vortex,
+        Reader::VortexLayout,
+        Reader::VortexZones,
+        Reader::VortexPlain,
+        Reader::VortexPrices,
         Reader::VortexIdeal,
     ];
 
@@ -90,15 +106,41 @@ impl Reader {
             Reader::Parquet => "parquet",
             Reader::ParquetPushdown => "parquet pushdown",
             Reader::Vortex => "vortex",
+            Reader::VortexLayout => "vortex layout",
+            Reader::VortexZones => "vortex zones",
+            Reader::VortexPlain => "vortex plain",
+            Reader::VortexPrices => "vortex prices",
             Reader::VortexIdeal => "vortex ideal",
         }
     }
+
+    /// For a Vortex reader, the file it reads and whether a `ZonePruner` prunes its scans.
+    fn vortex(self) -> Option<(VortexFile, bool)> {
+        Some(match self {
+            Reader::Parquet | Reader::ParquetPushdown => return None,
+            Reader::Vortex => (VortexFile::Bars, true),
+            Reader::VortexLayout | Reader::VortexIdeal => (VortexFile::Bars, false),
+            Reader::VortexZones => (VortexFile::Plain, true),
+            Reader::VortexPlain => (VortexFile::Plain, false),
+            Reader::VortexPrices => (VortexFile::Prices, true),
+        })
+    }
+}
+
+/// The Vortex files (see `common::data`).
+#[derive(Clone, Copy)]
+enum VortexFile {
+    Bars,
+    Plain,
+    Prices,
 }
 
 /// The files, and the Parquet table's schema, which the Vortex table takes too.
 struct Tables {
     parquet: String,
     vortex: String,
+    vortex_plain: String,
+    vortex_prices: String,
     schema: SchemaRef,
 }
 
@@ -108,6 +150,8 @@ impl Tables {
         let files = data::files(&setup, &new_session(&setup));
         let parquet = files.parquet.to_str().unwrap().to_string();
         let vortex = files.vortex.to_str().unwrap().to_string();
+        let vortex_plain = files.vortex_plain.to_str().unwrap().to_string();
+        let vortex_prices = files.vortex_prices.to_str().unwrap().to_string();
         let ctx = SessionContext::new();
         runtime
             .block_on(ctx.register_parquet(TABLE, &parquet, ParquetReadOptions::default()))
@@ -116,6 +160,8 @@ impl Tables {
         Self {
             parquet,
             vortex,
+            vortex_plain,
+            vortex_prices,
             schema,
         }
     }
@@ -134,7 +180,7 @@ impl Tables {
         if reader == Reader::ParquetPushdown {
             config.options_mut().execution.parquet.pushdown_filters = true;
         }
-        if matches!(reader, Reader::Vortex | Reader::VortexIdeal) {
+        if reader.vortex().is_some() {
             config.options_mut().optimizer.repartition_file_scans = false;
         }
         let mut ctx = SessionContext::new_with_config(config);
@@ -142,7 +188,13 @@ impl Tables {
             Reader::Parquet | Reader::ParquetPushdown => runtime
                 .block_on(ctx.register_parquet(TABLE, &self.parquet, ParquetReadOptions::default()))
                 .unwrap(),
-            Reader::Vortex | Reader::VortexIdeal => {
+            _ => {
+                let (file, pruned) = reader.vortex().unwrap();
+                let path = match file {
+                    VortexFile::Bars => &self.vortex,
+                    VortexFile::Plain => &self.vortex_plain,
+                    VortexFile::Prices => &self.vortex_prices,
+                };
                 // Vortex does its I/O on the runtime it finds when the session is made.
                 let _runtime = runtime.enter();
                 let session = VortexSession::default();
@@ -150,21 +202,25 @@ impl Tables {
                 if let Some(registry) = registry {
                     record_metrics(&session, registry);
                 }
-                let stores = Arc::clone(&ctx.runtime_env().object_store_registry);
-                let pruning = BarsPruning::new(session.clone(), stores);
+                let pruner = Arc::new(ZonePruner::new(session.clone()));
                 let options = ListingOptions::new(Arc::new(vortex_format(session)))
                     .with_file_extension(".vortex");
-                let config = ListingTableConfig::new(ListingTableUrl::parse(&self.vortex).unwrap())
+                let config = ListingTableConfig::new(ListingTableUrl::parse(path).unwrap())
                     .with_listing_options(options)
                     .with_schema(Arc::clone(&self.schema))
                     .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
-                let table = ListingTable::try_new(config).unwrap();
-                ctx.register_table(TABLE, Arc::new(table)).unwrap();
+                let mut table: Arc<dyn TableProvider> =
+                    Arc::new(ListingTable::try_new(config).unwrap());
+                // Pruned with zone maps read through the object store, as production reads S3.
+                if pruned {
+                    let url = ObjectStoreUrl::local_filesystem();
+                    let store = ctx.runtime_env().object_store(&url).unwrap();
+                    let readers = Arc::new(DefaultVortexReaderFactory::new(store));
+                    table = Arc::new(PrunedTable::new(table, pruner, readers));
+                }
+                ctx.register_table(TABLE, table).unwrap();
                 let mut state = SessionStateBuilder::new_from_existing(ctx.state())
                     .with_physical_optimizer_rule(Arc::new(LocalReaders));
-                if reader == Reader::Vortex {
-                    state = state.with_physical_optimizer_rule(Arc::new(pruning));
-                }
                 if let (Reader::VortexIdeal, Some(ideal)) = (reader, ideal) {
                     state =
                         state.with_physical_optimizer_rule(Arc::new(IdealSelection(ideal.clone())));
@@ -384,7 +440,7 @@ fn scan_metrics(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
                 }
             }
         }
-        // The rows of each Vortex file a selection keeps (see `BarsPruning`).
+        // The rows of each Vortex file a selection keeps (see `ZonePruner`).
         let files = plan
             .downcast_ref::<DataSourceExec>()
             .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
@@ -527,18 +583,27 @@ impl Setup {
                 .tables
                 .context(rt, reader, partitions, Some(as_registry), ideal);
             let name = format!("{}/{partitions}", reader.name());
-            // Three times, a moment apart, so that the last runs as the timed ones do, with
-            // whatever the first ones read in the background (see `BarsPruning`).
+            // Three times, a moment apart: the first reads the zone maps (see `ZonePruner`), and
+            // the last runs as the timed ones do, with them cached.
             let mut before = BTreeMap::new();
             let mut metrics = Vec::new();
-            for _ in 0..3 {
+            let mut first = Vec::new();
+            for run in 0..3 {
                 before = counters(&registry);
                 let (actual, last) = rt.block_on(check(&ctx, sql));
                 assert_eq!(actual, expected, "{label}: {name}");
+                if run == 0 {
+                    first = last
+                        .iter()
+                        .filter_map(|m| m.strip_prefix("selected_rows="))
+                        .map(|rows| format!("first_selected_rows={rows}"))
+                        .collect();
+                }
                 metrics = last;
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if matches!(reader, Reader::Vortex | Reader::VortexIdeal) {
+            metrics.extend(first);
+            if reader.vortex().is_some() {
                 let after = counters(&registry);
                 metrics.extend(
                     after

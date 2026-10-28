@@ -1,5 +1,5 @@
-//! Pruning a Vortex scan's zones while the query is planned, as DataFusion does a Parquet file's
-//! row groups from its footer.
+//! Pruning a Vortex scan's zones before it starts, as DataFusion does a Parquet file's row groups
+//! from its footer.
 //!
 //! Vortex prunes a scan split by split as the scan runs: every one of a file's zones becomes a
 //! task that asks the zone maps whether the filter can match there. Each task costs a few
@@ -7,20 +7,21 @@
 //! selective filter that walk is most of the query: about a millisecond for the 386 zones of a
 //! month of bars. A scan given a [`Selection`] doesn't start the splits it rules out at all.
 //!
-//! [`BarsPruning`] is a physical optimizer rule that gives each file of a Vortex scan the
-//! selection of the zones its filter can match. It keeps each file's zone maps, read once, as
-//! DataFusion [`PruningStatistics`] over the table's columns, and prunes them with DataFusion's
-//! own [`PruningPredicate`](datafusion::physical_optimizer::pruning::PruningPredicate), a zone
-//! to a container:
+//! [`ZonePruner`] gives each file of a plan's Vortex scans the selection of the zones a filter
+//! can match. It keeps each file's zone maps, read once, as DataFusion [`PruningStatistics`] over
+//! the table's columns, and prunes them with DataFusion's own
+//! [`PruningPredicate`](datafusion::physical_optimizer::pruning::PruningPredicate), a zone to a
+//! container:
 //!
 //! - a column the file stores as it is has its zone maps' min and max, in the table's type;
 //! - a rescaled decimal has them scaled back up to the table's scale;
 //! - a price has bounds from those of the [`OHLC`] parts it is rebuilt from (see
 //!   [`price_bounds`]).
 //!
-//! A file's zone maps are read in the background the first time a query sees it, through the
-//! object store the scan reads it from (S3, a cache in front of it, or the local filesystem),
-//! so that query, and any that plans before the reads are done, scans every zone as before.
+//! [`ZonePruner::prune`] reads the zone maps it doesn't have yet and waits for them, so every
+//! query is pruned. It reads them through a [`VortexReaderFactory`], the one the scans read their
+//! data with, so the reads go wherever the data's do (S3, a disk cache in front of it, or a local
+//! file). [`PrunedTable`](super::PrunedTable) calls it when it's scanned.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -31,41 +32,40 @@ use arrow::array::types::Decimal128Type;
 use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array};
 use arrow::compute::{cast, nullif};
 use arrow::datatypes::{DataType, Schema};
-use datafusion::common::config::ConfigOptions;
 use datafusion::common::pruning::PruningStatistics;
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfig, FileScanConfigBuilder, FileSource,
 };
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::execution::object_store::{ObjectStoreRegistry, ObjectStoreUrl};
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::object_store::ObjectMeta;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
+use futures::future::{BoxFuture, Shared};
+use futures::{FutureExt, StreamExt};
 use moka::sync::Cache;
 use roaring::RoaringTreemap;
-use vortex::array::memory::MemorySessionExt;
 use vortex::array::{MaskFuture, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::error::{vortex_err, VortexResult};
 use vortex::expr::root;
 use vortex::file::{OpenOptionsSessionExt, VortexFile};
-use vortex::io::object_store::ObjectStoreReadAt;
-use vortex::io::session::RuntimeSessionExt;
+use vortex::io::VortexReadAt;
 use vortex::layout::layouts::zoned::Zoned;
 use vortex::layout::{LayoutReaderContext, LayoutRef};
 use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
+use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
 
 use crate::layout::{find_child, find_zoned};
 use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
-/// How many bytes of zone maps [`BarsPruning`] keeps by default: tens of KB a file, so some
+/// How many bytes of zone maps a [`ZonePruner`] keeps by default: tens of KB a file, so some
 /// thousands of files.
 pub const DEFAULT_CACHE_BYTES: u64 = 256 << 20;
 
@@ -73,148 +73,78 @@ pub const DEFAULT_CACHE_BYTES: u64 = 256 << 20;
 /// too few splits to make up for checking its selection on the rest.
 const MAX_KEPT: f64 = 0.5;
 
-/// Gives each file of a Vortex scan the zones its filter can match: see the module docs.
+/// How many files' zone maps [`ZonePruner::prune`] reads at once.
+const CONCURRENT_READS: usize = 16;
+
+/// A read of a file's zone maps, which every query that wants them joins; `None` if it failed.
+type ZonesRead = Shared<BoxFuture<'static, Option<Arc<FileZones>>>>;
+
+/// Gives each file of a plan's Vortex scans the zones a filter can match: see the module docs.
 ///
 /// The session needs the crate registered (see [`crate::register`]).
-pub struct BarsPruning {
+pub struct ZonePruner {
     session: VortexSession,
-    /// The object stores the scans read their files from, as DataFusion's runtime has them.
-    stores: Arc<dyn ObjectStoreRegistry>,
     /// Zone maps by object store and path, up to a number of bytes, the least recently used
     /// evicted first.
     files: Cache<String, Arc<FileZones>>,
-    /// The files whose zone maps are being read; shared with the tasks that read them.
-    reading: Arc<Mutex<HashSet<String>>>,
+    /// The reads under way, by object store and path; shared with the reads, which remove
+    /// themselves once done.
+    reading: Arc<Mutex<HashMap<String, ZonesRead>>>,
 }
 
-impl BarsPruning {
+impl ZonePruner {
     /// Keeping up to [`DEFAULT_CACHE_BYTES`] of zone maps.
-    pub fn new(session: VortexSession, stores: Arc<dyn ObjectStoreRegistry>) -> Self {
-        Self::with_cache_bytes(session, stores, DEFAULT_CACHE_BYTES)
+    pub fn new(session: VortexSession) -> Self {
+        Self::with_cache_bytes(session, DEFAULT_CACHE_BYTES)
     }
 
     /// Keeping up to `cache_bytes` of zone maps.
-    pub fn with_cache_bytes(
-        session: VortexSession,
-        stores: Arc<dyn ObjectStoreRegistry>,
-        cache_bytes: u64,
-    ) -> Self {
+    pub fn with_cache_bytes(session: VortexSession, cache_bytes: u64) -> Self {
         let files = Cache::builder()
             .weigher(|_, zones: &Arc<FileZones>| zones.bytes)
             .max_capacity(cache_bytes)
             .build();
         Self {
             session,
-            stores,
             files,
             reading: Arc::default(),
         }
     }
 
-    /// The zone maps of `file` in the object store at `url`, or `None` if they aren't read yet,
-    /// in which case it starts reading them in the background (on the Tokio runtime the query
-    /// is planned on, if there is one).
-    fn zones(&self, url: &ObjectStoreUrl, file: &PartitionedFile) -> Option<Arc<FileZones>> {
-        let key = format!("{}{}", url.as_str(), file.path());
-        let meta = &file.object_meta;
-        if let Some(zones) = self.files.get(&key) {
-            if zones.meta.size == meta.size && zones.meta.last_modified == meta.last_modified {
-                return Some(zones);
-            }
-        }
-        let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
-        if reading.contains(&key) {
-            return None;
-        }
-        let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let store = self.stores.get_store(url.as_ref()).ok()?;
-        reading.insert(key.clone());
-        let (session, path, meta) = (self.session.clone(), file.path().clone(), meta.clone());
-        let (files, reading) = (self.files.clone(), Arc::clone(&self.reading));
-        runtime.spawn(async move {
-            let read = async {
-                let read = ObjectStoreReadAt::new_with_allocator(
-                    store,
-                    path,
-                    session.handle(),
-                    session.allocator(),
-                );
-                let file = session
-                    .open_options()
-                    .with_file_size(meta.size)
-                    .open_read(Arc::new(read))
-                    .await?;
-                FileZones::read(&session, &file, meta).await
-            };
-            // On an error, left unpruned until the next query tries again.
-            if let Ok(zones) = read.await {
-                files.insert(key.clone(), Arc::new(zones));
-            }
-            reading
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-        });
-        None
-    }
-
-    /// The rows of `file` in the zones that `predicate` (over `table`, the table's schema) can
-    /// match; `None` to scan it whole.
-    fn selection(
-        &self,
-        url: &ObjectStoreUrl,
-        file: &PartitionedFile,
-        predicate: &Arc<dyn PhysicalExpr>,
-        table: &Arc<Schema>,
-    ) -> Option<Selection> {
-        let zones = self.zones(url, file)?;
-        let pruning = PruningPredicateBuilder::new()
-            .with_file_schema(Arc::clone(table))
-            .build(Arc::clone(predicate))?;
-        let stats = ZoneStatistics {
-            zones: &zones,
-            table,
-        };
-        let keep = pruning.prune(&stats).ok()?;
-        let kept = keep.iter().filter(|&&keep| keep).count();
-        if kept as f64 > keep.len() as f64 * MAX_KEPT {
-            return None;
-        }
-        let mut selected = RoaringTreemap::new();
-        for (zone, _) in keep.iter().enumerate().filter(|(_, &keep)| keep) {
-            let start = zone as u64 * zones.zone_len;
-            selected.insert_range(start..(start + zones.zone_len).min(zones.row_count));
-        }
-        Some(Selection::IncludeRoaring(selected))
-    }
-}
-
-impl fmt::Debug for BarsPruning {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BarsPruning").finish_non_exhaustive()
-    }
-}
-
-impl PhysicalOptimizerRule for BarsPruning {
-    fn optimize(
+    /// Give the Vortex scans in `plan` the zones `predicate` can match, or, without one, those
+    /// each scan's own pushed-down predicate can. The zone maps of every file it doesn't have
+    /// are read first, through `readers`.
+    pub async fn prune(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+        readers: &dyn VortexReaderFactory,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut reads = Vec::new();
+        plan.apply(|node| {
+            if let Some((conf, _)) = vortex_scan(node) {
+                for file in conf.file_groups.iter().flat_map(|group| group.iter()) {
+                    let url = &conf.object_store_url;
+                    if self.cached(url, file).is_none() {
+                        let reader = readers.create_reader(file, &self.session)?;
+                        reads.push(self.read(url, file, reader));
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        futures::stream::iter(reads)
+            .buffer_unordered(CONCURRENT_READS)
+            .collect::<Vec<_>>()
+            .await;
         plan.transform_up(|plan| {
-            let Some(conf) = plan
-                .downcast_ref::<DataSourceExec>()
-                .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
-            else {
+            let Some((conf, source)) = vortex_scan(&plan) else {
                 return Ok(Transformed::no(plan));
             };
-            let Some(source) = conf.file_source().downcast_ref::<VortexSource>() else {
+            let Some(predicate) = predicate.or(source.predicate()) else {
                 return Ok(Transformed::no(plan));
             };
-            let Some(predicate) = source.predicate() else {
-                return Ok(Transformed::no(plan));
-            };
-            let table = source.table_schema().table_schema();
+            let (url, table) = (&conf.object_store_url, source.table_schema().table_schema());
             let mut pruned = false;
             let groups = conf
                 .file_groups
@@ -222,9 +152,11 @@ impl PhysicalOptimizerRule for BarsPruning {
                 .map(|group| {
                     let files = group.iter().map(|file| {
                         let mut file = file.clone();
-                        if let Some(selection) =
-                            self.selection(&conf.object_store_url, &file, predicate, table)
-                        {
+                        // A file whose zone maps couldn't be read is scanned whole.
+                        let Some(zones) = self.cached(url, &file) else {
+                            return file;
+                        };
+                        if let Some(selection) = selection(&zones, predicate, table) {
                             file.extensions
                                 .insert(VortexAccessPlan::default().with_selection(selection));
                             pruned = true;
@@ -247,13 +179,100 @@ impl PhysicalOptimizerRule for BarsPruning {
         .data()
     }
 
-    fn name(&self) -> &str {
-        "vortex_ohlc_bars_pruning"
+    /// The zone maps of `file` in the object store at `url`, if they're kept and the file
+    /// hasn't changed since they were read.
+    fn cached(&self, url: &ObjectStoreUrl, file: &PartitionedFile) -> Option<Arc<FileZones>> {
+        let zones = self.files.get(&key(url, file))?;
+        let meta = &file.object_meta;
+        (zones.meta.size == meta.size && zones.meta.last_modified == meta.last_modified)
+            .then_some(zones)
     }
 
-    fn schema_check(&self) -> bool {
-        true
+    /// A read of the zone maps of `file` in the object store at `url` through `reader`, or the
+    /// one under way, which another query started. It keeps them once done.
+    fn read(
+        &self,
+        url: &ObjectStoreUrl,
+        file: &PartitionedFile,
+        reader: Arc<dyn VortexReadAt>,
+    ) -> ZonesRead {
+        let key = key(url, file);
+        let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(read) = reading.get(&key) {
+            return read.clone();
+        }
+        let (session, meta) = (self.session.clone(), file.object_meta.clone());
+        let (files, reads, done) = (self.files.clone(), Arc::clone(&self.reading), key.clone());
+        let read = async move {
+            let zones = async {
+                let file = session
+                    .open_options()
+                    .with_file_size(meta.size)
+                    .open_read(reader)
+                    .await?;
+                FileZones::read(&session, &file, meta).await
+            };
+            // On an error, left unpruned until a later query tries again.
+            let zones = zones.await.ok().map(Arc::new);
+            if let Some(zones) = &zones {
+                files.insert(done.clone(), Arc::clone(zones));
+            }
+            reads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&done);
+            zones
+        }
+        .boxed()
+        .shared();
+        reading.insert(key, read.clone());
+        read
     }
+}
+
+impl fmt::Debug for ZonePruner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZonePruner").finish_non_exhaustive()
+    }
+}
+
+/// The cache key of `file` in the object store at `url`.
+fn key(url: &ObjectStoreUrl, file: &PartitionedFile) -> String {
+    format!("{}{}", url.as_str(), file.path())
+}
+
+/// `plan`'s file scan config and source, if it is a Vortex scan.
+fn vortex_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<(&FileScanConfig, &VortexSource)> {
+    let conf = plan
+        .downcast_ref::<DataSourceExec>()?
+        .data_source()
+        .downcast_ref::<FileScanConfig>()?;
+    let source = conf.file_source().downcast_ref::<VortexSource>()?;
+    Some((conf, source))
+}
+
+/// The rows in the zones of a file with the zone maps `zones` that `predicate` (over `table`,
+/// the table's schema) can match; `None` to scan it whole.
+fn selection(
+    zones: &FileZones,
+    predicate: &Arc<dyn PhysicalExpr>,
+    table: &Arc<Schema>,
+) -> Option<Selection> {
+    let pruning = PruningPredicateBuilder::new()
+        .with_file_schema(Arc::clone(table))
+        .build(Arc::clone(predicate))?;
+    let stats = ZoneStatistics { zones, table };
+    let keep = pruning.prune(&stats).ok()?;
+    let kept = keep.iter().filter(|&&keep| keep).count();
+    if kept as f64 > keep.len() as f64 * MAX_KEPT {
+        return None;
+    }
+    let mut selected = RoaringTreemap::new();
+    for (zone, _) in keep.iter().enumerate().filter(|(_, &keep)| keep) {
+        let start = zone as u64 * zones.zone_len;
+        selected.insert_range(start..(start + zones.zone_len).min(zones.row_count));
+    }
+    Some(Selection::IncludeRoaring(selected))
 }
 
 /// A file's zone maps, as of its size and modification time (in `meta`): every zoned column's
