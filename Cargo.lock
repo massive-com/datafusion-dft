@@ -2601,6 +2601,7 @@ dependencies = [
  "datafusion-functions-parquet",
  "datafusion-functions-rocksdb",
  "datafusion-net",
+ "datafusion-session",
  "datafusion-udfs-wasm",
  "deltalake",
  "directories",
@@ -2616,6 +2617,7 @@ dependencies = [
  "parking_lot",
  "rustls",
  "serde",
+ "tempfile",
  "tokio",
  "tokio-metrics",
  "tokio-stream",
@@ -2624,6 +2626,7 @@ dependencies = [
  "url",
  "vortex",
  "vortex-datafusion",
+ "vortex-ohlc",
 ]
 
 [[package]]
