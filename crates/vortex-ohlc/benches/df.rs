@@ -22,7 +22,6 @@
 //! `target/vortex-ohlc-bench/parquet-results.txt`, to compare against without timing Parquet
 //! again.
 
-#[allow(dead_code)]
 mod common;
 
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -51,7 +50,6 @@ use futures::StreamExt;
 use roaring::RoaringTreemap;
 use tokio::runtime::Runtime;
 use vortex::array::memory::MemorySessionExt;
-use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::std_file::FileReadAt;
 use vortex::io::VortexReadAt;
@@ -65,8 +63,7 @@ use vortex_ohlc::datafusion::{
 };
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
-use common::needle::{needles, vortex_filter, Needle, Op, Value};
-use common::vortex_read::{matching_rows, new_session, open_vortex, read_plan};
+use common::needle::{matching_rows, needles, Needle, Op, Value};
 use common::{data, Selection};
 
 /// The table every query reads.
@@ -77,7 +74,7 @@ const TABLE: &str = "bars";
 enum Reader {
     Parquet,
     /// Parquet with `pushdown_filters`: the filter decodes its columns first, and the others
-    /// only for the rows that pass, as the needle bench's Parquet reader does.
+    /// only for the rows that pass.
     ParquetPushdown,
     /// The Vortex file, its scans pruned by a `ZonePruner` before they start.
     Vortex,
@@ -140,8 +137,7 @@ struct Tables {
 
 impl Tables {
     fn new(runtime: &Runtime) -> Self {
-        let setup = CurrentThreadRuntime::new();
-        let files = data::files(&setup, &new_session(&setup));
+        let files = data::files();
         let parquet = files.parquet.to_str().unwrap().to_string();
         let vortex = files.vortex.to_str().unwrap().to_string();
         let vortex_prices = files.vortex_prices.to_str().unwrap().to_string();
@@ -332,22 +328,9 @@ impl PhysicalOptimizerRule for IdealSelection {
 /// The rows of the zones of the Vortex file at `path` that hold a match for `needle`, found by
 /// a scan; `None` if the needle doesn't go into a Vortex filter whole.
 fn ideal_selection(path: &std::path::Path, needle: &Needle) -> Option<ScanSelection> {
-    let runtime = CurrentThreadRuntime::new();
-    let session = new_session(&runtime);
-    let file = open_vortex(&runtime, &session, path);
-    let plan = read_plan(&runtime, &session, path);
-    let (Some(filter), after) = vortex_filter(&file, needle, &plan) else {
-        return None;
-    };
-    if !after.is_empty() {
-        return None;
-    }
+    let (matches, rows) = matching_rows(path, needle)?;
     let zone = DEFAULT_ROW_BLOCK as u64;
-    let rows = file.row_count();
-    let mut zones: Vec<u64> = matching_rows(&runtime, &session, &file, &filter)
-        .into_iter()
-        .map(|row| row / zone)
-        .collect();
+    let mut zones: Vec<u64> = matches.into_iter().map(|row| row / zone).collect();
     zones.dedup();
     let mut selected = RoaringTreemap::new();
     for z in zones {
