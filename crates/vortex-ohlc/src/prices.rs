@@ -8,7 +8,7 @@
 
 use vortex::dtype::{DType, DecimalDType, Nullability};
 use vortex::expr::{
-    and, binary, cast, checked_add, fill_null, get_item, gt_eq, lit, lt, mask, or, root, Expression,
+    binary, cast, checked_add, fill_null, get_item, gt_eq, lit, lt, mask, root, Expression,
 };
 use vortex::scalar::{DecimalValue, Scalar};
 use vortex::scalar_fn::fns::operators::Operator;
@@ -50,12 +50,8 @@ pub fn price(table: &DType, price: &str) -> Option<Expression> {
 /// `price op literal`, where the literal is the decimal `unscaled / 10^scale`, as a filter over
 /// the [`OHLC`] struct's parts (in a table of `table`); `op` is a comparison. `None` for
 /// anything but the four prices, a table without the struct, or a literal the price's type can't
-/// hold exactly.
-///
-/// Open and close are compared as [`price`] rebuilds them. High and low are compared one branch
-/// of the body's sign at a time: `high op x` is `(body >= 0 AND close + upper op x) OR (body < 0
-/// AND open + upper op x)`, and low the same with open and close swapped. Each side is compared
-/// at its own type, as a sum of parts.
+/// hold exactly. The price is compared as [`price`] rebuilds it: one sum per row is quicker than
+/// comparing high and low one branch of the body's sign at a time, which takes a sum for each.
 pub fn compare_price(
     table: &DType,
     price: &str,
@@ -63,32 +59,14 @@ pub fn compare_price(
     unscaled: i128,
     scale: i8,
 ) -> Option<Expression> {
-    let compare = |value: Expression| -> Option<Expression> {
-        let DType::Decimal(decimal, _) = value.bind(table).ok()?.dtype().clone() else {
-            return None;
-        };
-        Some(binary(
-            op,
-            value,
-            decimal_literal(unscaled, scale, decimal)?,
-        ))
+    let value = self::price(table, price)?;
+    let DType::Decimal(decimal, _) = value.bind(table).ok()?.dtype().clone() else {
+        return None;
     };
-    let parts = OhlcParts::new(table)?;
-    let p = parts.precision;
-    let (when_up, when_down) = match price {
-        "high" => (
-            checked_add(parts.close(), parts.part("upper", p + 1)),
-            checked_add(parts.part("open", p), parts.part("upper", p)),
-        ),
-        "low" => (
-            binary(Operator::Sub, parts.part("open", p), parts.part("lower", p)),
-            binary(Operator::Sub, parts.close(), parts.part("lower", p + 1)),
-        ),
-        _ => return compare(self::price(table, price)?),
-    };
-    Some(or(
-        and(parts.up(), compare(when_up)?),
-        and(parts.down(), compare(when_down)?),
+    Some(binary(
+        op,
+        value,
+        decimal_literal(unscaled, scale, decimal)?,
     ))
 }
 
