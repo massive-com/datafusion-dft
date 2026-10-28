@@ -9843,12 +9843,14 @@ dependencies = [
  "arrow",
  "async-trait",
  "criterion",
+ "datafusion",
  "futures",
  "num-traits",
  "parquet",
  "regex",
  "serde_json",
  "vortex",
+ "vortex-datafusion",
 ]
 
 [[package]]
