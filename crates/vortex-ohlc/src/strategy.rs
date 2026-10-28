@@ -31,6 +31,12 @@ pub const DEFAULT_ROW_BLOCK: usize = 65_536;
 /// `row_block`-row chunks. The writing session must enable [`crate::edition`], and a reading one
 /// register [`crate::layout`].
 pub fn write_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn LayoutStrategy> {
+    Arc::new(BarsStrategy::new(table_strategy(source, plan, row_block)))
+}
+
+/// [`write_strategy`] without the [`BarsLayout`](crate::layout::BarsLayout) around the table:
+/// a file any Vortex reader opens, which a scan prunes on its own zone maps only.
+pub fn table_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn LayoutStrategy> {
     let mut builder = builder(row_block);
     for field in source.fields() {
         let name = field.name().as_str();
@@ -54,7 +60,7 @@ pub fn write_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn
             _ => {}
         }
     }
-    Arc::new(BarsStrategy::new(builder.build()))
+    builder.build()
 }
 
 /// A session with Vortex's defaults, for the compressors and write strategies Vortex builds from

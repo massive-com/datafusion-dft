@@ -24,7 +24,7 @@ use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::session::VortexSession;
 use vortex_ohlc::plan::{apply_plan, planned_schema, transforms_json, Transform, TRANSFORMS_KEY};
 use vortex_ohlc::profile::{plan, DecimalProfiler};
-use vortex_ohlc::strategy::{write_strategy, DEFAULT_ROW_BLOCK};
+use vortex_ohlc::strategy::{table_strategy, write_strategy, DEFAULT_ROW_BLOCK};
 
 use crate::common::parquet_read::open_parquet;
 
@@ -51,6 +51,11 @@ pub struct Files {
     pub source: PathBuf,
     pub parquet: PathBuf,
     pub vortex: PathBuf,
+    /// The same, without the bars layout (see [`vortex_ohlc::strategy::table_strategy`]).
+    pub vortex_plain: PathBuf,
+    /// The same, without the bars layout or the OHLC struct: the four prices rescaled like any
+    /// other decimal column.
+    pub vortex_prices: PathBuf,
 }
 
 /// The source, and the files written from it (see the module docs), writing those that are
@@ -64,6 +69,8 @@ pub fn files(runtime: &CurrentThreadRuntime, session: &VortexSession) -> Files {
     let files = Files {
         parquet: dir.join("v2.parquet"),
         vortex: dir.join(format!("upstream-{VORTEX_VERSION}.vortex")),
+        vortex_plain: dir.join(format!("upstream-plain-{VORTEX_VERSION}.vortex")),
+        vortex_prices: dir.join(format!("upstream-prices-{VORTEX_VERSION}.vortex")),
         source,
     };
     // Each file is written under a temporary name and renamed once complete, so an interrupted
@@ -74,10 +81,17 @@ pub fn files(runtime: &CurrentThreadRuntime, session: &VortexSession) -> Files {
         write_parquet_v2(&files.source, &tmp(&files.parquet));
         std::fs::rename(tmp(&files.parquet), &files.parquet).unwrap();
     }
-    if !files.vortex.exists() {
-        eprintln!("writing {}", files.vortex.display());
-        write_vortex(runtime, session, &files.source, &tmp(&files.vortex));
-        std::fs::rename(tmp(&files.vortex), &files.vortex).unwrap();
+    let vortex = [
+        (&files.vortex, true, true),
+        (&files.vortex_plain, false, true),
+        (&files.vortex_prices, false, false),
+    ];
+    for (path, bars, ohlc) in vortex {
+        if !path.exists() {
+            eprintln!("writing {}", path.display());
+            write_vortex(runtime, session, &files.source, &tmp(path), bars, ohlc);
+            std::fs::rename(tmp(path), path).unwrap();
+        }
     }
     files
 }
@@ -100,12 +114,16 @@ fn write_parquet_v2(source: &Path, dest: &Path) {
     writer.close().unwrap();
 }
 
-/// Profile the source, then write it with the plan that follows, recorded in the file.
+/// Profile the source, then write it with the plan that follows, recorded in the file, with the
+/// bars layout or without it (`bars`), and with the prices in the OHLC struct or each rescaled on
+/// its own (`ohlc`).
 fn write_vortex(
     runtime: &CurrentThreadRuntime,
     session: &VortexSession,
     source: &Path,
     dest: &Path,
+    bars: bool,
+    ohlc: bool,
 ) {
     let batches = || {
         open_parquet(source, false)
@@ -120,8 +138,16 @@ fn write_vortex(
     }
     let mut plan = plan(&profiler.finish());
     plan.insert(TRANSACTIONS.to_string(), Transform::Packed);
+    if !ohlc {
+        for transform in plan.values_mut() {
+            if let Transform::Ohlc(k) = *transform {
+                *transform = Transform::Rescale(k);
+            }
+        }
+    }
     eprintln!("  plan: {plan:?}");
 
+    let strategy = if bars { write_strategy } else { table_strategy };
     let transforms = serde_json::to_vec(&transforms_json(&plan, &schema)).unwrap();
     let planned = planned_schema(&plan, &schema);
     let dtype = session.arrow().from_arrow_schema(&planned).unwrap();
@@ -135,7 +161,7 @@ fn write_vortex(
     });
     session
         .write_options()
-        .with_strategy(write_strategy(&schema, &plan, DEFAULT_ROW_BLOCK))
+        .with_strategy(strategy(&schema, &plan, DEFAULT_ROW_BLOCK))
         .with_metadata_segment(TRANSFORMS_KEY, ByteBuffer::copy_from(transforms))
         .blocking(runtime)
         .write(
