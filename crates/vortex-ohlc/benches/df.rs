@@ -180,9 +180,6 @@ impl Tables {
         if reader == Reader::ParquetPushdown {
             config.options_mut().execution.parquet.pushdown_filters = true;
         }
-        if reader.vortex().is_some() {
-            config.options_mut().optimizer.repartition_file_scans = false;
-        }
         let mut ctx = SessionContext::new_with_config(config);
         match reader {
             Reader::Parquet | Reader::ParquetPushdown => runtime
