@@ -38,8 +38,9 @@ use vortex_ohlc::ohlc::ohlc_from_parts;
 use vortex_ohlc::plan::{
     plan_from_json, stored_name, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES, TRANSFORMS_KEY,
 };
+use vortex_ohlc::prices::price;
 
-use crate::common::needle::{filter_rows, ohlc_price, vortex_filter, Needle};
+use crate::common::needle::{filter_rows, vortex_filter, Needle};
 
 /// Values per FastLanes block: [`restore`] rebuilds the prices this many at a time.
 const BLOCK: usize = 1024;
@@ -468,7 +469,7 @@ where
 
 /// The `wanted` source columns, in order, each as an expression over the stored columns cast to
 /// its source type: a rescaled column cast back to its scale, a price rebuilt from the [`OHLC`]
-/// parts (see [`ohlc_price`]), and the rest as they are.
+/// parts (see [`price`]), and the rest as they are.
 fn expr_projection(
     file: &VortexFile,
     plan: &Plan,
@@ -485,10 +486,7 @@ fn expr_projection(
     let column = |name: &str| -> Expression {
         match plan.get(name) {
             Some(Transform::Rescale(_)) => cast(get_item(name, root()), source_type(name)),
-            Some(Transform::Ohlc(_)) => {
-                let price = ohlc_price(file.dtype(), name).unwrap();
-                cast(price, source_type(name))
-            }
+            Some(Transform::Ohlc(_)) => cast(price(file.dtype(), name).unwrap(), source_type(name)),
             None | Some(Transform::Packed) => get_item(name, root()),
         }
     };
