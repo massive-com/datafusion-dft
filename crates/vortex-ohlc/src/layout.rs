@@ -260,7 +260,7 @@ impl PartZones {
 
 /// The child named `name` of the first layout at or under `layout` that has one, depth first:
 /// a field of the table's struct layout, wherever that is.
-fn find_child(layout: &LayoutRef, name: &str) -> Option<LayoutRef> {
+pub(crate) fn find_child(layout: &LayoutRef, name: &str) -> Option<LayoutRef> {
     let children = layout.children().ok()?;
     if let Some(index) = layout.child_names().position(|n| n.as_ref() == name) {
         return children.get(index).map(Arc::clone);
@@ -269,7 +269,7 @@ fn find_child(layout: &LayoutRef, name: &str) -> Option<LayoutRef> {
 }
 
 /// The first zoned layout at or under `layout`, depth first.
-fn find_zoned(layout: &LayoutRef) -> Option<LayoutRef> {
+pub(crate) fn find_zoned(layout: &LayoutRef) -> Option<LayoutRef> {
     if layout.is::<Zoned>() {
         return Some(Arc::clone(layout));
     }

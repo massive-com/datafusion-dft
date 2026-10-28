@@ -9848,6 +9848,7 @@ dependencies = [
  "num-traits",
  "parquet",
  "regex",
+ "roaring",
  "serde_json",
  "tokio",
  "vortex",
