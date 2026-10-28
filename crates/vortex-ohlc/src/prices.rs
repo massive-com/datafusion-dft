@@ -55,8 +55,7 @@ pub fn price(table: &DType, price: &str) -> Option<Expression> {
 /// Open and close are compared as [`price`] rebuilds them. High and low are compared one branch
 /// of the body's sign at a time: `high op x` is `(body >= 0 AND close + upper op x) OR (body < 0
 /// AND open + upper op x)`, and low the same with open and close swapped. Each side is compared
-/// at its own type, and is a sum of parts the bars layout bounds from their zone maps (see
-/// [`crate::layout`]).
+/// at its own type, as a sum of parts.
 pub fn compare_price(
     table: &DType,
     price: &str,

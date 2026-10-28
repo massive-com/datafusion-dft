@@ -6,9 +6,8 @@
 //!   a price becomes an [`OhlcPrice`] over the [`OHLC`] struct, a rescaled decimal column a
 //!   [`Rescaled`], and everything else is left to DataFusion's default adapter.
 //! - [`BarsExpressionConverter`] decides what vortex-datafusion hands Vortex. A comparison of a
-//!   price with a literal goes in as [`compare_price`], so Vortex prunes it on the parts' zone
-//!   maps (see [`crate::layout`]) and filters on the parts, and one of a rescaled column with the
-//!   literal at the column's stored scale. Everything else goes through vortex-datafusion's
+//!   price with a literal goes in as [`compare_price`], so Vortex filters on the parts, and one
+//!   of a rescaled column with the literal at the column's stored scale. Everything else goes through vortex-datafusion's
 //!   default converter. Rebuilding the columns is left to DataFusion ([`OhlcPrice`],
 //!   [`Rescaled`]), which is quicker than Vortex's expressions for it.
 //!
@@ -52,7 +51,6 @@ pub use prune::{ZonePruner, DEFAULT_CACHE_BYTES};
 pub use table::PrunedTable;
 
 /// A [`VortexFormat`] on `session` that hands Vortex what [`BarsExpressionConverter`] converts.
-/// The session needs the crate registered (see [`crate::register`]).
 pub fn vortex_format(session: VortexSession) -> VortexFormat {
     let converter = BarsExpressionConverter::new(session.clone());
     VortexFormat::new(session).with_expression_converter(Arc::new(converter))

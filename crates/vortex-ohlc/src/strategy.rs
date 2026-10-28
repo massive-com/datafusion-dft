@@ -1,8 +1,7 @@
 //! The write strategy: Vortex's default, with every decimal column, the integer columns the plan
 //! packs ([`Transform::Packed`]) and each part of the [`OHLC`] struct compressed by
 //! [`compress_chunk`]. Each part of the OHLC struct is a column of its own with its own zone map,
-//! and the table is wrapped in a [`BarsLayout`](crate::layout::BarsLayout), so a scan can prune
-//! on the prices and skips the splits its filter rules out.
+//! so a scan can prune on the prices (see [`crate::datafusion::ZonePruner`]).
 
 use std::sync::{Arc, OnceLock};
 
@@ -20,7 +19,6 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 
 use crate::compress::compress_chunk;
-use crate::layout::BarsStrategy;
 use crate::plan::{Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES};
 
 /// Rows per chunk (row block) by default: 65,536, the row group size of the Parquet files the
@@ -28,15 +26,9 @@ use crate::plan::{Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES};
 pub const DEFAULT_ROW_BLOCK: usize = 65_536;
 
 /// The write strategy for `source` stored with `plan` (see [`crate::plan::apply_plan`]), in
-/// `row_block`-row chunks. The writing session must enable [`crate::edition`], and a reading one
-/// register [`crate::layout`].
+/// `row_block`-row chunks. The writing session must enable [`crate::edition`]; any Vortex session
+/// reads the file.
 pub fn write_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn LayoutStrategy> {
-    Arc::new(BarsStrategy::new(table_strategy(source, plan, row_block)))
-}
-
-/// [`write_strategy`] without the [`BarsLayout`](crate::layout::BarsLayout) around the table:
-/// a file any Vortex reader opens, which a scan prunes on its own zone maps only.
-pub fn table_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn LayoutStrategy> {
     let mut builder = builder(row_block);
     for field in source.fields() {
         let name = field.name().as_str();

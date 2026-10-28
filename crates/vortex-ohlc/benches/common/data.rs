@@ -24,7 +24,7 @@ use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::session::VortexSession;
 use vortex_ohlc::plan::{apply_plan, planned_schema, transforms_json, Transform, TRANSFORMS_KEY};
 use vortex_ohlc::profile::{plan, DecimalProfiler};
-use vortex_ohlc::strategy::{table_strategy, write_strategy, DEFAULT_ROW_BLOCK};
+use vortex_ohlc::strategy::{write_strategy, DEFAULT_ROW_BLOCK};
 
 use crate::common::parquet_read::open_parquet;
 
@@ -40,8 +40,8 @@ const DATA_DIR: &str = concat!(
 );
 
 /// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout, 3
-/// since the bars layout at the root.
-const VORTEX_VERSION: u32 = 3;
+/// since the bars layout at the root, 4 since it's gone.
+const VORTEX_VERSION: u32 = 4;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;
@@ -53,10 +53,8 @@ pub struct Files {
     pub source: PathBuf,
     pub parquet: PathBuf,
     pub vortex: PathBuf,
-    /// The same, without the bars layout (see [`vortex_ohlc::strategy::table_strategy`]).
-    pub vortex_plain: PathBuf,
-    /// The same, without the bars layout or the OHLC struct: the four prices rescaled like any
-    /// other decimal column.
+    /// The same, without the OHLC struct: the four prices rescaled like any other decimal
+    /// column.
     pub vortex_prices: PathBuf,
 }
 
@@ -70,7 +68,6 @@ pub fn files(runtime: &CurrentThreadRuntime, session: &VortexSession) -> Files {
     let files = Files {
         parquet: dir.join("v2.parquet"),
         vortex: dir.join(format!("upstream-{VORTEX_VERSION}.vortex")),
-        vortex_plain: dir.join(format!("upstream-plain-{VORTEX_VERSION}.vortex")),
         vortex_prices: dir.join(format!("upstream-prices-{VORTEX_VERSION}.vortex")),
         source,
     };
@@ -82,15 +79,10 @@ pub fn files(runtime: &CurrentThreadRuntime, session: &VortexSession) -> Files {
         write_parquet_v2(&files.source, &tmp(&files.parquet));
         std::fs::rename(tmp(&files.parquet), &files.parquet).unwrap();
     }
-    let vortex = [
-        (&files.vortex, true, true),
-        (&files.vortex_plain, false, true),
-        (&files.vortex_prices, false, false),
-    ];
-    for (path, bars, ohlc) in vortex {
+    for (path, ohlc) in [(&files.vortex, true), (&files.vortex_prices, false)] {
         if !path.exists() {
             eprintln!("writing {}", path.display());
-            write_vortex(runtime, session, &files.source, &tmp(path), bars, ohlc);
+            write_vortex(runtime, session, &files.source, &tmp(path), ohlc);
             std::fs::rename(tmp(path), path).unwrap();
         }
     }
@@ -116,14 +108,12 @@ fn write_parquet_v2(source: &Path, dest: &Path) {
 }
 
 /// Profile the source, then write it with the plan that follows, recorded in the file, with the
-/// bars layout or without it (`bars`), and with the prices in the OHLC struct or each rescaled on
-/// its own (`ohlc`).
+/// prices in the OHLC struct or each rescaled on its own (`ohlc`).
 fn write_vortex(
     runtime: &CurrentThreadRuntime,
     session: &VortexSession,
     source: &Path,
     dest: &Path,
-    bars: bool,
     ohlc: bool,
 ) {
     let batches = || {
@@ -148,7 +138,6 @@ fn write_vortex(
     }
     eprintln!("  plan: {plan:?}");
 
-    let strategy = if bars { write_strategy } else { table_strategy };
     let transforms = serde_json::to_vec(&transforms_json(&plan, &schema)).unwrap();
     let planned = planned_schema(&plan, &schema);
     let dtype = session.arrow().from_arrow_schema(&planned).unwrap();
@@ -162,7 +151,7 @@ fn write_vortex(
     });
     session
         .write_options()
-        .with_strategy(strategy(&schema, &plan, DEFAULT_ROW_BLOCK))
+        .with_strategy(write_strategy(&schema, &plan, DEFAULT_ROW_BLOCK))
         .with_metadata_segment(TRANSFORMS_KEY, ByteBuffer::copy_from(transforms))
         .blocking(runtime)
         .write(
