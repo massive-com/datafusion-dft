@@ -95,7 +95,11 @@ pub fn compare_price(
 
 /// The decimal `unscaled / 10^scale` as a literal of type `decimal`, or `None` if that type
 /// can't hold it exactly.
-fn decimal_literal(unscaled: i128, scale: i8, decimal: DecimalDType) -> Option<Expression> {
+pub(crate) fn decimal_literal(
+    unscaled: i128,
+    scale: i8,
+    decimal: DecimalDType,
+) -> Option<Expression> {
     let shift = decimal.scale() as i32 - scale as i32;
     let factor = 10i128.checked_pow(shift.unsigned_abs())?;
     let value = if shift >= 0 {
