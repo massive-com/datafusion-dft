@@ -10,21 +10,17 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use arrow::array::RecordBatchReader;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
-use vortex::array::iter::ArrayIteratorAdapter;
-use vortex::arrow::ArrowSessionExt;
-use vortex::buffer::ByteBuffer;
-use vortex::file::WriteOptionsSessionExt;
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::session::VortexSession;
-use vortex_ohlc::plan::{apply_plan, planned_schema, transforms_json, Transform, TRANSFORMS_KEY};
+use vortex_ohlc::plan::Transform;
 use vortex_ohlc::profile::{plan, DecimalProfiler};
-use vortex_ohlc::strategy::{write_strategy, DEFAULT_ROW_BLOCK};
+use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
+use vortex_ohlc::write::{stored_arrays, write_options};
 
 use crate::common::parquet_read::open_parquet;
 
@@ -138,25 +134,9 @@ fn write_vortex(
     }
     eprintln!("  plan: {plan:?}");
 
-    let transforms = serde_json::to_vec(&transforms_json(&plan, &schema)).unwrap();
-    let planned = planned_schema(&plan, &schema);
-    let dtype = session.arrow().from_arrow_schema(&planned).unwrap();
-    let chunks = batches().map({
-        let session = session.clone();
-        let (plan, planned) = (plan.clone(), Arc::clone(&planned));
-        move |batch| {
-            let batch = apply_plan(&plan, &planned, batch.unwrap());
-            session.arrow().from_arrow_record_batch(batch, &planned)
-        }
-    });
-    session
-        .write_options()
-        .with_strategy(write_strategy(&schema, &plan, DEFAULT_ROW_BLOCK))
-        .with_metadata_segment(TRANSFORMS_KEY, ByteBuffer::copy_from(transforms))
+    let arrays = stored_arrays(session, &plan, &schema, batches().map(|b| b.unwrap())).unwrap();
+    write_options(session, &schema, &plan, DEFAULT_ROW_BLOCK)
         .blocking(runtime)
-        .write(
-            BufWriter::new(File::create(dest).unwrap()),
-            ArrayIteratorAdapter::new(dtype, chunks),
-        )
+        .write(BufWriter::new(File::create(dest).unwrap()), arrays)
         .unwrap();
 }

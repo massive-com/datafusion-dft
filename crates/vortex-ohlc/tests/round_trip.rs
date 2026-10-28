@@ -11,23 +11,18 @@ use arrow::array::{
 };
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
-use vortex::array::iter::ArrayIteratorAdapter;
 use vortex::array::{ArrayRef, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
-use vortex::buffer::ByteBuffer;
-use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+use vortex::file::OpenOptionsSessionExt;
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_ohlc::ohlc::ohlc_from_parts;
-use vortex_ohlc::plan::{
-    apply_plan, plan_from_json, planned_schema, transforms_json, Plan, Transform, OHLC,
-    OHLC_PRICES, TRANSFORMS_KEY,
-};
+use vortex_ohlc::plan::{apply_plan, planned_schema, Plan, Transform, OHLC, OHLC_PRICES};
 use vortex_ohlc::profile::{plan, DecimalProfiler};
-use vortex_ohlc::strategy::write_strategy;
+use vortex_ohlc::write::{file_plan, stored_arrays, write_options};
 
 const ROWS: usize = 5_000;
 const ROW_BLOCK: usize = 2_048;
@@ -121,27 +116,15 @@ fn write_and_read(source: &RecordBatch, plan: &Plan) -> (Vec<ArrayRef>, RecordBa
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
 
-    let schema = planned_schema(plan, &source.schema());
-    let dtype = session.arrow().from_arrow_schema(&schema).unwrap();
-    let transforms = serde_json::to_vec(&transforms_json(plan, &source.schema())).unwrap();
-    let chunks: Vec<_> = (0..ROWS)
+    let batches: Vec<RecordBatch> = (0..ROWS)
         .step_by(1_000)
-        .map(|start| {
-            let batch = source.slice(start, 1_000.min(ROWS - start));
-            let batch = apply_plan(plan, &schema, batch);
-            session.arrow().from_arrow_record_batch(batch, &schema)
-        })
+        .map(|start| source.slice(start, 1_000.min(ROWS - start)))
         .collect();
+    let arrays = stored_arrays(&session, plan, &source.schema(), batches).unwrap();
     let mut bytes = Vec::new();
-    session
-        .write_options()
-        .with_strategy(write_strategy(&source.schema(), plan, ROW_BLOCK))
-        .with_metadata_segment(TRANSFORMS_KEY, ByteBuffer::copy_from(transforms))
+    write_options(&session, &source.schema(), plan, ROW_BLOCK)
         .blocking(&runtime)
-        .write(
-            &mut bytes,
-            ArrayIteratorAdapter::new(dtype, chunks.into_iter()),
-        )
+        .write(&mut bytes, arrays)
         .unwrap();
 
     // Metadata segments are only loaded when asked for.
@@ -150,9 +133,8 @@ fn write_and_read(source: &RecordBatch, plan: &Plan) -> (Vec<ArrayRef>, RecordBa
         .include_metadata()
         .open_buffer(bytes)
         .unwrap();
-    let recorded = file.metadata_segment(TRANSFORMS_KEY).unwrap();
-    let recorded = serde_json::from_slice(recorded.as_ref()).unwrap();
-    assert_eq!(plan_from_json(&recorded).as_ref(), Some(plan));
+    assert_eq!(file_plan(&file).as_ref(), Some(plan));
+    let schema = planned_schema(plan, &source.schema());
     let chunks: Vec<ArrayRef> = file
         .scan()
         .unwrap()

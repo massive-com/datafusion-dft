@@ -11,6 +11,7 @@
 //!   within a scan.
 //! - [`compress`]: FoR + FastLanes for decimal and integer chunks, under DecimalByteParts.
 //! - [`strategy`]: the write strategy that sends each column through it.
+//! - [`write`]: writing a table with a plan, recorded in the file, and reading the plan back.
 //! - [`datafusion`]: reading the files from DataFusion with the source's schema: the planned
 //!   columns rebuilt, filters on them pushed down into Vortex, and scans pruned on the zone maps,
 //!   the prices on their parts'.
@@ -24,3 +25,4 @@ pub mod plan;
 pub mod prices;
 pub mod profile;
 pub mod strategy;
+pub mod write;
