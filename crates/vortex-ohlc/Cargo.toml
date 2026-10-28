@@ -10,7 +10,9 @@ async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 num-traits.workspace = true
+roaring = "0.11"
 serde_json.workspace = true
+tokio = { features = ["rt"], workspace = true }
 vortex.workspace = true
 vortex-datafusion.workspace = true
 
