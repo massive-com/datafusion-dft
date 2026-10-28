@@ -1,31 +1,23 @@
-//! Needle-in-a-haystack lookups: a handful of selective filters, run against Parquet (row group
-//! statistics + a row filter) and against the Vortex file (a scan filter, pruned on zone maps).
-//! Every needle returns all columns, so the results can be compared value for value across
-//! formats.
+//! Needle-in-a-haystack lookups: a handful of selective filters, each returning every column of
+//! the rows it matches, and the rows of the Vortex file that match one (see [`matching_rows`]).
 
-use std::fs::File;
-use std::sync::Arc;
+use std::path::Path;
 
-use arrow::array::{
-    Array, ArrayRef as ArrowArrayRef, BooleanArray, Datum, Decimal128Array, Int64Array,
-    RecordBatch, Scalar, StringArray,
-};
-use arrow::compute::kernels::cmp;
-use arrow::compute::{cast, filter_record_batch};
-use arrow::datatypes::DataType;
-use arrow::error::ArrowError;
-use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter,
-};
-use parquet::arrow::ProjectionMask;
-use parquet::file::statistics::{Statistics, ValueStatistics};
+use vortex::array::arrays::PrimitiveArray;
+use vortex::array::VortexSessionExecute;
 use vortex::dtype::DType;
 use vortex::expr::{and_collect, binary, get_item, lit, root, BoundExpression, Expression};
-use vortex::file::VortexFile;
+use vortex::file::{OpenOptionsSessionExt, VortexFile};
+use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex::io::runtime::BlockingRuntime;
+use vortex::layout::layouts::row_idx::row_idx;
 use vortex::scalar::{DecimalValue, Scalar as VortexScalar};
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex_ohlc::plan::{Plan, Transform};
 use vortex_ohlc::prices::compare_price;
+use vortex_ohlc::write::file_plan;
+
+use crate::common::data::new_session;
 
 /// How a term compares its column with its value.
 #[derive(Clone, Copy, Debug)]
@@ -38,16 +30,6 @@ pub enum Op {
 }
 
 impl Op {
-    /// `column op literal`, row by row, in Arrow.
-    fn arrow(self, column: &dyn Array, literal: &dyn Datum) -> Result<BooleanArray, ArrowError> {
-        match self {
-            Op::Eq => cmp::eq(&column, literal),
-            Op::Gt => cmp::gt(&column, literal),
-            Op::Ge => cmp::gt_eq(&column, literal),
-            Op::Lt => cmp::lt(&column, literal),
-        }
-    }
-
     fn operator(self) -> Operator {
         match self {
             Op::Eq => Operator::Eq,
@@ -282,191 +264,45 @@ pub fn needles() -> Vec<Needle> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Parquet
-// ---------------------------------------------------------------------------------------------
-
-/// Restrict a reader to `needle`: drop the row groups whose statistics rule it out, and filter
-/// the rest row by row. Each term's column is decoded first and the other columns only for the
-/// rows that pass.
-pub fn parquet_needle(
-    builder: ParquetRecordBatchReaderBuilder<File>,
-    needle: &Needle,
-) -> ParquetRecordBatchReaderBuilder<File> {
-    let row_groups = candidate_row_groups(&builder, &needle.terms);
-    let filter = row_filter(&builder, &needle.terms);
-    builder.with_row_groups(row_groups).with_row_filter(filter)
-}
-
-fn leaf(builder: &ParquetRecordBatchReaderBuilder<File>, column: &str) -> usize {
-    builder
-        .parquet_schema()
-        .columns()
-        .iter()
-        .position(|c| c.path().parts() == [column])
-        .unwrap_or_else(|| panic!("no {column} column"))
-}
-
-/// The decimal scale of `data_type`.
-fn decimal_scale(data_type: &DataType) -> i8 {
-    match data_type {
-        DataType::Decimal32(_, s)
-        | DataType::Decimal64(_, s)
-        | DataType::Decimal128(_, s)
-        | DataType::Decimal256(_, s) => *s,
-        other => panic!("{other} is not a decimal"),
-    }
-}
-
-/// Could a row group whose column has these statistics hold a row matching `term`? Anything the
-/// statistics can't answer counts as a yes.
-fn may_hold(stats: Option<&Statistics>, term: &Term, scale: Option<i8>) -> bool {
-    let Some(stats) = stats else {
-        return true;
-    };
-    match (stats, term.value) {
-        (_, Value::Str(s)) => {
-            let s = s.as_bytes();
-            let above_min = stats.min_bytes_opt().is_none_or(|min| s >= min);
-            let below_max = stats.max_bytes_opt().is_none_or(|max| s <= max);
-            match term.op {
-                Op::Eq => above_min && below_max,
-                Op::Gt => stats.max_bytes_opt().is_none_or(|max| max > s),
-                Op::Ge => stats.max_bytes_opt().is_none_or(|max| max >= s),
-                Op::Lt => stats.min_bytes_opt().is_none_or(|min| min < s),
-            }
-        }
-        (Statistics::Int64(stats), Value::TimestampNs(v)) => in_range(stats, v, term.op),
-        // INT64-backed decimals: the statistics are unscaled, at the column's scale.
-        (Statistics::Int64(stats), value @ Value::Decimal { .. }) => {
-            let v = value.unscaled_at(scale.expect("decimal column has a scale"));
-            v.and_then(|v| i64::try_from(v).ok())
-                .is_none_or(|v| in_range(stats, v, term.op))
-        }
-        _ => true,
-    }
-}
-
-fn in_range(stats: &ValueStatistics<i64>, v: i64, op: Op) -> bool {
-    match op {
-        Op::Eq => {
-            stats.min_opt().is_none_or(|min| v >= *min)
-                && stats.max_opt().is_none_or(|max| v <= *max)
-        }
-        Op::Gt => stats.max_opt().is_none_or(|max| *max > v),
-        Op::Ge => stats.max_opt().is_none_or(|max| *max >= v),
-        Op::Lt => stats.min_opt().is_none_or(|min| *min < v),
-    }
-}
-
-pub fn candidate_row_groups(
-    builder: &ParquetRecordBatchReaderBuilder<File>,
-    terms: &[Term],
-) -> Vec<usize> {
-    let leaves: Vec<(usize, &Term, Option<i8>)> = terms
-        .iter()
-        .map(|term| {
-            let scale = matches!(term.value, Value::Decimal { .. }).then(|| {
-                let field = builder.schema().field_with_name(term.column).unwrap();
-                decimal_scale(field.data_type())
-            });
-            (leaf(builder, term.column), term, scale)
-        })
-        .collect();
-    builder
-        .metadata()
-        .row_groups()
-        .iter()
-        .enumerate()
-        .filter(|(_, rg)| {
-            leaves
-                .iter()
-                .all(|(leaf, term, scale)| may_hold(rg.column(*leaf).statistics(), term, *scale))
-        })
-        .map(|(idx, _)| idx)
-        .collect()
-}
-
-fn row_filter(builder: &ParquetRecordBatchReaderBuilder<File>, terms: &[Term]) -> RowFilter {
-    let predicates = terms
-        .iter()
-        .map(|term| {
-            // Compare in whatever type the reader decodes the column to (Utf8View, a timestamp
-            // with its time zone, or a decimal).
-            let data_type = builder
-                .schema()
-                .field_with_name(term.column)
-                .unwrap()
-                .data_type()
-                .clone();
-            let literal = arrow_literal(term.value, &data_type);
-            let op = term.op;
-            let predicate = ArrowPredicateFn::new(
-                ProjectionMask::leaves(builder.parquet_schema(), [leaf(builder, term.column)]),
-                move |batch: RecordBatch| -> Result<BooleanArray, _> {
-                    op.arrow(batch.column(0), &literal)
-                },
-            );
-            Box::new(predicate) as Box<dyn ArrowPredicate>
-        })
-        .collect();
-    RowFilter::new(predicates)
-}
-
-/// `value` as a one-element Arrow scalar of `data_type` (Utf8View, a timestamp with its time
-/// zone, or a decimal at that type's scale), for comparing against arrays of that type.
-fn arrow_literal(value: Value, data_type: &DataType) -> Scalar<ArrowArrayRef> {
-    let literal: ArrowArrayRef = match value {
-        Value::Str(s) => Arc::new(StringArray::from(vec![s])),
-        Value::TimestampNs(ns) => Arc::new(Int64Array::from(vec![ns])),
-        value @ Value::Decimal { .. } => {
-            let scale = decimal_scale(data_type);
-            let unscaled = value
-                .unscaled_at(scale)
-                .unwrap_or_else(|| panic!("{value:?} doesn't fit a scale of {scale}"));
-            Arc::new(
-                Decimal128Array::from(vec![unscaled])
-                    .with_precision_and_scale(38, scale)
-                    .unwrap(),
-            )
-        }
-    };
-    Scalar::new(cast(&literal, data_type).unwrap())
-}
-
-/// The rows of a decoded batch that match every one of `terms`, compared in Arrow in each
-/// column's own type.
-pub fn filter_rows(mut batch: RecordBatch, terms: &[Term]) -> RecordBatch {
-    for term in terms {
-        let column: &dyn Array = batch
-            .column_by_name(term.column)
-            .unwrap_or_else(|| panic!("no {} column to filter on", term.column))
-            .as_ref();
-        let literal = arrow_literal(term.value, column.data_type());
-        let mask = term.op.arrow(column, &literal).unwrap();
-        batch = filter_record_batch(&batch, &mask).unwrap();
-    }
-    batch
-}
-
-// ---------------------------------------------------------------------------------------------
 // Vortex
 // ---------------------------------------------------------------------------------------------
 
-/// `needle` as one Vortex filter expression over `file`, and the terms it leaves out, to check
-/// with [`filter_rows`] after decoding: those whose literal its column's stored type can't hold
-/// exactly. `None` when no term can go into the filter. Literals are built in each column's own
-/// stored type, so a rescaled decimal column gets a literal at its rescaled scale, and a price
-/// stored in the [`OHLC`](vortex_ohlc::plan::OHLC) struct is compared over its parts (see [`ohlc_term`]).
-pub fn vortex_filter(
-    file: &VortexFile,
-    needle: &Needle,
-    plan: &Plan,
-) -> (Option<BoundExpression>, Vec<Term>) {
+/// The rows of the Vortex file at `path` that match `needle`, ascending, and the file's row
+/// count: a filtered scan with only the row index projected. `None` if a term doesn't go into a
+/// Vortex filter (see [`vortex_filter`]).
+pub fn matching_rows(path: &Path, needle: &Needle) -> Option<(Vec<u64>, u64)> {
+    let runtime = CurrentThreadRuntime::new();
+    let session = new_session(&runtime);
+    let open = session.open_options().include_metadata().open_path(path);
+    let file = runtime.block_on(open).unwrap();
+    let plan = file_plan(&file).expect("the file records a plan of this version");
+    let filter = vortex_filter(&file, needle, &plan)?;
+    let mut ctx = session.create_execution_ctx();
+    let hits = file
+        .scan()
+        .unwrap()
+        .with_filter(filter)
+        .with_projection(row_idx().bind(file.dtype()).unwrap())
+        .into_array_iter(&runtime)
+        .unwrap();
+    let mut rows: Vec<u64> = Vec::new();
+    for chunk in hits {
+        let chunk = chunk.unwrap().execute::<PrimitiveArray>(&mut ctx).unwrap();
+        rows.extend_from_slice(chunk.as_slice::<u64>());
+    }
+    Some((rows, file.row_count()))
+}
+
+/// `needle` as one Vortex filter expression over `file`, its literals in each column's stored
+/// type: a rescaled decimal column gets a literal at its rescaled scale, and a price stored in
+/// the [`OHLC`](vortex_ohlc::plan::OHLC) struct is compared over its parts (see [`ohlc_term`]).
+/// `None` if a term's literal doesn't fit its column's stored type exactly.
+fn vortex_filter(file: &VortexFile, needle: &Needle, plan: &Plan) -> Option<BoundExpression> {
     let fields = file.dtype().as_struct_fields();
-    let mut after = Vec::new();
-    let mut conjuncts = Vec::new();
-    for term in &needle.terms {
-        let pushed = match plan.get(term.column) {
+    let conjuncts = needle
+        .terms
+        .iter()
+        .map(|term| match plan.get(term.column) {
             Some(Transform::Ohlc(_)) => ohlc_term(file.dtype(), term),
             _ => {
                 let dtype = fields.field(term.column).unwrap();
@@ -474,20 +310,10 @@ pub fn vortex_filter(
                     binary(term.op.operator(), get_item(term.column, root()), literal)
                 })
             }
-        };
-        match pushed {
-            Some(expr) => conjuncts.push(expr),
-            None => after.push(*term),
-        }
-    }
-    let filter = and_collect(conjuncts).map(|filter| {
-        filter
-            .bind(file.dtype())
-            .unwrap()
-            .optimize_recursive()
-            .unwrap()
-    });
-    (filter, after)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let filter = and_collect(conjuncts)?.bind(file.dtype()).unwrap();
+    Some(filter.optimize_recursive().unwrap())
 }
 
 /// `value` as a literal of `dtype`, or `None` if `dtype` can't hold it exactly.

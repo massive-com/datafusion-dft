@@ -12,17 +12,19 @@ use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use arrow::array::RecordBatchReader;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
 use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex::io::runtime::BlockingRuntime;
+use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 use vortex_ohlc::plan::Transform;
 use vortex_ohlc::profile::{plan, DecimalProfiler};
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 use vortex_ohlc::write::{stored_arrays, write_options};
-
-use crate::common::parquet_read::open_parquet;
 
 /// The month of minute bars `decimal_parts_bench` reads: August 2006, every ticker from A to ZZ,
 /// sorted by ticker.
@@ -54,9 +56,17 @@ pub struct Files {
     pub vortex_prices: PathBuf,
 }
 
+/// A session with Vortex's defaults on `runtime`, which runs everything on the calling thread,
+/// able to write the files (see [`vortex_ohlc::edition`]).
+pub fn new_session(runtime: &CurrentThreadRuntime) -> VortexSession {
+    let session = VortexSession::default().with_handle(runtime.handle());
+    vortex_ohlc::edition::enable(&session).unwrap();
+    session
+}
+
 /// The source, and the files written from it (see the module docs), writing those that are
 /// missing.
-pub fn files(runtime: &CurrentThreadRuntime, session: &VortexSession) -> Files {
+pub fn files() -> Files {
     let source = PathBuf::from(SOURCE);
     assert!(source.exists(), "no source at {}", source.display());
     let dir = Path::new(DATA_DIR);
@@ -75,18 +85,25 @@ pub fn files(runtime: &CurrentThreadRuntime, session: &VortexSession) -> Files {
         write_parquet_v2(&files.source, &tmp(&files.parquet));
         std::fs::rename(tmp(&files.parquet), &files.parquet).unwrap();
     }
+    let runtime = CurrentThreadRuntime::new();
+    let session = new_session(&runtime);
     for (path, ohlc) in [(&files.vortex, true), (&files.vortex_prices, false)] {
         if !path.exists() {
             eprintln!("writing {}", path.display());
-            write_vortex(runtime, session, &files.source, &tmp(path), ohlc);
+            write_vortex(&runtime, &session, &files.source, &tmp(path), ohlc);
             std::fs::rename(tmp(path), path).unwrap();
         }
     }
     files
 }
 
+/// Read the Parquet file at `path`.
+fn open_parquet(path: &Path) -> ParquetRecordBatchReaderBuilder<File> {
+    ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap()
+}
+
 fn write_parquet_v2(source: &Path, dest: &Path) {
-    let source = open_parquet(source, false);
+    let source = open_parquet(source);
     // Keep the source's row group size, so the format version is the only thing that changes.
     let row_group_rows = source.metadata().row_group(0).num_rows() as usize;
     let reader = source.with_batch_size(CONVERT_BATCH_SIZE).build().unwrap();
@@ -113,7 +130,7 @@ fn write_vortex(
     ohlc: bool,
 ) {
     let batches = || {
-        open_parquet(source, false)
+        open_parquet(source)
             .with_batch_size(CONVERT_BATCH_SIZE)
             .build()
             .unwrap()

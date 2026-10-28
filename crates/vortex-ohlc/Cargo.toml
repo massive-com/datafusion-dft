@@ -27,12 +27,4 @@ workspace = true
 
 [[bench]]
 harness = false
-name = "scan"
-
-[[bench]]
-harness = false
-name = "needle"
-
-[[bench]]
-harness = false
 name = "df"
