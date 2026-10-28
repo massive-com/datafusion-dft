@@ -9849,6 +9849,7 @@ dependencies = [
  "parquet",
  "regex",
  "serde_json",
+ "tokio",
  "vortex",
  "vortex-datafusion",
 ]

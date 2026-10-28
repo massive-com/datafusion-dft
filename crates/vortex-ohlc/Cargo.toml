@@ -18,6 +18,7 @@ vortex-datafusion.workspace = true
 criterion.workspace = true
 parquet = { features = ["snap", "zstd"], workspace = true }
 regex.workspace = true
+tokio = { features = ["rt-multi-thread"], workspace = true }
 
 [lints]
 workspace = true
@@ -29,3 +30,7 @@ name = "scan"
 [[bench]]
 harness = false
 name = "needle"
+
+[[bench]]
+harness = false
+name = "df"
