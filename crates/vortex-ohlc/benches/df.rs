@@ -32,10 +32,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::row::{RowConverter, SortField};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
-use datafusion::catalog::TableProvider;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -49,17 +47,12 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use futures::StreamExt;
 use roaring::RoaringTreemap;
 use tokio::runtime::Runtime;
-use vortex::array::memory::MemorySessionExt;
-use vortex::io::session::RuntimeSessionExt;
-use vortex::io::std_file::FileReadAt;
-use vortex::io::VortexReadAt;
 use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
 use vortex_ohlc::datafusion::{
-    vortex_format, BarsAdapterFactory, PrunedTable, VortexExecFactory, ZonePruner,
+    reader_factory, vortex_format, BarsAdapterFactory, PrunedTable, VortexExecFactory, ZonePruner,
 };
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
@@ -188,87 +181,24 @@ impl Tables {
                     .with_schema(Arc::clone(&self.schema))
                     .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
                 let listing = Arc::new(ListingTable::try_new(config).unwrap());
-                let mut table: Arc<dyn TableProvider> = Arc::clone(&listing) as _;
-                // Pruned with zone maps read through the object store, as production reads S3.
+                // The scans read the file directly, as dft reads a local file.
+                let url = ObjectStoreUrl::local_filesystem();
+                let store = ctx.runtime_env().object_store(&url).unwrap();
+                let mut factory = VortexExecFactory::new(reader_factory(&url, store));
                 if pruned {
-                    let url = ObjectStoreUrl::local_filesystem();
-                    let store = ctx.runtime_env().object_store(&url).unwrap();
-                    let readers = Arc::new(DefaultVortexReaderFactory::new(store));
-                    let factory = VortexExecFactory::new(pruner, readers);
-                    table = Arc::new(PrunedTable::new(listing, factory));
+                    factory = factory.with_pruner(pruner);
                 }
-                ctx.register_table(TABLE, table).unwrap();
-                let mut state = SessionStateBuilder::new_from_existing(ctx.state())
-                    .with_physical_optimizer_rule(Arc::new(LocalReaders));
+                ctx.register_table(TABLE, Arc::new(PrunedTable::new(listing, factory)))
+                    .unwrap();
                 if let (Reader::VortexIdeal, Some(ideal)) = (reader, ideal) {
-                    state =
-                        state.with_physical_optimizer_rule(Arc::new(IdealSelection(ideal.clone())));
+                    let state = SessionStateBuilder::new_from_existing(ctx.state())
+                        .with_physical_optimizer_rule(Arc::new(IdealSelection(ideal.clone())))
+                        .build();
+                    ctx = SessionContext::new_with_state(state);
                 }
-                let state = state.build();
-                ctx = SessionContext::new_with_state(state);
             }
         }
         ctx
-    }
-}
-
-/// Gives Vortex scans a reader that keeps the file open, as dft's `VortexReaders` rule does for
-/// a local file: vortex-datafusion otherwise reads it through the `ObjectStore`, which opens the
-/// file again for every read.
-#[derive(Debug)]
-struct LocalReaders;
-
-impl PhysicalOptimizerRule for LocalReaders {
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(|plan| {
-            let Some(conf) = plan
-                .downcast_ref::<DataSourceExec>()
-                .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
-            else {
-                return Ok(Transformed::no(plan));
-            };
-            let Some(source) = conf.file_source().downcast_ref::<VortexSource>() else {
-                return Ok(Transformed::no(plan));
-            };
-            let source = source
-                .clone()
-                .with_vortex_reader_factory(Arc::new(LocalReaderFactory));
-            let conf = FileScanConfigBuilder::from(conf.clone())
-                .with_source(Arc::new(source))
-                .build();
-            Ok(Transformed::yes(
-                DataSourceExec::from_data_source(conf) as Arc<dyn ExecutionPlan>
-            ))
-        })
-        .data()
-    }
-
-    fn name(&self) -> &str {
-        "local_readers"
-    }
-
-    fn schema_check(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug)]
-struct LocalReaderFactory;
-
-impl VortexReaderFactory for LocalReaderFactory {
-    fn create_reader(
-        &self,
-        file: &PartitionedFile,
-        session: &VortexSession,
-    ) -> datafusion::common::Result<Arc<dyn VortexReadAt>> {
-        let path = format!("/{}", file.path());
-        let file = FileReadAt::open_with_allocator(path, session.handle(), session.allocator())
-            .map_err(|e| datafusion::common::DataFusionError::External(Box::new(e)))?;
-        Ok(Arc::new(file))
     }
 }
 

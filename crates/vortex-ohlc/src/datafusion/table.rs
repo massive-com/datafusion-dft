@@ -9,25 +9,36 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
-use datafusion::common::{internal_datafusion_err, Constraints, DFSchema, Result, Statistics};
+use datafusion::common::{
+    internal_datafusion_err, Constraints, DFSchema, DataFusionError, Result, Statistics,
+};
 use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::listing::ListingTable;
+use datafusion::datasource::listing::{ListingTable, PartitionedFile};
 use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::TableType;
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
+use datafusion::object_store::local::LocalFileSystem;
+use datafusion::object_store::ObjectStore;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
-use vortex_datafusion::reader::VortexReaderFactory;
+use vortex::array::memory::MemorySessionExt;
+use vortex::io::session::RuntimeSessionExt;
+use vortex::io::std_file::FileReadAt;
+use vortex::io::VortexReadAt;
+use vortex::session::VortexSession;
+use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
 use vortex_datafusion::VortexSource;
 
 use super::ZonePruner;
 
 /// Builds Vortex scans as Atlas's `VortexExecFactory` does, from a scan's config and filter: the
-/// config's files pruned by a [`ZonePruner`] (as Atlas's default factory prunes file groups with
-/// its index) and read through `readers`, the zone maps too, then planned by the format.
+/// config's files read through `readers` and, given a [`ZonePruner`] (see
+/// [`with_pruner`](Self::with_pruner)), pruned by it as Atlas's default factory prunes file
+/// groups with its index, the zone maps read through `readers` too; then planned by the format.
 ///
 /// Atlas's own factory would prune its scans the same way with one line at the top of its
 /// `create_execution_plan`, given a `ZonePruner` kept next to its reader factory:
@@ -39,13 +50,23 @@ use super::ZonePruner;
 /// Atlas pushes the filter into the scan itself, so it can keep doing that after this line.
 #[derive(Debug)]
 pub struct VortexExecFactory {
-    pruner: Arc<ZonePruner>,
     readers: Arc<dyn VortexReaderFactory>,
+    pruner: Option<Arc<ZonePruner>>,
 }
 
 impl VortexExecFactory {
-    pub fn new(pruner: Arc<ZonePruner>, readers: Arc<dyn VortexReaderFactory>) -> Self {
-        Self { pruner, readers }
+    /// Scans that read through `readers` and aren't pruned.
+    pub fn new(readers: Arc<dyn VortexReaderFactory>) -> Self {
+        Self {
+            readers,
+            pruner: None,
+        }
+    }
+
+    /// Scans pruned by `pruner` before they start.
+    pub fn with_pruner(mut self, pruner: Arc<ZonePruner>) -> Self {
+        self.pruner = Some(pruner);
+        self
     }
 
     /// A scan of `file_scan_config`, a Vortex scan's config, by `file_format`, with the zones
@@ -58,10 +79,14 @@ impl VortexExecFactory {
         file_format: &Arc<dyn FileFormat>,
         filter: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let conf = self
-            .pruner
-            .prune(file_scan_config, filter, self.readers.as_ref())
-            .await?;
+        let conf = match &self.pruner {
+            Some(pruner) => {
+                pruner
+                    .prune(file_scan_config, filter, self.readers.as_ref())
+                    .await?
+            }
+            None => file_scan_config,
+        };
         let source = conf
             .file_source()
             .downcast_ref::<VortexSource>()
@@ -72,6 +97,40 @@ impl VortexExecFactory {
             .with_source(Arc::new(source))
             .build();
         file_format.create_physical_plan(state, conf).await
+    }
+}
+
+/// The readers for files in the object store at `url`, `store`, as a table's scans should read
+/// them: a local file directly, and anything else through `store`, as vortex-datafusion reads
+/// every file by default. Through the `ObjectStore`, a local file is opened again for every read
+/// and nearby reads are merged into requests of up to 16 MiB, a size meant for object storage;
+/// Vortex's file reader keeps it open and merges reads into requests of at most 4 MiB.
+pub fn reader_factory(
+    url: &ObjectStoreUrl,
+    store: Arc<dyn ObjectStore>,
+) -> Arc<dyn VortexReaderFactory> {
+    // DataFusion registers a `LocalFileSystem` rooted at `/` for `file://`.
+    if *url == ObjectStoreUrl::local_filesystem() {
+        Arc::new(LocalFileReaders(LocalFileSystem::new()))
+    } else {
+        Arc::new(DefaultVortexReaderFactory::new(store))
+    }
+}
+
+/// Vortex's own reader for a local file, at the path `LocalFileSystem` maps it to.
+#[derive(Debug)]
+struct LocalFileReaders(LocalFileSystem);
+
+impl VortexReaderFactory for LocalFileReaders {
+    fn create_reader(
+        &self,
+        file: &PartitionedFile,
+        session: &VortexSession,
+    ) -> Result<Arc<dyn VortexReadAt>> {
+        let path = self.0.path_to_filesystem(file.path())?;
+        let file = FileReadAt::open_with_allocator(path, session.handle(), session.allocator())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(Arc::new(file))
     }
 }
 
