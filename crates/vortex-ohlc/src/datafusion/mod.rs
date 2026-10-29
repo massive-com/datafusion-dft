@@ -27,7 +27,7 @@ use arrow::array::cast::AsArray;
 use arrow::array::types::Decimal128Type;
 use arrow::array::{Array, Decimal128Array, PrimitiveArray, RecordBatch};
 use arrow::buffer::{NullBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{exec_err, Result, ScalarValue};
 use datafusion::logical_expr::{ColumnarValue, Operator as DFOperator};
@@ -36,7 +36,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
-use vortex::dtype::{DType, DecimalDType, Nullability, StructFields};
+use vortex::arrow::ArrowSessionExt;
+use vortex::dtype::DecimalDType;
 use vortex::expr::{and, binary as vortex_binary, get_item, or, root, Expression};
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::VortexSession;
@@ -390,13 +391,15 @@ impl PhysicalExprAdapter for BarsAdapter {
 
 /// Converts expressions for vortex-datafusion to hand Vortex: see the module docs.
 pub struct BarsExpressionConverter {
+    session: VortexSession,
     inner: DefaultExpressionConverter,
 }
 
 impl BarsExpressionConverter {
     pub fn new(session: VortexSession) -> Self {
         Self {
-            inner: DefaultExpressionConverter::new(session),
+            inner: DefaultExpressionConverter::new(session.clone()),
+            session,
         }
     }
 
@@ -432,7 +435,10 @@ impl BarsExpressionConverter {
         let (column, literal, op) = match right.downcast_ref::<Literal>() {
             Some(literal) => (left, literal, op),
             None => match left.downcast_ref::<Literal>() {
-                Some(literal) => (right, literal, flipped(op)),
+                Some(literal) => match op.swap() {
+                    Some(op) => (right, literal, op),
+                    None => return Ok(None),
+                },
                 None => return Ok(None),
             },
         };
@@ -462,7 +468,13 @@ impl BarsExpressionConverter {
         let Some(ohlc) = price.ohlc.downcast_ref::<Column>() else {
             return Ok(None);
         };
-        let Some(table) = ohlc_table(schema.field_with_name(ohlc.name())?) else {
+        // A table of just the struct, as `compare_price` takes it.
+        let field = schema.field_with_name(ohlc.name())?.clone();
+        let Ok(table) = self
+            .session
+            .arrow()
+            .from_arrow_schema(&Schema::new(vec![field]))
+        else {
             return Ok(None);
         };
         Ok(compare_price(&table, price.name(), op, unscaled, scale))
@@ -512,40 +524,41 @@ fn comparison(op: &DFOperator) -> Option<Operator> {
     })
 }
 
-/// `op` with its operands swapped: `x op y` is `y flipped(op) x`.
-fn flipped(op: Operator) -> Operator {
-    match op {
-        Operator::Lt => Operator::Gt,
-        Operator::Lte => Operator::Gte,
-        Operator::Gt => Operator::Lt,
-        Operator::Gte => Operator::Lte,
-        op => op,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::Field;
+    use vortex::VortexSessionDefault;
 
-/// A table holding just the [`OHLC`] struct `field` (its Arrow field in the file's schema), as
-/// [`compare_price`] takes it; `None` unless it is a struct of decimals.
-fn ohlc_table(field: &Field) -> Option<DType> {
-    let DataType::Struct(parts) = field.data_type() else {
-        return None;
-    };
-    let dtypes = parts
-        .iter()
-        .map(|part| match part.data_type() {
-            DataType::Decimal128(precision, scale) => Some(DType::Decimal(
-                DecimalDType::new(*precision, *scale),
-                part.is_nullable().into(),
-            )),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let names: Vec<&str> = parts.iter().map(|part| part.name().as_str()).collect();
-    let ohlc = DType::Struct(
-        StructFields::new(names.into(), dtypes),
-        field.is_nullable().into(),
-    );
-    Some(DType::Struct(
-        StructFields::new([OHLC].into(), vec![ohlc]),
-        Nullability::NonNullable,
-    ))
+    use crate::plan::ohlc_fields;
+
+    #[test]
+    fn price_comparisons_go_to_vortex() {
+        let schema = Schema::new(vec![Field::new(
+            OHLC,
+            DataType::Struct(ohlc_fields(4)),
+            false,
+        )]);
+        let ohlc: Arc<dyn PhysicalExpr> = Arc::new(Column::new(OHLC, 0));
+        let converter = BarsExpressionConverter::new(VortexSession::default());
+        for price in OHLC_PRICES {
+            let field = Arc::new(Field::new(price, DataType::Decimal128(18, 6), false));
+            let price: Arc<dyn PhysicalExpr> =
+                Arc::new(OhlcPrice::new(field, Arc::clone(&ohlc)).unwrap());
+            let literal: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Decimal128(
+                Some(1_000_000_000),
+                18,
+                6,
+            )));
+            // Either way round: `price > 1000` and `1000 < price`.
+            for expr in [
+                BinaryExpr::new(Arc::clone(&price), DFOperator::Gt, Arc::clone(&literal)),
+                BinaryExpr::new(literal, DFOperator::Lt, price),
+            ] {
+                let expr: Arc<dyn PhysicalExpr> = Arc::new(expr);
+                let converted = converter.try_convert(&expr, &schema).unwrap();
+                assert!(converted.is_some(), "{expr} isn't handed to Vortex");
+            }
+        }
+    }
 }
