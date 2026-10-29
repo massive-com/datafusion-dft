@@ -49,7 +49,7 @@ mod prune;
 mod table;
 use crate::prices::{compare_price, decimal_literal};
 pub use prune::{ZonePruner, DEFAULT_CACHE_BYTES};
-pub use table::{PrunedTable, VortexExecFactory};
+pub use table::{reader_factory, PrunedTable, VortexExecFactory};
 
 /// A [`VortexFormat`] on `session` that hands Vortex what [`BarsExpressionConverter`] converts.
 pub fn vortex_format(session: VortexSession) -> VortexFormat {
