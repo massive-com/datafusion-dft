@@ -330,7 +330,7 @@ For Vortex files, the IO summary also shows the segments the scan requested, the
 I/O requests it made after merging nearby segments, and the bytes it read. A
 query that reads far more bytes than it returns usually means the scan could not
 skip chunks with zone maps, or that merged reads pulled in columns it did not
-need (see `dft_vortex.coalesce_distance` in the [config guide](config.md)).
+need.
 When a Vortex file is local, dft reads it directly rather than through the
 object store. For every Vortex scan, `EXPLAIN ANALYZE` reports the scan's reads
 as `bytes_scanned` and `io_requests`.

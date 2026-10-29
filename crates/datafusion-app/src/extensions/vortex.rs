@@ -19,8 +19,7 @@
 
 use crate::config::ExecutionConfig;
 use crate::extensions::{DftSessionStateBuilder, Extension};
-use datafusion::common::config::{ConfigExtension, ConfigOptions};
-use datafusion::common::extensions_options;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::listing::PartitionedFile;
@@ -68,7 +67,6 @@ impl Extension for VortexExtension {
         // The factory reads the session's `vortex` options when it creates a format, so
         // registering them makes `SET vortex.<option>` apply to later queries.
         builder.add_config_extension(VortexTableOptions::default())?;
-        builder.add_config_extension(DftVortexOptions::default())?;
         builder.add_file_format_factory(Arc::new(VortexFormatFactory::new()));
         // `CREATE EXTERNAL TABLE ... STORED AS VORTEX`, created the way DataFusion creates its
         // built-in formats' tables.
@@ -79,24 +77,8 @@ impl Extension for VortexExtension {
     }
 }
 
-extensions_options! {
-    /// dft's options for Vortex scans, set with `SET dft_vortex.<option>`.
-    ///
-    /// vortex-datafusion owns the `vortex` prefix, so these use their own.
-    pub struct DftVortexOptions {
-        /// Merge reads of segments at most this many bytes apart into one request.
-        /// The bytes between them are read and discarded. Unset keeps Vortex's
-        /// default of 1 MiB.
-        pub coalesce_distance: Option<usize>, default = None
-    }
-}
-
-impl ConfigExtension for DftVortexOptions {
-    const PREFIX: &'static str = "dft_vortex";
-}
-
 /// Gives Vortex scans a reader that records the scan's reads as `bytes_scanned`
-/// and `io_requests` metrics and applies `dft_vortex.coalesce_distance`.
+/// and `io_requests` metrics.
 ///
 /// Local files are read directly. vortex-datafusion otherwise reads them through
 /// the `ObjectStore`, which opens the file again for every read and merges nearby
@@ -113,12 +95,8 @@ impl PhysicalOptimizerRule for VortexReaders {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        config: &ConfigOptions,
+        _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let coalesce_distance = config
-            .extensions
-            .get::<DftVortexOptions>()
-            .and_then(|options| options.coalesce_distance);
         plan.transform_up(|plan| {
             let Some(conf) = plan
                 .downcast_ref::<DataSourceExec>()
@@ -136,7 +114,6 @@ impl PhysicalOptimizerRule for VortexReaders {
                     Arc::new(LocalReaderFactory {
                         store: LocalFileSystem::new(),
                         metrics,
-                        coalesce_distance,
                     })
                 } else {
                     // Without a registered store the scan fails when it opens the file, with
@@ -144,11 +121,7 @@ impl PhysicalOptimizerRule for VortexReaders {
                     let Ok(store) = self.stores.get_store(conf.object_store_url.as_ref()) else {
                         return Ok(Transformed::no(plan));
                     };
-                    Arc::new(ObjectStoreReaderFactory {
-                        store,
-                        metrics,
-                        coalesce_distance,
-                    })
+                    Arc::new(ObjectStoreReaderFactory { store, metrics })
                 };
             let source = source.clone().with_vortex_reader_factory(factory);
             let conf = FileScanConfigBuilder::from(conf.clone())
@@ -174,7 +147,6 @@ impl PhysicalOptimizerRule for VortexReaders {
 struct LocalReaderFactory {
     store: LocalFileSystem,
     metrics: ReadMetrics,
-    coalesce_distance: Option<usize>,
 }
 
 impl VortexReaderFactory for LocalReaderFactory {
@@ -189,7 +161,6 @@ impl VortexReaderFactory for LocalReaderFactory {
         Ok(Arc::new(MeteredReadAt {
             inner: file,
             metrics: self.metrics.clone(),
-            coalesce_distance: self.coalesce_distance,
         }))
     }
 }
@@ -198,7 +169,6 @@ impl VortexReaderFactory for LocalReaderFactory {
 struct ObjectStoreReaderFactory {
     store: Arc<dyn ObjectStore>,
     metrics: ReadMetrics,
-    coalesce_distance: Option<usize>,
 }
 
 impl VortexReaderFactory for ObjectStoreReaderFactory {
@@ -216,7 +186,6 @@ impl VortexReaderFactory for ObjectStoreReaderFactory {
         Ok(Arc::new(MeteredReadAt {
             inner: object,
             metrics: self.metrics.clone(),
-            coalesce_distance: self.coalesce_distance,
         }))
     }
 }
@@ -250,8 +219,6 @@ impl ReadMetrics {
 struct MeteredReadAt<R> {
     inner: R,
     metrics: ReadMetrics,
-    /// Replaces the merge distance of `inner`'s coalescing, keeping its maximum request size.
-    coalesce_distance: Option<usize>,
 }
 
 impl<R: VortexReadAt> VortexReadAt for MeteredReadAt<R> {
@@ -260,11 +227,7 @@ impl<R: VortexReadAt> VortexReadAt for MeteredReadAt<R> {
     }
 
     fn coalesce_config(&self) -> Option<CoalesceConfig> {
-        let config = self.inner.coalesce_config()?;
-        Some(match self.coalesce_distance {
-            Some(distance) => CoalesceConfig::new(distance as u64, config.max_size),
-            None => config,
-        })
+        self.inner.coalesce_config()
     }
 
     fn concurrency(&self) -> usize {

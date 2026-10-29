@@ -214,54 +214,6 @@ fn io_requests(scan: &str) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_vortex_coalesce_distance() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("wide.vortex");
-    let path = path.to_str().unwrap();
-    let test_exec = TestExecution::new().await;
-    // Random values do not compress, so the unread `b` column sits between `a` and `c`.
-    test_exec
-        .run(&format!(
-            "COPY (SELECT CAST(random() * 1e15 AS BIGINT) AS a, \
-             md5(CAST(random() AS VARCHAR)) AS b, \
-             CAST(random() * 1e15 AS BIGINT) AS c \
-             FROM generate_series(1, 20000)) TO '{path}' STORED AS VORTEX"
-        ))
-        .await
-        .unwrap();
-    let query = format!("SELECT sum(a), sum(c) FROM '{path}'");
-
-    // By default the reads of `a` and `c` are close enough to be merged into one.
-    assert_eq!(io_requests(&scan_metrics(&test_exec, &query).await), 1);
-
-    test_exec
-        .run("SET dft_vortex.coalesce_distance = 0")
-        .await
-        .unwrap();
-    assert_eq!(io_requests(&scan_metrics(&test_exec, &query).await), 2);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_vortex_coalesce_distance_from_config() {
-    let mut config = AppConfig::default();
-    config.cli.execution.datafusion = Some(HashMap::from([(
-        "dft_vortex.coalesce_distance".to_string(),
-        "65536".to_string(),
-    )]));
-    let test_exec = TestExecution::new_with_config(config).await;
-
-    let output = test_exec
-        .run_and_format(
-            "SELECT value FROM information_schema.df_settings WHERE name = 'coalesce_distance'",
-        )
-        .await;
-    assert!(
-        output.iter().any(|line| line.contains("65536")),
-        "unexpected output: {output:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_vortex_object_store_scan_reports_reads() {
     let test_exec = TestExecution::new().await;
     let url = url::Url::parse("memory://bucket").unwrap();

@@ -187,15 +187,6 @@ To keep a shared setting for that app, repeat it in the app's table.
 
 They can also be changed per session with `SET vortex.predicate_pushdown = false`. DataFusion lists extension options without their prefix, so read them back by the bare name: `SHOW predicate_pushdown`, or `SELECT * FROM information_schema.df_settings WHERE name = 'predicate_pushdown'`. `SHOW vortex.predicate_pushdown` is rejected.
 
-dft adds one Vortex option of its own, under the `dft_vortex.` prefix: `coalesce_distance`, in bytes. A Vortex scan merges reads of segments that lie at most this far apart in the file into one request, and reads and discards the bytes between them. Unset, Vortex merges reads up to 1 MiB apart, which can read much more than the query needs when it selects a few columns of a wide file. A smaller distance, such as 65536, reads less at the cost of more requests. Very small distances (`0`) stop merging almost entirely and make large scans much slower:
-
-```toml
-[shared.datafusion]
-"dft_vortex.coalesce_distance" = "65536"
-```
-
-It applies to local files and object stores alike, and is set per session with `SET dft_vortex.coalesce_distance = 65536`. `EXPLAIN ANALYZE` shows the effect in the scan's `bytes_scanned` and `io_requests` metrics.
-
 With the `net` feature enabled, the MaxMind-format (`.mmdb`) database used by the single-argument form of the `geoip` function can be configured (the `GEOIP_DB` environment variable takes precedence over this value).
 
 ```toml
