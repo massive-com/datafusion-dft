@@ -186,31 +186,25 @@ async fn test_vortex_local_scan_reports_reads() {
         "unexpected output: {output:?}"
     );
 
-    let scan = scan_metrics(&test_exec, &query).await;
-    assert!(
-        scan.contains("bytes_scanned=") && scan.contains("io_requests="),
-        "scan reports no reads: {scan}"
-    );
+    assert!(bytes_scanned(&test_exec, &query).await > 0);
 }
 
-/// The `DataSourceExec` line of `EXPLAIN ANALYZE` for `query`.
-async fn scan_metrics(test_exec: &TestExecution, query: &str) -> String {
-    let explain = test_exec
-        .run_and_format(&format!("EXPLAIN ANALYZE {query}"))
-        .await;
-    explain
-        .into_iter()
-        .find(|line| line.contains("DataSourceExec"))
-        .expect("plan has a scan")
-}
-
-/// The `io_requests` metric of a scan line from [`scan_metrics`].
-fn io_requests(scan: &str) -> usize {
-    let (_, rest) = scan
-        .split_once("io_requests=")
-        .unwrap_or_else(|| panic!("scan reports no reads: {scan}"));
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().unwrap()
+/// The bytes `query`'s scans read, as `--analyze` reports them.
+async fn bytes_scanned(test_exec: &TestExecution, query: &str) -> usize {
+    let plan = test_exec
+        .session_ctx()
+        .sql(query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let task_ctx = test_exec.session_ctx().task_ctx();
+    datafusion::physical_plan::collect(Arc::clone(&plan), task_ctx)
+        .await
+        .unwrap();
+    let stats = datafusion_app::stats::collect_plan_io_stats(plan).expect("plan has a scan");
+    stats.bytes_scanned().expect("scan reports its reads")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -235,5 +229,5 @@ async fn test_vortex_object_store_scan_reports_reads() {
         output.iter().any(|line| line == "| 10 |"),
         "unexpected output: {output:?}"
     );
-    assert!(io_requests(&scan_metrics(&test_exec, query).await) > 0);
+    assert!(bytes_scanned(&test_exec, query).await > 0);
 }

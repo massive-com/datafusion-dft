@@ -204,11 +204,13 @@ pub struct ExecutionIOStats {
     vortex: Option<VortexScanStats>,
 }
 
-/// Totals from the metrics Vortex records for its scans outside the plan's metrics
+/// Totals from the metrics Vortex records for its scans outside the plan's metrics. The bytes
+/// read are the IO summary's bytes scanned.
 #[derive(Clone, Debug, Default)]
 pub struct VortexScanStats {
     segment_requests: u64,
     io_requests: u64,
+    #[cfg(feature = "vortex")]
     bytes_read: u64,
 }
 
@@ -238,20 +240,17 @@ impl VortexScanStats {
 impl std::fmt::Display for VortexScanStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Vortex Scan Stats")?;
-        writeln!(
-            f,
-            "{:<20} {:<20} {:<20}",
-            "Segments Requested", "I/O Requests", "Bytes Read"
-        )?;
-        writeln!(
-            f,
-            "{:<20} {:<20} {:<20}",
-            self.segment_requests, self.io_requests, self.bytes_read
-        )
+        writeln!(f, "{:<20} {:<20}", "Segments Requested", "I/O Requests")?;
+        writeln!(f, "{:<20} {:<20}", self.segment_requests, self.io_requests)
     }
 }
 
 impl ExecutionIOStats {
+    /// The bytes the scans read, if they report them
+    pub fn bytes_scanned(&self) -> Option<usize> {
+        self.bytes_scanned.as_ref().map(MetricValue::as_usize)
+    }
+
     fn parquet_rg_pruned_stats_ratio(&self) -> f64 {
         if let (Some(pruned), Some(matched)) = (
             self.parquet_rg_matched_stats.as_ref(),
@@ -441,9 +440,15 @@ impl PlanIOVisitor {
                             .downcast_ref::<vortex_datafusion::VortexSource>()
                     })
                 {
-                    self.vortex
-                        .get_or_insert_with(VortexScanStats::default)
-                        .add_scan(source);
+                    let vortex = self.vortex.get_or_insert_with(VortexScanStats::default);
+                    vortex.add_scan(source);
+                    // Vortex counts its reads in its own metrics, not the plan's.
+                    let bytes = datafusion::physical_plan::metrics::Count::new();
+                    bytes.add(vortex.bytes_read as usize);
+                    self.bytes_scanned = Some(MetricValue::Count {
+                        name: "bytes_scanned".into(),
+                        count: bytes,
+                    });
                 }
             }
         }

@@ -23,27 +23,18 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, FileSource};
+use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::provider::DefaultTableFactory;
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::execution::object_store::{ObjectStoreRegistry, ObjectStoreUrl};
+use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::object_store::local::LocalFileSystem;
-use datafusion::object_store::ObjectStore;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::metrics::{
-    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory, MetricType,
-};
 use datafusion::physical_plan::ExecutionPlan;
-use futures::future::BoxFuture;
 use std::sync::Arc;
-use vortex::array::buffer::BufferHandle;
 use vortex::array::memory::MemorySessionExt;
-use vortex::buffer::Alignment;
-use vortex::error::VortexResult;
-use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::std_file::FileReadAt;
-use vortex::io::{CoalesceConfig, ReadAtRequest, ReadAtStream, VortexReadAt};
+use vortex::io::VortexReadAt;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::{VortexFormatFactory, VortexSource, VortexTableOptions};
@@ -71,25 +62,20 @@ impl Extension for VortexExtension {
         // `CREATE EXTERNAL TABLE ... STORED AS VORTEX`, created the way DataFusion creates its
         // built-in formats' tables.
         builder.add_table_factory("VORTEX", Arc::new(DefaultTableFactory::new()));
-        let stores = Arc::clone(&builder.runtime_env().object_store_registry);
-        builder.add_physical_optimizer_rule(Arc::new(VortexReaders { stores }));
+        builder.add_physical_optimizer_rule(Arc::new(VortexReaders));
         Ok(())
     }
 }
 
-/// Gives Vortex scans a reader that records the scan's reads as `bytes_scanned`
-/// and `io_requests` metrics.
+/// Gives Vortex scans of local files a reader that reads the file directly.
 ///
-/// Local files are read directly. vortex-datafusion otherwise reads them through
-/// the `ObjectStore`, which opens the file again for every read and merges nearby
-/// reads into requests of up to 16 MiB, a size meant for object storage. Vortex's
-/// file reader keeps the file open and merges reads into requests of at most
-/// 4 MiB. Vortex records its own I/O metrics outside the plan, so without these
-/// metrics `EXPLAIN ANALYZE` shows none.
+/// vortex-datafusion otherwise reads them through the `ObjectStore`, which opens the file
+/// again for every read and merges nearby reads into requests of up to 16 MiB, a size meant for
+/// object storage. Vortex's file reader keeps the file open and merges reads into requests of
+/// at most 4 MiB. Vortex records every scan's reads in its own metrics, whichever reader it has
+/// (see `stats.rs`).
 #[derive(Debug)]
-struct VortexReaders {
-    stores: Arc<dyn ObjectStoreRegistry>,
-}
+struct VortexReaders;
 
 impl PhysicalOptimizerRule for VortexReaders {
     fn optimize(
@@ -107,23 +93,14 @@ impl PhysicalOptimizerRule for VortexReaders {
             let Some(source) = conf.file_source().downcast_ref::<VortexSource>() else {
                 return Ok(Transformed::no(plan));
             };
-            let metrics = ReadMetrics::new(source.metrics());
             // DataFusion registers a `LocalFileSystem` rooted at `/` for `file://`.
-            let factory: Arc<dyn VortexReaderFactory> =
-                if conf.object_store_url == ObjectStoreUrl::local_filesystem() {
-                    Arc::new(LocalReaderFactory {
-                        store: LocalFileSystem::new(),
-                        metrics,
-                    })
-                } else {
-                    // Without a registered store the scan fails when it opens the file, with
-                    // DataFusion's own error, so it is left as it is.
-                    let Ok(store) = self.stores.get_store(conf.object_store_url.as_ref()) else {
-                        return Ok(Transformed::no(plan));
-                    };
-                    Arc::new(ObjectStoreReaderFactory { store, metrics })
-                };
-            let source = source.clone().with_vortex_reader_factory(factory);
+            if conf.object_store_url != ObjectStoreUrl::local_filesystem() {
+                return Ok(Transformed::no(plan));
+            }
+            let factory = LocalReaderFactory {
+                store: LocalFileSystem::new(),
+            };
+            let source = source.clone().with_vortex_reader_factory(Arc::new(factory));
             let conf = FileScanConfigBuilder::from(conf.clone())
                 .with_source(Arc::new(source))
                 .build();
@@ -146,7 +123,6 @@ impl PhysicalOptimizerRule for VortexReaders {
 #[derive(Debug)]
 struct LocalReaderFactory {
     store: LocalFileSystem,
-    metrics: ReadMetrics,
 }
 
 impl VortexReaderFactory for LocalReaderFactory {
@@ -158,100 +134,6 @@ impl VortexReaderFactory for LocalReaderFactory {
         let path = self.store.path_to_filesystem(file.path())?;
         let file = FileReadAt::open_with_allocator(path, session.handle(), session.allocator())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(Arc::new(MeteredReadAt {
-            inner: file,
-            metrics: self.metrics.clone(),
-        }))
-    }
-}
-
-#[derive(Debug)]
-struct ObjectStoreReaderFactory {
-    store: Arc<dyn ObjectStore>,
-    metrics: ReadMetrics,
-}
-
-impl VortexReaderFactory for ObjectStoreReaderFactory {
-    fn create_reader(
-        &self,
-        file: &PartitionedFile,
-        session: &VortexSession,
-    ) -> Result<Arc<dyn VortexReadAt>> {
-        let object = ObjectStoreReadAt::new_with_allocator(
-            Arc::clone(&self.store),
-            file.path().clone(),
-            session.handle(),
-            session.allocator(),
-        );
-        Ok(Arc::new(MeteredReadAt {
-            inner: object,
-            metrics: self.metrics.clone(),
-        }))
-    }
-}
-
-/// Read metrics registered with a scan's DataFusion metrics.
-#[derive(Clone, Debug)]
-struct ReadMetrics {
-    bytes_scanned: Count,
-    io_requests: Count,
-}
-
-impl ReadMetrics {
-    fn new(metrics: &ExecutionPlanMetricsSet) -> Self {
-        Self {
-            bytes_scanned: MetricBuilder::new(metrics)
-                .with_type(MetricType::Summary)
-                .with_category(MetricCategory::Bytes)
-                .global_counter("bytes_scanned"),
-            io_requests: MetricBuilder::new(metrics)
-                .with_type(MetricType::Summary)
-                .global_counter("io_requests"),
-        }
-    }
-
-    fn record(&self, length: usize) {
-        self.bytes_scanned.add(length);
-        self.io_requests.add(1);
-    }
-}
-
-struct MeteredReadAt<R> {
-    inner: R,
-    metrics: ReadMetrics,
-}
-
-impl<R: VortexReadAt> VortexReadAt for MeteredReadAt<R> {
-    fn uri(&self) -> Option<&Arc<str>> {
-        self.inner.uri()
-    }
-
-    fn coalesce_config(&self) -> Option<CoalesceConfig> {
-        self.inner.coalesce_config()
-    }
-
-    fn concurrency(&self) -> usize {
-        self.inner.concurrency()
-    }
-
-    fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
-        self.inner.size()
-    }
-
-    fn read_at(
-        &self,
-        offset: u64,
-        length: usize,
-        alignment: Alignment,
-    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
-        self.metrics.record(length);
-        self.inner.read_at(offset, length, alignment)
-    }
-
-    fn read_ranges(&self, requests: Arc<[ReadAtRequest]>) -> ReadAtStream {
-        for request in requests.iter() {
-            self.metrics.record(request.length);
-        }
-        self.inner.read_ranges(requests)
+        Ok(Arc::new(file))
     }
 }
