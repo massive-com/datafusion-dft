@@ -115,6 +115,15 @@ impl DftSessionStateBuilder {
         Ok(())
     }
 
+    /// Keep `extension` on the session, for whatever the session runs to get with
+    /// `SessionConfig::get_extension`
+    pub fn add_session_extension<T: Send + Sync + 'static>(&mut self, extension: Arc<T>) {
+        self.inner
+            .config()
+            .get_or_insert_with(SessionConfig::default)
+            .set_extension(extension);
+    }
+
     /// Add a catalog provider to the list of providers on this builder
     pub fn add_catalog_provider(&mut self, name: &str, factory: Arc<dyn CatalogProvider>) {
         self.inner
