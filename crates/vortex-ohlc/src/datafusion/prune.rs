@@ -25,7 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::array::cast::AsArray;
 use arrow::array::types::Decimal128Type;
@@ -41,16 +41,14 @@ use datafusion::object_store::ObjectMeta;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::physical_plan::Partitioning;
-use futures::future::{BoxFuture, Shared};
-use futures::{FutureExt, StreamExt};
-use moka::sync::Cache;
+use futures::StreamExt;
+use moka::future::Cache;
 use roaring::RoaringTreemap;
 use vortex::array::{MaskFuture, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::error::{vortex_err, VortexResult};
 use vortex::expr::root;
 use vortex::file::{OpenOptionsSessionExt, VortexFile};
-use vortex::io::VortexReadAt;
 use vortex::layout::layouts::zoned::Zoned;
 use vortex::layout::{LayoutReaderContext, LayoutRef};
 use vortex::scan::selection::Selection;
@@ -71,18 +69,13 @@ const MAX_KEPT: f64 = 0.5;
 /// How many files' zone maps [`ZonePruner::prune`] reads at once.
 const CONCURRENT_READS: usize = 16;
 
-/// A read of a file's zone maps, which every query that wants them joins; `None` if it failed.
-type ZonesRead = Shared<BoxFuture<'static, Option<Arc<FileZones>>>>;
-
 /// Gives each file of a Vortex scan the zones a filter can match: see the module docs.
 pub struct ZonePruner {
     session: VortexSession,
     /// Zone maps by object store and path, up to a number of bytes, the least recently used
-    /// evicted first.
+    /// evicted first. A query that wants a file's zone maps while another reads them waits for
+    /// that read.
     files: Cache<String, Arc<FileZones>>,
-    /// The reads under way, by object store and path; shared with the reads, which remove
-    /// themselves once done.
-    reading: Arc<Mutex<HashMap<String, ZonesRead>>>,
 }
 
 impl ZonePruner {
@@ -97,11 +90,7 @@ impl ZonePruner {
             .weigher(|_, zones: &Arc<FileZones>| zones.bytes)
             .max_capacity(cache_bytes)
             .build();
-        Self {
-            session,
-            files,
-            reading: Arc::default(),
-        }
+        Self { session, files }
     }
 
     /// `conf`, a Vortex scan's config, with each file given the zones `predicate` can match, as
@@ -119,15 +108,16 @@ impl ZonePruner {
         let url = &conf.object_store_url;
         let mut reads = Vec::new();
         for file in conf.file_groups.iter().flat_map(|group| group.iter()) {
-            if self.cached(url, file).is_none() {
-                let reader = readers.create_reader(file, &self.session)?;
-                reads.push(self.read(url, file, reader));
-            }
+            reads.push(self.zones(url, file, readers));
         }
-        futures::stream::iter(reads)
-            .buffer_unordered(CONCURRENT_READS)
+        // Each file's zone maps, in the order of the files.
+        let mut zones = futures::stream::iter(reads)
+            .buffered(CONCURRENT_READS)
             .collect::<Vec<_>>()
-            .await;
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter();
         let table = conf.file_source().table_schema().table_schema();
         let mut pruned = false;
         let groups: Vec<FileGroup> = conf
@@ -137,7 +127,7 @@ impl ZonePruner {
                 let files = group.iter().map(|file| {
                     let mut file = file.clone();
                     // A file whose zone maps couldn't be read is scanned whole.
-                    let Some(zones) = self.cached(url, &file) else {
+                    let Some(zones) = zones.next().flatten() else {
                         return file;
                     };
                     if let Some(selection) = selection(&zones, predicate, table) {
@@ -164,54 +154,36 @@ impl ZonePruner {
             .build())
     }
 
-    /// The zone maps of `file` in the object store at `url`, if they're kept and the file
-    /// hasn't changed since they were read.
-    fn cached(&self, url: &ObjectStoreUrl, file: &PartitionedFile) -> Option<Arc<FileZones>> {
-        let zones = self.files.get(&key(url, file))?;
-        let meta = &file.object_meta;
-        (zones.meta.size == meta.size && zones.meta.last_modified == meta.last_modified)
-            .then_some(zones)
-    }
-
-    /// A read of the zone maps of `file` in the object store at `url` through `reader`, or the
-    /// one under way, which another query started. It keeps them once done.
-    fn read(
+    /// The zone maps of `file` in the object store at `url`: the ones kept, unless the file has
+    /// changed since they were read, or else read through `readers` (or by the query already
+    /// reading them) and kept. `None` if they can't be read, until a later query tries again.
+    async fn zones(
         &self,
         url: &ObjectStoreUrl,
         file: &PartitionedFile,
-        reader: Arc<dyn VortexReadAt>,
-    ) -> ZonesRead {
+        readers: &dyn VortexReaderFactory,
+    ) -> Result<Option<Arc<FileZones>>> {
         let key = key(url, file);
-        let mut reading = self.reading.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(read) = reading.get(&key) {
-            return read.clone();
-        }
-        let (session, meta) = (self.session.clone(), file.object_meta.clone());
-        let (files, reads, done) = (self.files.clone(), Arc::clone(&self.reading), key.clone());
-        let read = async move {
-            let zones = async {
-                let file = session
-                    .open_options()
-                    .with_file_size(meta.size)
-                    .open_read(reader)
-                    .await?;
-                FileZones::read(&session, &file, meta).await
-            };
-            // On an error, left unpruned until a later query tries again.
-            let zones = zones.await.ok().map(Arc::new);
-            if let Some(zones) = &zones {
-                files.insert(done.clone(), Arc::clone(zones));
+        let meta = &file.object_meta;
+        if let Some(zones) = self.files.get(&key).await {
+            if zones.meta.size == meta.size && zones.meta.last_modified == meta.last_modified {
+                return Ok(Some(zones));
             }
-            reads
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&done);
-            zones
+            self.files.invalidate(&key).await;
         }
-        .boxed()
-        .shared();
-        reading.insert(key, read.clone());
-        read
+        let reader = readers.create_reader(file, &self.session)?;
+        let read = async {
+            let file = self
+                .session
+                .open_options()
+                .with_file_size(meta.size)
+                .open_read(reader)
+                .await
+                .ok()?;
+            let zones = FileZones::read(&self.session, &file, meta.clone()).await;
+            zones.ok().map(Arc::new)
+        };
+        Ok(self.files.optionally_get_with(key, read).await)
     }
 }
 
