@@ -2,20 +2,22 @@
 //! the rows it matches, and the rows of the Vortex file that match one (see [`matching_rows`]).
 
 use std::path::Path;
+use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
+use datafusion::physical_expr::simplifier::PhysicalExprSimplifier;
+use datafusion::physical_expr::{split_conjunction, PhysicalExpr};
+use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::VortexSessionExecute;
-use vortex::dtype::DType;
-use vortex::expr::{and_collect, binary, get_item, lit, root, BoundExpression, Expression};
-use vortex::file::{OpenOptionsSessionExt, VortexFile};
+use vortex::arrow::ArrowSessionExt;
+use vortex::expr::and_collect;
+use vortex::file::OpenOptionsSessionExt;
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::layout::layouts::row_idx::row_idx;
-use vortex::scalar::{DecimalValue, Scalar as VortexScalar};
-use vortex::scalar_fn::fns::operators::Operator;
-use vortex_ohlc::plan::{Plan, Transform};
-use vortex_ohlc::prices::compare_price;
-use vortex_ohlc::write::file_plan;
+use vortex_datafusion::convert::ExpressionConverter;
+use vortex_ohlc::datafusion::{BarsAdapterFactory, BarsExpressionConverter};
 
 use crate::common::data::new_session;
 
@@ -29,17 +31,6 @@ pub enum Op {
     Lt,
 }
 
-impl Op {
-    fn operator(self) -> Operator {
-        match self {
-            Op::Eq => Operator::Eq,
-            Op::Gt => Operator::Gt,
-            Op::Ge => Operator::Gte,
-            Op::Lt => Operator::Lt,
-        }
-    }
-}
-
 /// A literal, in a form that doesn't depend on how either format stores the column.
 #[derive(Clone, Copy, Debug)]
 pub enum Value {
@@ -51,20 +42,6 @@ pub enum Value {
         unscaled: i128,
         scale: i8,
     },
-}
-
-impl Value {
-    /// A decimal literal's unscaled value at `scale`, or `None` if that would round it.
-    fn unscaled_at(&self, scale: i8) -> Option<i128> {
-        let Value::Decimal {
-            unscaled,
-            scale: own,
-        } = *self
-        else {
-            panic!("{self:?} is not a decimal");
-        };
-        (scale >= own).then(|| unscaled * 10i128.pow((scale - own) as u32))
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -267,16 +244,36 @@ pub fn needles() -> Vec<Needle> {
 // Vortex
 // ---------------------------------------------------------------------------------------------
 
-/// The rows of the Vortex file at `path` that match `needle`, ascending, and the file's row
-/// count: a filtered scan with only the row index projected. `None` if a term doesn't go into a
-/// Vortex filter (see [`vortex_filter`]).
-pub fn matching_rows(path: &Path, needle: &Needle) -> Option<(Vec<u64>, u64)> {
+/// The rows of the Vortex file at `path` that `predicate` (over `table`, the table's schema)
+/// matches, ascending, and the file's row count: a scan with only the row index projected,
+/// filtered as a scan of a Vortex table filters, with `predicate` adapted to the file by
+/// [`BarsAdapterFactory`] and handed to Vortex by [`BarsExpressionConverter`], as
+/// vortex-datafusion's opener does. `None` if a conjunct doesn't go to Vortex.
+pub fn matching_rows(
+    path: &Path,
+    table: &SchemaRef,
+    predicate: &Arc<dyn PhysicalExpr>,
+) -> Option<(Vec<u64>, u64)> {
     let runtime = CurrentThreadRuntime::new();
     let session = new_session(&runtime);
-    let open = session.open_options().include_metadata().open_path(path);
-    let file = runtime.block_on(open).unwrap();
-    let plan = file_plan(&file).expect("the file records a plan of this version");
-    let filter = vortex_filter(&file, needle, &plan)?;
+    let file = runtime
+        .block_on(session.open_options().open_path(path))
+        .unwrap();
+    let schema = Arc::new(session.arrow().to_arrow_schema(file.dtype()).unwrap());
+    let adapter = BarsAdapterFactory
+        .create(Arc::clone(table), Arc::clone(&schema))
+        .unwrap();
+    let predicate = adapter.rewrite(Arc::clone(predicate)).unwrap();
+    let predicate = PhysicalExprSimplifier::new(&schema)
+        .simplify(predicate)
+        .unwrap();
+    let converter = BarsExpressionConverter::new(session.clone());
+    let conjuncts = split_conjunction(&predicate)
+        .into_iter()
+        .map(|conjunct| converter.try_convert(conjunct, &schema).unwrap())
+        .collect::<Option<Vec<_>>>()?;
+    let filter = and_collect(conjuncts)?.bind(file.dtype()).unwrap();
+    let filter = filter.optimize_recursive().unwrap();
     let mut ctx = session.create_execution_ctx();
     let hits = file
         .scan()
@@ -291,59 +288,4 @@ pub fn matching_rows(path: &Path, needle: &Needle) -> Option<(Vec<u64>, u64)> {
         rows.extend_from_slice(chunk.as_slice::<u64>());
     }
     Some((rows, file.row_count()))
-}
-
-/// `needle` as one Vortex filter expression over `file`, its literals in each column's stored
-/// type: a rescaled decimal column gets a literal at its rescaled scale, and a price stored in
-/// the [`OHLC`](vortex_ohlc::plan::OHLC) struct is compared over its parts (see [`ohlc_term`]).
-/// `None` if a term's literal doesn't fit its column's stored type exactly.
-fn vortex_filter(file: &VortexFile, needle: &Needle, plan: &Plan) -> Option<BoundExpression> {
-    let fields = file.dtype().as_struct_fields();
-    let conjuncts = needle
-        .terms
-        .iter()
-        .map(|term| match plan.get(term.column) {
-            Some(Transform::Ohlc(_)) => ohlc_term(file.dtype(), term),
-            _ => {
-                let dtype = fields.field(term.column).unwrap();
-                vortex_literal(term.value, &dtype).map(|literal| {
-                    binary(term.op.operator(), get_item(term.column, root()), literal)
-                })
-            }
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let filter = and_collect(conjuncts)?.bind(file.dtype()).unwrap();
-    Some(filter.optimize_recursive().unwrap())
-}
-
-/// `value` as a literal of `dtype`, or `None` if `dtype` can't hold it exactly.
-fn vortex_literal(value: Value, dtype: &DType) -> Option<Expression> {
-    Some(match value {
-        Value::Str(s) => lit(s),
-        // Timestamps are an extension type over i64; the literal has to be one too.
-        Value::TimestampNs(ns) => {
-            let ext = dtype.as_extension();
-            let storage = VortexScalar::primitive(ns, ext.storage_dtype().nullability());
-            lit(VortexScalar::extension_ref(ext.clone(), storage))
-        }
-        value @ Value::Decimal { .. } => {
-            let DType::Decimal(decimal, nullability) = dtype else {
-                panic!("{dtype} is not a decimal");
-            };
-            let v = DecimalValue::I128(value.unscaled_at(decimal.scale())?);
-            if !v.fits_in_precision(*decimal) {
-                return None;
-            }
-            lit(VortexScalar::decimal(v, *decimal, *nullability))
-        }
-    })
-}
-
-/// A term on a price stored in the [`OHLC`](vortex_ohlc::plan::OHLC) struct (in a table of `dtype`), over its parts (see
-/// [`compare_price`]); `None` if the literal doesn't fit the type it's compared in.
-fn ohlc_term(dtype: &DType, term: &Term) -> Option<Expression> {
-    let Value::Decimal { unscaled, scale } = term.value else {
-        panic!("{}: a price compares with a decimal", term.column);
-    };
-    compare_price(dtype, term.column, term.op.operator(), unscaled, scale)
 }
