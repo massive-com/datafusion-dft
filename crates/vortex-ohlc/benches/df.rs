@@ -41,6 +41,7 @@ use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanC
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
@@ -255,10 +256,17 @@ impl PhysicalOptimizerRule for IdealSelection {
     }
 }
 
-/// The rows of the zones of the Vortex file at `path` that hold a match for `needle`, found by
-/// a scan; `None` if the needle doesn't go into a Vortex filter whole.
-fn ideal_selection(path: &std::path::Path, needle: &Needle) -> Option<ScanSelection> {
-    let (matches, rows) = matching_rows(path, needle)?;
+/// The rows of the zones of the Vortex file that hold a match for `sql`, found by a scan with the
+/// filter the Vortex table pushes into its scans; `None` if it doesn't go to Vortex whole.
+fn ideal_selection(tables: &Tables, runtime: &Runtime, sql: &str) -> Option<ScanSelection> {
+    let ctx = tables.context(runtime, Reader::VortexUnpruned, 1, None);
+    let plan = runtime.block_on(async {
+        let query = ctx.sql(sql).await.unwrap();
+        query.create_physical_plan().await.unwrap()
+    });
+    let predicate = scan_predicate(&plan)?;
+    let path = std::path::Path::new(&tables.vortex);
+    let (matches, rows) = matching_rows(path, &tables.schema, &predicate)?;
     let zone = DEFAULT_ROW_BLOCK as u64;
     let mut zones: Vec<u64> = matches.into_iter().map(|row| row / zone).collect();
     zones.dedup();
@@ -267,6 +275,18 @@ fn ideal_selection(path: &std::path::Path, needle: &Needle) -> Option<ScanSelect
         selected.insert_range(z * zone..((z + 1) * zone).min(rows));
     }
     Some(ScanSelection::IncludeRoaring(selected))
+}
+
+/// The filter pushed into the Vortex scan in `plan`, over the table's columns.
+fn scan_predicate(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn PhysicalExpr>> {
+    let source = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+        .and_then(|conf| conf.file_source().downcast_ref::<VortexSource>());
+    match source {
+        Some(source) => source.predicate().cloned(),
+        None => plan.children().into_iter().find_map(scan_predicate),
+    }
 }
 
 /// Run `sql`, draining its batches; returns the row count.
@@ -515,7 +535,7 @@ fn df_needles(c: &mut Criterion) {
             .partitions
             .iter()
             .any(|p| setup.selection.runs(&format!("{id}/vortex ideal/{p}")))
-            .then(|| ideal_selection(std::path::Path::new(&setup.tables.vortex), needle))
+            .then(|| ideal_selection(&setup.tables, &setup.runtime, &sql))
             .flatten();
         setup.bench(c, &id, needle.name, &sql, false, ideal.as_ref());
     }
