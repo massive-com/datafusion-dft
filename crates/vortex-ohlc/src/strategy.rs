@@ -3,7 +3,7 @@
 //! [`compress_chunk`]. Each part of the OHLC struct is a column of its own with its own zone map,
 //! so a scan can prune on the prices (see [`crate::datafusion::ZonePruner`]).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema};
 use vortex::array::{ArrayRef, ExecutionCtx};
@@ -29,25 +29,32 @@ pub const DEFAULT_ROW_BLOCK: usize = 65_536;
 /// `row_block`-row chunks. The writing session must enable [`crate::edition`]; any Vortex session
 /// reads the file.
 pub fn write_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn LayoutStrategy> {
-    let mut builder = builder(row_block);
+    // Vortex's defaults, for the compressors and write strategies Vortex builds from a session.
+    // Not the writer's: its editions would let them pick encodings Vortex doesn't by default.
+    let defaults = VortexSession::default();
+    let mut builder = builder(&defaults, row_block);
     for field in source.fields() {
         let name = field.name().as_str();
         match (plan.get(name), field.data_type()) {
             (Some(Transform::Ohlc(_)), _) if name == OHLC_PRICES[0] => {
                 let validity = CollectStrategy::new(CompressingStrategy::new(
                     FlatLayoutStrategy::default(),
-                    BtrBlocksCompressor::from_session(default_session()),
+                    BtrBlocksCompressor::from_session(&defaults),
                 ));
                 let mut parts =
                     TableStrategy::new(Arc::new(validity), Arc::new(FlatLayoutStrategy::default()));
                 for part in OHLC_PARTS {
-                    parts = parts.with_field_writer(FieldPath::from_name(part), packed(row_block));
+                    parts = parts.with_field_writer(
+                        FieldPath::from_name(part),
+                        packed(&defaults, row_block),
+                    );
                 }
                 builder = builder.with_field_writer(FieldPath::from_name(OHLC), Arc::new(parts));
             }
             (Some(Transform::Ohlc(_)), _) => {}
             (Some(Transform::Packed), _) | (_, DataType::Decimal128(..)) => {
-                builder = builder.with_field_writer(FieldPath::from_name(name), packed(row_block));
+                builder = builder
+                    .with_field_writer(FieldPath::from_name(name), packed(&defaults, row_block));
             }
             _ => {}
         }
@@ -55,28 +62,21 @@ pub fn write_strategy(source: &Schema, plan: &Plan, row_block: usize) -> Arc<dyn
     builder.build()
 }
 
-/// A session with Vortex's defaults, for the compressors and write strategies Vortex builds from
-/// one.
-fn default_session() -> &'static VortexSession {
-    static SESSION: OnceLock<VortexSession> = OnceLock::new();
-    SESSION.get_or_init(VortexSession::default)
-}
-
 /// Vortex's default write strategy, but with `row_block`-row chunks. The default also coalesces
 /// blocks up to about 1 MiB, which would merge the narrow columns into bigger chunks, so that is
 /// turned off: every chunk is exactly one row block.
-fn builder(row_block: usize) -> WriteStrategyBuilder {
-    WriteStrategyBuilder::from_session(default_session())
+fn builder(defaults: &VortexSession, row_block: usize) -> WriteStrategyBuilder {
+    WriteStrategyBuilder::from_session(defaults)
         .with_row_block_size(row_block)
         .with_data_block_target_bytes(None)
 }
 
 /// A full [`builder`] pipeline (row blocks, zone maps) for one column, with only the compressor
 /// swapped for [`compress_chunk`].
-fn packed(row_block: usize) -> Arc<dyn LayoutStrategy> {
-    let fallback = BtrBlocksCompressor::from_session(default_session());
-    let probe_fallback = BtrBlocksCompressor::from_session(default_session());
-    builder(row_block)
+fn packed(defaults: &VortexSession, row_block: usize) -> Arc<dyn LayoutStrategy> {
+    let fallback = BtrBlocksCompressor::from_session(defaults);
+    let probe_fallback = BtrBlocksCompressor::from_session(defaults);
+    builder(defaults, row_block)
         .with_compressor(move |chunk: &ArrayRef, ctx: &mut ExecutionCtx| {
             compress_chunk(chunk, ctx, &fallback)
         })
