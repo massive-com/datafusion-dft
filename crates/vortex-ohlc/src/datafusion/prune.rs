@@ -93,6 +93,11 @@ impl ZonePruner {
         Self { session, files }
     }
 
+    /// The session it reads zone maps on.
+    pub fn session(&self) -> &VortexSession {
+        &self.session
+    }
+
     /// `conf`, a Vortex scan's config, with each file given the zones `predicate` can match, as
     /// Atlas's index prunes a scan's file groups. The zone maps of every file it doesn't have are
     /// read first, through `readers`.

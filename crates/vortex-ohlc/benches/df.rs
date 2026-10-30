@@ -34,6 +34,7 @@ use arrow::row::{RowConverter, SortField};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -53,7 +54,8 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
 use vortex_ohlc::datafusion::{
-    reader_factory, vortex_format, BarsAdapterFactory, PrunedTable, VortexExecFactory, ZonePruner,
+    reader_factory, vortex_format_factory, BarsAdapterFactory, PrunedTable, VortexExecFactory,
+    ZonePruner,
 };
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
@@ -175,7 +177,7 @@ impl Tables {
                 let _runtime = runtime.enter();
                 let session = VortexSession::default();
                 let pruner = Arc::new(ZonePruner::new(session.clone()));
-                let options = ListingOptions::new(Arc::new(vortex_format(session)))
+                let options = ListingOptions::new(vortex_format_factory(session).default())
                     .with_file_extension(".vortex");
                 let config = ListingTableConfig::new(ListingTableUrl::parse(path).unwrap())
                     .with_listing_options(options)

@@ -7,16 +7,18 @@
 //!   [`Rescaled`], and everything else is left to DataFusion's default adapter.
 //! - [`BarsExpressionConverter`] decides what vortex-datafusion hands Vortex. A comparison of a
 //!   price with a literal goes in as [`compare_price`], so Vortex filters on the parts, and one
-//!   of a rescaled column with the literal at the column's stored scale. Everything else goes through vortex-datafusion's
-//!   default converter. Rebuilding the columns is left to DataFusion ([`OhlcPrice`],
-//!   [`Rescaled`]), which is quicker than Vortex's expressions for it.
+//!   of a rescaled column with the literal at the column's stored scale. Everything else goes
+//!   through vortex-datafusion's default converter. Rebuilding the columns is left to
+//!   DataFusion ([`OhlcPrice`], [`Rescaled`]), which is quicker than Vortex's expressions for it.
 //!
-//! [`vortex_format`] is a format that reads the files this way, given a table with the source's
-//! schema and a [`BarsAdapterFactory`].
+//! [`vortex_format_factory`] makes formats that read the files this way, given a table with the
+//! source's schema and a [`BarsAdapterFactory`].
 //!
 //! [`ZonePruner`] prunes a Vortex scan before it starts, so the scan doesn't start the zones its
 //! filter rules out. A [`VortexExecFactory`] builds scans with it, as Atlas's factory of the same
 //! name builds its Vortex scans, and a [`PrunedTable`] has one build its scans.
+//! [`PrunedTable::over`] puts it all together for a listing table over Vortex files, with the
+//! source's schema and a [`BarsAdapterFactory`] from the plan the files record.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -42,7 +44,7 @@ use vortex::expr::{and, binary as vortex_binary, get_item, or, root, Expression}
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::VortexSession;
 use vortex_datafusion::convert::{DefaultExpressionConverter, ExpressionConverter};
-use vortex_datafusion::VortexFormat;
+use vortex_datafusion::VortexFormatFactory;
 
 use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
@@ -52,10 +54,12 @@ use crate::prices::{compare_price, decimal_literal};
 pub use prune::{ZonePruner, DEFAULT_CACHE_BYTES};
 pub use table::{reader_factory, PrunedTable, VortexExecFactory};
 
-/// A [`VortexFormat`] on `session` that hands Vortex what [`BarsExpressionConverter`] converts.
-pub fn vortex_format(session: VortexSession) -> VortexFormat {
+/// A [`VortexFormatFactory`] on `session` whose formats hand Vortex what
+/// [`BarsExpressionConverter`] converts; their options are the DataFusion session's `vortex` ones,
+/// and [`default`](datafusion::datasource::file_format::FileFormatFactory::default)'s Vortex's.
+pub fn vortex_format_factory(session: VortexSession) -> VortexFormatFactory {
     let converter = BarsExpressionConverter::new(session.clone());
-    VortexFormat::new(session).with_expression_converter(Arc::new(converter))
+    VortexFormatFactory::new_with_session(session).with_expression_converter(Arc::new(converter))
 }
 
 // ---------------------------------------------------------------------------------------------

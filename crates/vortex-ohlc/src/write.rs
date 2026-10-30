@@ -17,7 +17,8 @@ use vortex::file::{VortexFile, VortexWriteOptions, WriteOptionsSessionExt};
 use vortex::session::VortexSession;
 
 use crate::plan::{
-    apply_plan, plan_from_json, planned_schema, transforms_json, Plan, TRANSFORMS_KEY,
+    apply_plan, plan_from_json, planned_schema, source_schema, transforms_json, Plan,
+    TRANSFORMS_KEY,
 };
 use crate::strategy::write_strategy;
 
@@ -63,6 +64,18 @@ where
 /// The plan `file` records, if it records one of this version. A file only loads its metadata
 /// when opened with `include_metadata`.
 pub fn file_plan(file: &VortexFile) -> Option<Plan> {
+    plan_from_json(&file_record(file)?)
+}
+
+/// The schema of the source `file` was written from, given `stored`, its schema as written (see
+/// [`source_schema`]); `None` unless the file records a plan of this version that fits `stored`.
+/// A file only loads its metadata when opened with `include_metadata`.
+pub fn file_source_schema(file: &VortexFile, stored: &Schema) -> Option<Schema> {
+    source_schema(&file_record(file)?, stored)
+}
+
+/// The record of its plan `file` holds (see [`transforms_json`]), if any.
+fn file_record(file: &VortexFile) -> Option<serde_json::Value> {
     let json = file.metadata_segment(TRANSFORMS_KEY)?;
-    plan_from_json(&serde_json::from_slice(json.as_ref()).ok()?)
+    serde_json::from_slice(json.as_ref()).ok()
 }

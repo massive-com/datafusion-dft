@@ -33,8 +33,8 @@ use datafusion_session::SessionStore;
 use std::sync::Arc;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::{VortexFormat, VortexFormatFactory, VortexTableOptions};
-use vortex_ohlc::datafusion::{reader_factory, PrunedTable, VortexExecFactory, ZonePruner};
+use vortex_datafusion::{VortexFormat, VortexTableOptions};
+use vortex_ohlc::datafusion::{vortex_format_factory, PrunedTable, ZonePruner};
 
 #[derive(Debug, Default)]
 pub struct VortexExtension {}
@@ -55,38 +55,38 @@ impl Extension for VortexExtension {
         // The factory reads the session's `vortex` options when it creates a format, so
         // registering them makes `SET vortex.<option>` apply to later queries.
         builder.add_config_extension(VortexTableOptions::default())?;
-        builder.add_file_format_factory(Arc::new(VortexFormatFactory::new()));
+        // Filters on the columns of files written by vortex-ohlc (see `pruned`) go to Vortex on
+        // the columns as stored; anything else as vortex-datafusion converts it by default.
+        let session = VortexSession::default();
+        builder.add_file_format_factory(Arc::new(vortex_format_factory(session.clone())));
         // `CREATE EXTERNAL TABLE ... STORED AS VORTEX`, created the way DataFusion creates its
         // built-in formats' tables, then pruned (see `pruned`) with the session's zone maps.
         builder.add_table_factory("VORTEX", Arc::new(PrunedTableFactory::default()));
-        let pruner = ZonePruner::new(VortexSession::default());
+        let pruner = ZonePruner::new(session);
         builder.add_session_extension(Arc::new(pruner));
         Ok(())
     }
 }
 
 /// `table`, if it's a listing table of Vortex files, with its scans pruned to the zones their
-/// filter can match before they start (see [`PrunedTable`]), by the [`ZonePruner`] `state` keeps,
-/// which keeps the zone maps for as long as the session lasts. The scans and the zone maps read
-/// the files as [`reader_factory`] picks for the table's object store: a local file directly.
-fn pruned(table: Arc<dyn TableProvider>, state: &dyn Session) -> Result<Arc<dyn TableProvider>> {
+/// filter can match before they start, by the [`ZonePruner`] `state` keeps, which keeps the zone
+/// maps for as long as the session lasts (see [`PrunedTable::over`]). Files written by
+/// vortex-ohlc are read as the source they were written from: the table has the source's
+/// columns, not the ones the files store.
+async fn pruned(
+    table: Arc<dyn TableProvider>,
+    state: &dyn Session,
+) -> Result<Arc<dyn TableProvider>> {
     let Some(listing) = table.downcast_ref::<ListingTable>() else {
         return Ok(table);
     };
-    let (Some(_), Some(url), Some(pruner)) = (
+    let (Some(_), Some(pruner)) = (
         listing.options().format.downcast_ref::<VortexFormat>(),
-        listing.table_paths().first(),
         state.config().get_extension::<ZonePruner>(),
     ) else {
         return Ok(table);
     };
-    let store = state.runtime_env().object_store(url.object_store())?;
-    let readers = reader_factory(&url.object_store(), store);
-    let factory = VortexExecFactory::new(readers).with_pruner(pruner);
-    Ok(Arc::new(PrunedTable::new(
-        Arc::new(listing.clone()),
-        factory,
-    )))
+    Ok(Arc::new(PrunedTable::over(listing, state, pruner).await?))
 }
 
 /// DataFusion's table factory, its Vortex tables [`pruned`].
@@ -100,7 +100,7 @@ impl TableProviderFactory for PrunedTableFactory {
         state: &dyn Session,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>> {
-        pruned(self.0.create(state, cmd).await?, state)
+        pruned(self.0.create(state, cmd).await?, state).await
     }
 }
 
@@ -118,8 +118,17 @@ impl UrlTableFactory for PrunedUrlTables {
         let Some(session) = session else {
             return Ok(Some(table));
         };
-        let state = session.read();
-        pruned(table, &*state).map(Some)
+        // A copy, as DataFusion takes one to create the table: the lock isn't held while the
+        // files are read.
+        let state = session
+            .read()
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .cloned();
+        let Some(state) = state else {
+            return Ok(Some(table));
+        };
+        pruned(table, &state).await.map(Some)
     }
 }
 
