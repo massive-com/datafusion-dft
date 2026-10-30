@@ -1027,6 +1027,15 @@ fn test_output_vortex_zone_maps_disabled() {
 #[cfg(feature = "vortex")]
 const VORTEX_ENCODING_SOURCE: &str = "SELECT value::bigint AS int_col, (value % 1000)::double * 0.25 AS float_col, 'v' || (value % 100) AS string_col, arrow_cast('b' || (value % 37), 'Binary') AS binary_col, arrow_cast(value / 100.0, 'Decimal128(12, 2)') AS decimal_col, to_timestamp_seconds(value * 60) AS ext_col FROM generate_series(1, 65536)";
 
+/// A query for the rows that differ between [`VORTEX_ENCODING_SOURCE`] and the file at `file`,
+/// in either direction, as `mismatched`.
+#[cfg(feature = "vortex")]
+fn vortex_mismatched_rows(file: &str) -> String {
+    format!(
+        "SELECT (SELECT count(*) FROM (({VORTEX_ENCODING_SOURCE}) EXCEPT ALL (SELECT * FROM '{file}'))) + (SELECT count(*) FROM ((SELECT * FROM '{file}') EXCEPT ALL ({VORTEX_ENCODING_SOURCE}))) AS mismatched"
+    )
+}
+
 #[test]
 #[cfg(feature = "vortex")]
 fn test_output_vortex_every_listed_encoding_round_trips() {
@@ -1077,11 +1086,7 @@ fn test_output_vortex_every_listed_encoding_round_trips() {
             continue;
         }
 
-        // Rows that differ between the source and the file, in either direction.
-        let file = path.to_str().unwrap();
-        let check = format!(
-            "SELECT (SELECT count(*) FROM (({VORTEX_ENCODING_SOURCE}) EXCEPT ALL (SELECT * FROM '{file}'))) + (SELECT count(*) FROM ((SELECT * FROM '{file}') EXCEPT ALL ({VORTEX_ENCODING_SOURCE}))) AS mismatched"
-        );
+        let check = vortex_mismatched_rows(path.to_str().unwrap());
         let read = Command::cargo_bin("dft")
             .unwrap()
             .arg("-c")
@@ -1116,14 +1121,10 @@ fn test_output_vortex_blocked_encodings_round_trip() {
         .assert()
         .success();
 
-    let file = path.to_str().unwrap();
-    let check = format!(
-        "SELECT (SELECT count(*) FROM (({VORTEX_ENCODING_SOURCE}) EXCEPT ALL (SELECT * FROM '{file}'))) + (SELECT count(*) FROM ((SELECT * FROM '{file}') EXCEPT ALL ({VORTEX_ENCODING_SOURCE}))) AS mismatched"
-    );
     Command::cargo_bin("dft")
         .unwrap()
         .arg("-c")
-        .arg(check)
+        .arg(vortex_mismatched_rows(path.to_str().unwrap()))
         .assert()
         .success()
         .stdout(contains_str("| 0          |"));
