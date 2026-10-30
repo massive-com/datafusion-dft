@@ -18,9 +18,10 @@
 //! Vortex output writer options for `--output` with a `.vortex` suffix.
 //!
 //! The layout strategy is built here instead of using
-//! `vortex_file::WriteStrategyBuilder`. That builder can only override a field with a complete
-//! leaf strategy, which drops zone maps. This module composes the same pipeline as
-//! `WriteStrategyBuilder::build` for every column and changes only the compressor.
+//! `vortex_file::WriteStrategyBuilder`. That builder uses one compressor for a column's data and
+//! its zone maps, and has no switch for dictionary encoding or zone maps, which
+//! `dictionary_enabled` and `statistics_enabled` need. This module composes the same pipeline as
+//! `WriteStrategyBuilder::build` for every column and changes only those.
 //!
 //! Keep the pipeline in [`build_leaf`] in sync with `vortex_file::WriteStrategyBuilder::build`
 //! when the pinned Vortex version changes.
@@ -174,31 +175,24 @@ impl VortexWriteConfig {
                     config.blocked_encodings = parse_bool(value)?;
                 }
                 _ => {
-                    if let Some(column) = key.strip_prefix("encoding::") {
-                        if column.is_empty() {
-                            return Err(eyre!(
-                                "encoding requires a column name, for example encoding::id=bitpacking"
-                            ));
-                        }
-                        config.column(column).encoding = Some(value.clone());
-                    } else if let Some(column) = key.strip_prefix("dictionary_enabled::") {
-                        if column.is_empty() {
-                            return Err(eyre!(
-                                "dictionary_enabled requires a column name, for example dictionary_enabled::id=false"
-                            ));
-                        }
-                        let enabled = parse_bool(value)?;
-                        config.column(column).dictionary = Some(enabled);
-                    } else if let Some(column) = key.strip_prefix("statistics_enabled::") {
-                        if column.is_empty() {
-                            return Err(eyre!(
-                                "statistics_enabled requires a column name, for example statistics_enabled::id=false"
-                            ));
-                        }
-                        let enabled = parse_bool(value)?;
-                        config.column(column).statistics = Some(enabled);
-                    } else {
+                    let Some((option, column)) = key.split_once("::") else {
                         return Err(eyre!("Unknown vortex output format option '{key}'"));
+                    };
+                    let example = match option {
+                        "encoding" => "bitpacking",
+                        "dictionary_enabled" | "statistics_enabled" => "false",
+                        _ => return Err(eyre!("Unknown vortex output format option '{key}'")),
+                    };
+                    if column.is_empty() {
+                        return Err(eyre!(
+                            "{option} requires a column name, for example {option}::id={example}"
+                        ));
+                    }
+                    let column = config.column(column);
+                    match option {
+                        "encoding" => column.encoding = Some(value.clone()),
+                        "dictionary_enabled" => column.dictionary = Some(parse_bool(value)?),
+                        _ => column.statistics = Some(parse_bool(value)?),
                     }
                 }
             }
@@ -670,7 +664,7 @@ fn push_scheme_entry(entries: &mut Vec<SchemeEntry>, scheme: &'static dyn Scheme
 fn resolve_scheme(raw: &str, kind: &str, column: &str) -> Result<&'static dyn Scheme> {
     let entries = scheme_entries();
 
-    if let Some(entry) = entries.iter().find(|entry| entry.name == raw) {
+    if let Some(entry) = find_qualified(raw) {
         if entry.kind != kind {
             return Err(eyre!(
                 "Encoding '{raw}' is for {} columns, but column '{column}' is {kind}",
@@ -678,21 +672,6 @@ fn resolve_scheme(raw: &str, kind: &str, column: &str) -> Result<&'static dyn Sc
             ));
         }
         return Ok(entry.scheme);
-    }
-
-    if let Some((prefix, short)) = raw.split_once('.') {
-        if let Some(entry) = entries
-            .iter()
-            .find(|entry| entry.kind == prefix && entry.short == short)
-        {
-            if entry.kind != kind {
-                return Err(eyre!(
-                    "Encoding '{raw}' is for {} columns, but column '{column}' is {kind}",
-                    entry.kind
-                ));
-            }
-            return Ok(entry.scheme);
-        }
     }
 
     if let Some(entry) = entries
@@ -713,6 +692,18 @@ fn resolve_scheme(raw: &str, kind: &str, column: &str) -> Result<&'static dyn Sc
         "Unknown vortex encoding '{raw}' for {kind} column '{column}'; available encodings: {}",
         available.join(", ")
     ))
+}
+
+/// The scheme named in full (`vortex.int.bitpacking`) or by kind and short name
+/// (`int.bitpacking`).
+fn find_qualified(raw: &str) -> Option<&'static SchemeEntry> {
+    let entries = scheme_entries();
+    entries.iter().find(|entry| entry.name == raw).or_else(|| {
+        let (kind, short) = raw.split_once('.')?;
+        entries
+            .iter()
+            .find(|entry| entry.kind == kind && entry.short == short)
+    })
 }
 
 /// Resolve a column option's name to its field path and type: a top-level column, or failing that
@@ -751,16 +742,8 @@ fn resolve_field(schema: &Schema, name: &str) -> Result<(FieldPath, DataType)> {
 /// to is not known up front: a full or kind-qualified name, or a short name only one kind has.
 fn resolve_scheme_any(raw: &str, column: &str) -> Result<&'static dyn Scheme> {
     let entries = scheme_entries();
-    if let Some(entry) = entries.iter().find(|entry| entry.name == raw) {
+    if let Some(entry) = find_qualified(raw) {
         return Ok(entry.scheme);
-    }
-    if let Some((prefix, short)) = raw.split_once('.') {
-        if let Some(entry) = entries
-            .iter()
-            .find(|entry| entry.kind == prefix && entry.short == short)
-        {
-            return Ok(entry.scheme);
-        }
     }
     let matching: Vec<&SchemeEntry> = entries.iter().filter(|entry| entry.short == raw).collect();
     match matching.as_slice() {
@@ -1007,20 +990,43 @@ mod tests {
         chunks
     }
 
+    /// Whether any chunk has a child named `name`.
+    fn has_child(chunks: &[ArrayRef], name: &str) -> bool {
+        chunks.iter().any(|chunk| {
+            chunk
+                .named_children()
+                .iter()
+                .any(|(child, _)| child == name)
+        })
+    }
+
     #[tokio::test]
     async fn bitpacking_override_is_written() {
-        // Increasing values need a different bit width per block, which bitpacking's v2 wire
-        // format stores. v2 is outside the default editions, so the override must fall back to
-        // v1 rather than fail while writing.
-        let values = Int64Array::from_iter_values(0..ROWS);
-        assert_written_with(Arc::new(values), "bitpacking", "fastlanes.bitpacked").await;
+        // Increasing values need a different bit width per block, which only blocked
+        // bit-packing (v2) stores, with the offsets of its blocks as a child. v2 is outside the
+        // default editions, so the override must fall back to v1 rather than fail while writing.
+        let values = || Arc::new(Int64Array::from_iter_values(0..ROWS));
+        let default = assert_written_with(values(), "bitpacking", "fastlanes.bitpacked").await;
+        assert!(!has_child(&default, "block_offsets"));
+
+        let blocked =
+            written_chunks_with(values(), "bitpacking", &[("blocked_encodings", "true")]).await;
+        assert!(has_child(&blocked, "block_offsets"));
     }
 
     #[tokio::test]
     async fn for_override_is_written() {
-        // Drifting values favour a reference per chunk, which only FoR's v2 wire format stores.
-        let values = Int64Array::from_iter_values((0..ROWS).map(|i| 1_000_000_000 + i));
-        assert_written_with(Arc::new(values), "for", "fastlanes.for").await;
+        // Drifting values favour a reference per chunk, which only blocked FoR (v2) stores.
+        let values = || {
+            Arc::new(Int64Array::from_iter_values(
+                (0..ROWS).map(|i| 1_000_000_000 + i),
+            ))
+        };
+        let default = assert_written_with(values(), "for", "fastlanes.for").await;
+        assert!(!has_child(&default, "blocked_references"));
+
+        let blocked = written_chunks_with(values(), "for", &[("blocked_encodings", "true")]).await;
+        assert!(has_child(&blocked, "blocked_references"));
     }
 
     #[tokio::test]
@@ -1143,87 +1149,29 @@ mod tests {
             .all(|part| is_family(part, "fastlanes.for")));
     }
 
+    /// The error building a strategy for `field` with the format options `pairs` fails with.
+    fn strategy_error(field: Field, pairs: &[(&str, &str)]) -> String {
+        let schema = Schema::new(vec![field]);
+        let config = VortexWriteConfig::parse(&options(pairs)).unwrap();
+        match config.build_strategy(&schema, &VortexSession::default()) {
+            Ok(_) => panic!("expected {pairs:?} to be rejected"),
+            Err(err) => err.to_string(),
+        }
+    }
+
     #[test]
     fn override_chain_step_must_be_unambiguous() {
-        let schema = Schema::new(vec![Field::new("c", DataType::Decimal128(16, 4), false)]);
-        let Err(err) = VortexWriteConfig::parse(&options(&[("encoding::c", "byte_parts/dict")]))
-            .unwrap()
-            .build_strategy(&schema, &VortexSession::default())
-        else {
-            panic!("expected an ambiguous chain step to be rejected");
-        };
-        assert!(err.to_string().contains("int.dict"), "{err}");
+        let field = Field::new("c", DataType::Decimal128(16, 4), false);
+        let err = strategy_error(field, &[("encoding::c", "byte_parts/dict")]);
+        assert!(err.contains("int.dict"), "{err}");
     }
 
     #[test]
     fn unknown_struct_field_is_rejected() {
         let inner = Field::new("a", DataType::Int64, false);
-        let schema = Schema::new(vec![Field::new(
-            "s",
-            DataType::Struct(vec![inner].into()),
-            false,
-        )]);
-        let Err(err) = VortexWriteConfig::parse(&options(&[("encoding::s.missing", "bitpacking")]))
-            .unwrap()
-            .build_strategy(&schema, &VortexSession::default())
-        else {
-            panic!("expected an unknown struct field to be rejected");
-        };
-        assert!(
-            err.to_string().contains("Unknown column 's.missing'"),
-            "{err}"
-        );
-    }
-
-    /// Whether any chunk has a child named `name`.
-    fn has_child(chunks: &[ArrayRef], name: &str) -> bool {
-        chunks.iter().any(|chunk| {
-            chunk
-                .named_children()
-                .iter()
-                .any(|(child, _)| child == name)
-        })
-    }
-
-    #[tokio::test]
-    async fn blocked_encodings_write_blocked_bit_packing() {
-        // Increasing values need a different bit width per block. Only blocked bit-packing stores
-        // one, with the offsets of its blocks as a child.
-        let values = || Arc::new(Int64Array::from_iter_values(0..ROWS));
-        let default = written_chunks(values(), "bitpacking").await;
-        assert!(!has_child(&default, "block_offsets"));
-
-        let blocked =
-            written_chunks_with(values(), "bitpacking", &[("blocked_encodings", "true")]).await;
-        assert!(has_child(&blocked, "block_offsets"));
-    }
-
-    #[tokio::test]
-    async fn blocked_encodings_write_blocked_for() {
-        // Drifting values favour a reference per chunk, which only blocked FoR stores.
-        let values = || {
-            Arc::new(Int64Array::from_iter_values(
-                (0..ROWS).map(|i| 1_000_000_000 + i),
-            ))
-        };
-        let default = written_chunks(values(), "for").await;
-        assert!(!has_child(&default, "blocked_references"));
-
-        let blocked = written_chunks_with(values(), "for", &[("blocked_encodings", "true")]).await;
-        assert!(has_child(&blocked, "blocked_references"));
-    }
-
-    #[test]
-    fn override_outside_enabled_editions_is_rejected() {
-        // Delta is registered but not in the default editions, so the writer would reject it.
-        let schema = Schema::new(vec![Field::new("c", DataType::Int64, false)]);
-        let Err(err) = VortexWriteConfig::parse(&options(&[("encoding::c", "delta")]))
-            .unwrap()
-            .build_strategy(&schema, &VortexSession::default())
-        else {
-            panic!("expected the delta override to be rejected");
-        };
-        assert!(err.to_string().contains("fastlanes.delta"), "{err}");
+        let field = Field::new("s", DataType::Struct(vec![inner].into()), false);
+        let err = strategy_error(field, &[("encoding::s.missing", "bitpacking")]);
+        assert!(err.contains("Unknown column 's.missing'"), "{err}");
     }
 
     #[test]
