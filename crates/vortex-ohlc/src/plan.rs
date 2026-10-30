@@ -52,7 +52,7 @@ pub fn ohlc_fields(scale: i8) -> Fields {
 
 /// The stored column that holds `column`: [`OHLC`] for a price in it, and `column` itself
 /// otherwise.
-pub fn stored_name<'a>(plan: &Plan, column: &'a str) -> &'a str {
+fn stored_name<'a>(plan: &Plan, column: &'a str) -> &'a str {
     match plan.get(column) {
         Some(Transform::Ohlc(_)) => OHLC,
         _ => column,
@@ -104,14 +104,21 @@ pub fn transforms_json(plan: &Plan, source: &Schema) -> serde_json::Value {
     serde_json::json!({"version": TRANSFORMS_VERSION, "columns": columns})
 }
 
-/// The plan a file records (see [`transforms_json`]), or `None` if `json` isn't a record of this
-/// version.
-pub fn plan_from_json(json: &serde_json::Value) -> Option<Plan> {
+/// The columns a record of a plan holds (see [`transforms_json`]), or `None` if `json` isn't a
+/// record of this version.
+fn recorded_columns(
+    json: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
     if json["version"].as_u64()? != TRANSFORMS_VERSION as u64 {
         return None;
     }
-    json["columns"]
-        .as_object()?
+    json["columns"].as_object()
+}
+
+/// The plan a file records (see [`transforms_json`]), or `None` if `json` isn't a record of this
+/// version.
+pub fn plan_from_json(json: &serde_json::Value) -> Option<Plan> {
+    recorded_columns(json)?
         .iter()
         .map(|(name, entry)| {
             let k = || u8::try_from(entry["k"].as_u64()?).ok();
@@ -126,7 +133,48 @@ pub fn plan_from_json(json: &serde_json::Value) -> Option<Plan> {
         .collect()
 }
 
-pub fn decimal_params(field: &Field) -> (u8, i8) {
+/// The schema of the source a file was written from, given `stored`, a schema with its columns as
+/// written (see [`planned_schema`]), and the record of its plan, `json` (see
+/// [`transforms_json`]): each rescaled column back at the type the record gives, and the four
+/// prices in the [`OHLC`] struct's place, in [`OHLC_PRICES`] order. Columns `stored` has as the
+/// source has them are kept, so the source's own schema gives itself. `None` unless `json` is a
+/// record of this version that fits `stored`.
+pub fn source_schema(json: &serde_json::Value, stored: &Schema) -> Option<Schema> {
+    let plan = plan_from_json(json)?;
+    let columns = recorded_columns(json)?;
+    let source_type =
+        |name: &str| -> Option<DataType> { columns.get(name)?["type"].as_str()?.parse().ok() };
+    let is_price = |name: &str| matches!(plan.get(name), Some(Transform::Ohlc(_)));
+    let mut fields = Vec::with_capacity(stored.fields().len() + OHLC_PRICES.len() - 1);
+    for field in stored.fields() {
+        let name = field.name().as_str();
+        match (plan.get(name), field.data_type()) {
+            (_, DataType::Struct(_)) if name == OHLC && OHLC_PRICES.iter().any(|p| is_price(p)) => {
+                for price in OHLC_PRICES {
+                    if !is_price(price) {
+                        return None;
+                    }
+                    fields.push(Field::new(price, source_type(price)?, field.is_nullable()));
+                }
+            }
+            (Some(Transform::Rescale(k)), &DataType::Decimal128(precision, scale)) => {
+                let source = source_type(name)?;
+                let field = field.as_ref().clone();
+                // Only a column stored rescaled, not one the table already has as the source has it.
+                fields.push(
+                    match source == DataType::Decimal128(precision, scale + *k as i8) {
+                        true => field.with_data_type(source),
+                        false => field,
+                    },
+                );
+            }
+            _ => fields.push(field.as_ref().clone()),
+        }
+    }
+    Some(Schema::new_with_metadata(fields, stored.metadata().clone()))
+}
+
+fn decimal_params(field: &Field) -> (u8, i8) {
     match field.data_type() {
         DataType::Decimal128(precision, scale) => (*precision, *scale),
         other => panic!("{} is {other}, not Decimal128", field.name()),
