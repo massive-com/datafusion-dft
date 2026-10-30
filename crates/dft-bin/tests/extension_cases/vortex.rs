@@ -22,41 +22,31 @@ use datafusion_dft::config::AppConfig;
 
 use crate::extension_cases::TestExecution;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_vortex_extension_loads() {
-    // This test verifies that the Vortex extension loads successfully
-    // and is registered with the ExecutionContext
-    let _test_exec = TestExecution::new().await;
-
-    // If we get here without panicking, the extension loaded successfully
-    // TODO: Add test data and query tests once we have sample .vortex files
-    // Example usage would be:
-    // let cwd = std::env::current_dir().unwrap();
-    // let path = Url::from_file_path(cwd.join("data/vortex/sample_data.vortex")).unwrap();
-    //
-    // let test_exec = test_exec
-    //     .with_setup(&format!(
-    //         "CREATE EXTERNAL TABLE v STORED AS VORTEX LOCATION '{}';",
-    //         path
-    //     ))
-    //     .await;
-    //
-    // let output = test_exec
-    //     .run_and_format("SELECT * FROM v LIMIT 10")
-    //     .await;
-}
-
-/// Write a small `.vortex` file into `dir` and return a query that filters it.
-async fn filter_query(test_exec: &TestExecution, dir: &std::path::Path) -> String {
-    let path = dir.join("ids.vortex");
-    let path = path.to_str().unwrap();
+/// Write ids 1 to 1000 to the `.vortex` file at `path`.
+async fn write_ids(test_exec: &TestExecution, path: &str) {
     test_exec
         .run(&format!(
             "COPY (SELECT value AS id FROM generate_series(1, 1000)) TO '{path}' STORED AS VORTEX"
         ))
         .await
         .unwrap();
+}
+
+/// Write a small `.vortex` file into `dir` and return a query that filters it.
+async fn filter_query(test_exec: &TestExecution, dir: &std::path::Path) -> String {
+    let path = dir.join("ids.vortex");
+    let path = path.to_str().unwrap();
+    write_ids(test_exec, path).await;
     format!("EXPLAIN SELECT count(*) FROM '{path}' WHERE id = 5")
+}
+
+/// Run `query`, a count of the ids above 990, and check it counts 10.
+async fn assert_counts_ten(test_exec: &TestExecution, query: &str) {
+    let output = test_exec.run_and_format(query).await;
+    assert!(
+        output.iter().any(|line| line == "| 10 |"),
+        "unexpected output: {output:?}"
+    );
 }
 
 /// Whether the filter in `explain` is evaluated by DataFusion rather than inside the Vortex scan.
@@ -99,12 +89,7 @@ async fn test_vortex_create_external_table() {
     let path = dir.path().join("ids.vortex");
     let path = path.to_str().unwrap();
     let test_exec = TestExecution::new().await;
-    test_exec
-        .run(&format!(
-            "COPY (SELECT value AS id FROM generate_series(1, 1000)) TO '{path}' STORED AS VORTEX"
-        ))
-        .await
-        .unwrap();
+    write_ids(&test_exec, path).await;
     test_exec
         .run(&format!(
             "CREATE EXTERNAL TABLE ids STORED AS VORTEX LOCATION '{path}'"
@@ -119,13 +104,7 @@ async fn test_vortex_create_external_table() {
         .await
         .unwrap();
 
-    let output = test_exec
-        .run_and_format("SELECT count(*) AS n FROM ids WHERE id > 990")
-        .await;
-    assert!(
-        output.iter().any(|line| line == "| 10 |"),
-        "unexpected output: {output:?}"
-    );
+    assert_counts_ten(&test_exec, "SELECT count(*) AS n FROM ids WHERE id > 990").await;
 
     // Table options reach the Vortex format.
     let explain = "EXPLAIN SELECT count(*) FROM {table} WHERE id = 5";
@@ -172,20 +151,10 @@ async fn test_vortex_local_scan_reports_reads() {
     let path = dir.path().join("local ids.vortex");
     let path = path.to_str().unwrap();
     let test_exec = TestExecution::new().await;
-    test_exec
-        .run(&format!(
-            "COPY (SELECT value AS id FROM generate_series(1, 1000)) TO '{path}' STORED AS VORTEX"
-        ))
-        .await
-        .unwrap();
+    write_ids(&test_exec, path).await;
 
     let query = format!("SELECT count(*) AS n FROM '{path}' WHERE id > 990");
-    let output = test_exec.run_and_format(&query).await;
-    assert!(
-        output.iter().any(|line| line == "| 10 |"),
-        "unexpected output: {output:?}"
-    );
-
+    assert_counts_ten(&test_exec, &query).await;
     assert!(bytes_scanned(&test_exec, &query).await > 0);
 }
 
@@ -215,19 +184,9 @@ async fn test_vortex_object_store_scan_reports_reads() {
         &url,
         Arc::new(datafusion::object_store::memory::InMemory::new()),
     );
-    test_exec
-        .run(
-            "COPY (SELECT value AS id FROM generate_series(1, 1000)) \
-             TO 'memory://bucket/ids.vortex' STORED AS VORTEX",
-        )
-        .await
-        .unwrap();
+    write_ids(&test_exec, "memory://bucket/ids.vortex").await;
 
     let query = "SELECT count(*) AS n FROM 'memory://bucket/ids.vortex' WHERE id > 990";
-    let output = test_exec.run_and_format(query).await;
-    assert!(
-        output.iter().any(|line| line == "| 10 |"),
-        "unexpected output: {output:?}"
-    );
+    assert_counts_ten(&test_exec, query).await;
     assert!(bytes_scanned(&test_exec, query).await > 0);
 }
