@@ -25,7 +25,6 @@ use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::session_state::SessionStateBuilder;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::prelude::SessionConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -130,17 +129,6 @@ impl DftSessionStateBuilder {
             .catalog_list()
             .get_or_insert_with(|| Arc::new(MemoryCatalogProviderList::new()))
             .register_catalog(name.to_string(), factory);
-    }
-
-    /// Add a physical optimizer rule that runs after DataFusion's default rules
-    pub fn add_physical_optimizer_rule(
-        &mut self,
-        rule: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
-    ) {
-        self.inner
-            .physical_optimizer_rules()
-            .get_or_insert_with(Vec::new)
-            .push(rule);
     }
 
     /// Return the current [`RuntimeEnv`], creating a default if it doesn't exist
