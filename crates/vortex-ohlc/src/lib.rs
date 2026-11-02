@@ -13,13 +13,12 @@
 //! - [`strategy`]: the write strategy that sends each column through it.
 //! - [`write`](mod@write): writing a table with a plan, recorded in the file, and reading the
 //!   plan back.
-//! - [`datafusion`]: reading the files from DataFusion with the source's schema: the planned
-//!   columns rebuilt, and filters on them pushed down into Vortex. Pruning scans on the zone maps,
-//!   the prices on their parts', is datafusion-vortex-prune's.
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
+//!
+//! Reading the files from DataFusion with the source's schema is datafusion-vortex-ohlc's, and
+//! pruning scans on the zone maps (the prices on their parts') is datafusion-vortex-prune's.
 
 pub mod compress;
-pub mod datafusion;
 pub mod edition;
 pub mod ohlc;
 pub mod plan;

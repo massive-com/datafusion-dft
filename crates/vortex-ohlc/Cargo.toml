@@ -6,25 +6,12 @@ version = "0.1.0"
 
 [dependencies]
 arrow.workspace = true
-datafusion.workspace = true
-futures.workspace = true
 num-traits.workspace = true
 serde_json.workspace = true
 vortex.workspace = true
-vortex-datafusion.workspace = true
 
 [dev-dependencies]
-criterion.workspace = true
-datafusion-vortex-prune = { path = "../datafusion-vortex-prune" }
-parquet = { features = ["snap", "zstd"], workspace = true }
-regex.workspace = true
-roaring = "0.11"
-tempfile.workspace = true
-tokio = { features = ["rt-multi-thread"], workspace = true }
+test-util = { path = "../test-util" }
 
 [lints]
 workspace = true
-
-[[bench]]
-harness = false
-name = "df"

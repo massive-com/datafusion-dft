@@ -1,7 +1,7 @@
 //! The four prices as Vortex expressions over the [`OHLC`] struct's parts ([`price`]), for a
 //! scan to filter on them without leaving Vortex ([`compare_price`]). Rebuilding them for the
-//! rows a scan returns is left to DataFusion (see [`OhlcPrice`](crate::datafusion::OhlcPrice)),
-//! which is quicker.
+//! rows a scan returns is left to DataFusion (see datafusion-vortex-ohlc's `OhlcPrice`), which is
+//! quicker.
 //!
 //! Vortex only adds and compares decimals of one type, and a sum is one digit wider than its
 //! operands, so each operand is cast to the precision its place needs: the parts start at their
@@ -74,11 +74,7 @@ pub fn compare_price(
 
 /// The decimal `unscaled / 10^scale` as a literal of type `decimal`, or `None` if that type
 /// can't hold it exactly.
-pub(crate) fn decimal_literal(
-    unscaled: i128,
-    scale: i8,
-    decimal: DecimalDType,
-) -> Option<Expression> {
+pub fn decimal_literal(unscaled: i128, scale: i8, decimal: DecimalDType) -> Option<Expression> {
     let shift = decimal.scale() as i32 - scale as i32;
     let factor = 10i128.checked_pow(shift.unsigned_abs())?;
     let value = if shift >= 0 {

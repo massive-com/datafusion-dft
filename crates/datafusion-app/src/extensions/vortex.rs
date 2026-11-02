@@ -19,12 +19,12 @@
 
 use crate::config::ExecutionConfig;
 use crate::extensions::{DftSessionStateBuilder, Extension};
+use datafusion_vortex_ohlc::vortex_format_factory;
 use datafusion_vortex_prune::{PrunedTableFactory, ZonePruner};
 use std::sync::Arc;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexTableOptions;
-use vortex_ohlc::datafusion::vortex_format_factory;
 
 #[derive(Debug, Default)]
 pub struct VortexExtension {}
