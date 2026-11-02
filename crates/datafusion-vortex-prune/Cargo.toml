@@ -1,5 +1,5 @@
 [package]
-description = "Vortex scans in DataFusion pruned to the zones their filter can match before they start, as Atlas prunes its scans"
+description = "Vortex scans in DataFusion pruned to the zones their filter can match before they start"
 edition.workspace = true
 name = "datafusion-vortex-prune"
 version = "0.1.0"

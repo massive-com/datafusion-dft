@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Vortex scans that skip the zones their filter can't match, set up as Atlas sets up its scans:
-//! a table turns a scan's filters into one physical predicate and hands it, with the scan's
-//! config, to a factory that builds the scan ([`VortexExecFactory`], after Atlas's), which prunes
-//! the config's files before the format plans it.
+//! Vortex scans that skip the zones their filter can't match: a table turns a scan's filters into
+//! one physical predicate and hands it, with the scan's config, to a factory that builds the scan
+//! ([`VortexExecFactory`]), which prunes the config's files before the format plans it.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -53,19 +52,18 @@ use vortex_ohlc::datafusion::source_table;
 
 use crate::ZonePruner;
 
-/// Builds Vortex scans as Atlas's `VortexExecFactory` does, from a scan's config and filter: the
-/// config's files read through `readers` and, given a [`ZonePruner`] (see
-/// [`with_pruner`](Self::with_pruner)), pruned by it as Atlas's default factory prunes file
-/// groups with its index, the zone maps read through `readers` too; then planned by the format.
+/// Builds Vortex scans from a scan's config and filter: the config's files read through `readers`
+/// and, given a [`ZonePruner`] (see [`with_pruner`](Self::with_pruner)), pruned by it, the zone
+/// maps read through `readers` too; then planned by the format.
 ///
-/// Atlas's own factory would prune its scans the same way with one line at the top of its
-/// `create_execution_plan`, given a `ZonePruner` kept next to its reader factory:
+/// A factory of Vortex scans of its own prunes them the same way with one line before it plans a
+/// scan, given a `ZonePruner` kept next to its reader factory:
 ///
 /// ```ignore
 /// let file_scan_config = self.pruner.prune(file_scan_config, filter, &*self.reader_factory).await?;
 /// ```
 ///
-/// Atlas pushes the filter into the scan itself, so it can keep doing that after this line.
+/// It can still push the filter into the scan itself after this line.
 #[derive(Debug)]
 pub struct VortexExecFactory {
     readers: Arc<dyn VortexReaderFactory>,
@@ -153,8 +151,7 @@ impl VortexReaderFactory for LocalFileReaders {
 }
 
 /// A listing table over Vortex files whose scans a [`VortexExecFactory`] builds, given each scan's
-/// filters, as Atlas's `FileScanTable` hands its scans to its factory. Everything else is
-/// `inner`'s.
+/// filters. Everything else is `inner`'s.
 #[derive(Debug)]
 pub struct PrunedTable {
     inner: Arc<ListingTable>,

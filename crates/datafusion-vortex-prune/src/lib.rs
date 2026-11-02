@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Vortex scans in DataFusion that skip the zones their filter can't match before they start,
-//! set up as Atlas sets up its Vortex scans:
+//! Vortex scans in DataFusion that skip the zones their filter can't match before they start:
 //!
 //! - [`ZonePruner`] gives each file of a scan the zones a filter can match, from the file's zone
 //!   maps, read once and kept.
-//! - A [`VortexExecFactory`] builds scans with it, as Atlas's factory of the same name builds
-//!   its Vortex scans, and a [`PrunedTable`] has one build its scans. [`PrunedTable::over`]
-//!   puts it all together for a listing table over Vortex files.
+//! - A [`VortexExecFactory`] builds scans with it, and a [`PrunedTable`] has one build its scans.
+//!   [`PrunedTable::over`] puts it all together for a listing table over Vortex files.
 //! - [`PrunedTableFactory`] and [`enable_url_table`] make a DataFusion session's Vortex tables
 //!   pruned ones, those created with `CREATE EXTERNAL TABLE` and those queried by path.
 //!
