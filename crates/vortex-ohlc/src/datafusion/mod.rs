@@ -12,13 +12,8 @@
 //!   DataFusion ([`OhlcPrice`], [`Rescaled`]), which is quicker than Vortex's expressions for it.
 //!
 //! [`vortex_format_factory`] makes formats that read the files this way, given a table with the
-//! source's schema and a [`BarsAdapterFactory`].
-//!
-//! [`ZonePruner`] prunes a Vortex scan before it starts, so the scan doesn't start the zones its
-//! filter rules out. A [`VortexExecFactory`] builds scans with it, and a [`PrunedTable`] has one
-//! build its scans.
-//! [`PrunedTable::over`] puts it all together for a listing table over Vortex files, with the
-//! source's schema and a [`BarsAdapterFactory`] from the plan the files record.
+//! source's schema and a [`BarsAdapterFactory`]. [`source_table`] makes that table from a listing
+//! table over the files, with the plan the first of them records.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -48,11 +43,9 @@ use vortex_datafusion::VortexFormatFactory;
 
 use crate::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
-mod prune;
-mod table;
+mod source;
 use crate::prices::{compare_price, decimal_literal};
-pub use prune::{ZonePruner, DEFAULT_CACHE_BYTES};
-pub use table::{reader_factory, PrunedTable, VortexExecFactory};
+pub use source::source_table;
 
 /// A [`VortexFormatFactory`] on `session` whose formats hand Vortex what
 /// [`BarsExpressionConverter`] converts; their options are the DataFusion session's `vortex` ones,

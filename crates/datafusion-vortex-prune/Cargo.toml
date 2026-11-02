@@ -1,0 +1,24 @@
+[package]
+description = "Vortex scans in DataFusion pruned to the zones their filter can match before they start"
+edition.workspace = true
+name = "datafusion-vortex-prune"
+version = "0.1.0"
+
+[dependencies]
+arrow.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+datafusion-session.workspace = true
+futures.workspace = true
+moka.workspace = true
+roaring = "0.11"
+vortex.workspace = true
+vortex-datafusion.workspace = true
+vortex-ohlc = { path = "../vortex-ohlc" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

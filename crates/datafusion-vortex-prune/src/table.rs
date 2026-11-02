@@ -1,19 +1,35 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 //! Vortex scans that skip the zones their filter can't match: a table turns a scan's filters into
 //! one physical predicate and hands it, with the scan's config, to a factory that builds the scan
 //! ([`VortexExecFactory`]), which prunes the config's files before the format plans it.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
 use datafusion::common::{
     internal_datafusion_err, Constraints, DFSchema, DataFusionError, Result, Statistics,
 };
 use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::listing::{ListingTable, ListingTableConfig, PartitionedFile};
+use datafusion::datasource::listing::{ListingTable, PartitionedFile};
 use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::TableType;
@@ -25,18 +41,16 @@ use datafusion::object_store::local::LocalFileSystem;
 use datafusion::object_store::ObjectStore;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
-use futures::StreamExt;
 use vortex::array::memory::MemorySessionExt;
-use vortex::file::OpenOptionsSessionExt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::std_file::FileReadAt;
 use vortex::io::VortexReadAt;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
 use vortex_datafusion::VortexSource;
+use vortex_ohlc::datafusion::source_table;
 
-use super::{BarsAdapterFactory, ZonePruner};
-use crate::write::file_source_schema;
+use crate::ZonePruner;
 
 /// Builds Vortex scans from a scan's config and filter: the config's files read through `readers`
 /// and, given a [`ZonePruner`] (see [`with_pruner`](Self::with_pruner)), pruned by it, the zone
@@ -136,72 +150,6 @@ impl VortexReaderFactory for LocalFileReaders {
     }
 }
 
-/// `listing`, a listing table over Vortex files, as a table of the source they were written from,
-/// if the first of them records a plan (see [`file_source_schema`]): with the source's schema
-/// (columns the table already has as the source has them are kept), and every file read through a
-/// [`BarsAdapterFactory`]. Its definition, constraints and column defaults are kept, and its files'
-/// statistics are kept in `state`'s cache, as DataFusion's `CREATE EXTERNAL TABLE` keeps them.
-/// The first file is opened on `session`, through `readers`. `None` if the table has no files, or
-/// the first records no plan that fits the table.
-async fn source_table(
-    listing: &ListingTable,
-    state: &dyn Session,
-    readers: &dyn VortexReaderFactory,
-    session: &VortexSession,
-) -> Result<Option<ListingTable>> {
-    let Some(url) = listing.table_paths().first() else {
-        return Ok(None);
-    };
-    let store = state.runtime_env().object_store(url.object_store())?;
-    let extension = &listing.options().file_extension;
-    let first = url
-        .list_all_files(state, store.as_ref(), extension)
-        .await?
-        .next()
-        .await
-        .transpose()?;
-    let Some(first) = first else {
-        return Ok(None);
-    };
-    let file = PartitionedFile::from(first);
-    let reader = readers.create_reader(&file, session)?;
-    let file = session
-        .open_options()
-        .include_metadata()
-        .with_file_size(file.object_meta.size)
-        .open_read(reader)
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-    // The table's schema has the partition columns after the files'.
-    let table = listing.schema();
-    let partitions = listing.options().table_partition_cols.len();
-    let files = &table.fields()[..table.fields().len() - partitions];
-    let stored = Schema::new_with_metadata(files.to_vec(), table.metadata().clone());
-    let Some(source) = file_source_schema(&file, &stored) else {
-        return Ok(None);
-    };
-    let column_defaults: HashMap<String, Expr> = table
-        .fields()
-        .iter()
-        .filter_map(|field| {
-            let default = listing.get_column_default(field.name())?;
-            Some((field.name().clone(), default.clone()))
-        })
-        .collect();
-    let config = ListingTableConfig::new_with_multi_paths(listing.table_paths().clone())
-        .with_listing_options(listing.options().clone())
-        .with_schema(Arc::new(source))
-        .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
-    let cache = state.runtime_env().cache_manager.get_file_statistic_cache();
-    Ok(Some(
-        ListingTable::try_new(config)?
-            .with_cache(cache)
-            .with_definition(listing.get_table_definition().map(str::to_string))
-            .with_constraints(listing.constraints().cloned().unwrap_or_default())
-            .with_column_defaults(column_defaults),
-    ))
-}
-
 /// A listing table over Vortex files whose scans a [`VortexExecFactory`] builds, given each scan's
 /// filters. Everything else is `inner`'s.
 #[derive(Debug)]
@@ -216,8 +164,8 @@ impl PrunedTable {
     }
 
     /// `listing`, a listing table over Vortex files, read as the source they were written from
-    /// where the first of them records a plan (the source's schema, every file read through a
-    /// [`BarsAdapterFactory`]), its scans pruned by `pruner` before they start. Its files, and
+    /// where the first of them records a vortex-ohlc plan (see [`source_table`]), its scans
+    /// pruned by `pruner` before they start. Its files, and
     /// their zone maps, are read as [`reader_factory`] picks for its object store.
     pub async fn over(
         listing: &ListingTable,

@@ -1,7 +1,7 @@
 //! The write strategy: Vortex's default, with every decimal column, the integer columns the plan
 //! packs ([`Transform::Packed`]) and each part of the [`OHLC`] struct compressed by
 //! [`compress_chunk`]. Each part of the OHLC struct is a column of its own with its own zone map,
-//! so a scan can prune on the prices (see [`crate::datafusion::ZonePruner`]).
+//! so a scan can prune on the prices (see datafusion-vortex-prune's `ZonePruner`).
 
 use std::sync::Arc;
 
