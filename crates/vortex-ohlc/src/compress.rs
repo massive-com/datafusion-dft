@@ -61,7 +61,7 @@ pub fn compress_chunk(
 }
 
 /// FoR + FastLanes over an integer array: Vortex's blocked FoR + BitPacked (a reference and a
-/// bit width per [`BLOCK`] values) where there is more than one block, or plain FoR + FastLanes
+/// bit width per 1,024 values) where there is more than one block, or plain FoR + FastLanes
 /// (one of each), whichever is smaller.
 pub fn pack_ints(ints: PrimitiveArray, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
     let blocked = match ints.len() > BLOCK {
