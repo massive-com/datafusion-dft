@@ -46,6 +46,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use datafusion_vortex_prune::{reader_factory, PrunedTable, VortexExecFactory, ZonePruner};
 use futures::StreamExt;
 use roaring::RoaringTreemap;
 use tokio::runtime::Runtime;
@@ -53,10 +54,7 @@ use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
-use vortex_ohlc::datafusion::{
-    reader_factory, vortex_format_factory, BarsAdapterFactory, PrunedTable, VortexExecFactory,
-    ZonePruner,
-};
+use vortex_ohlc::datafusion::{vortex_format_factory, BarsAdapterFactory};
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
 use common::needle::{matching_rows, needles, Needle, Op, Value};

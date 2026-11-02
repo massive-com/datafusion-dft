@@ -2601,8 +2601,8 @@ dependencies = [
  "datafusion-functions-parquet",
  "datafusion-functions-rocksdb",
  "datafusion-net",
- "datafusion-session",
  "datafusion-udfs-wasm",
+ "datafusion-vortex-prune",
  "deltalake",
  "directories",
  "futures",
@@ -3455,6 +3455,24 @@ dependencies = [
  "tokio",
  "wasi-common",
  "wasmtime",
+]
+
+[[package]]
+name = "datafusion-vortex-prune"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "datafusion-session",
+ "futures",
+ "moka",
+ "roaring",
+ "tempfile",
+ "tokio",
+ "vortex",
+ "vortex-datafusion",
+ "vortex-ohlc",
 ]
 
 [[package]]
@@ -9844,11 +9862,10 @@ name = "vortex-ohlc"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "async-trait",
  "criterion",
  "datafusion",
+ "datafusion-vortex-prune",
  "futures",
- "moka",
  "num-traits",
  "parquet",
  "regex",

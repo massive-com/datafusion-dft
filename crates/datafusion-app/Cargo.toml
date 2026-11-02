@@ -27,7 +27,6 @@ bytes.workspace = true
 color-eyre.workspace = true
 datafusion.workspace = true
 datafusion-functions-json = { optional = true, workspace = true }
-datafusion-session = { optional = true, workspace = true }
 deltalake = { features = [
   "datafusion",
   "s3",
@@ -59,6 +58,7 @@ tonic = { optional = true, workspace = true }
 url = { optional = true, workspace = true }
 vortex = { features = ["object_store"], optional = true, workspace = true }
 vortex-datafusion = { optional = true, workspace = true }
+datafusion-vortex-prune = { optional = true, path = "../datafusion-vortex-prune" }
 vortex-ohlc = { optional = true, path = "../vortex-ohlc" }
 
 [dev-dependencies]
@@ -79,7 +79,7 @@ observability = ["dep:metrics", "dep:tokio-metrics"]
 s3 = ["object_store/aws", "url"]
 udfs-wasm = ["dep:datafusion-udfs-wasm"]
 vortex = [
-  "dep:datafusion-session",
+  "dep:datafusion-vortex-prune",
   "dep:vortex",
   "dep:vortex-datafusion",
   "dep:vortex-ohlc",

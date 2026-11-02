@@ -6,20 +6,19 @@ version = "0.1.0"
 
 [dependencies]
 arrow.workspace = true
-async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
-moka.workspace = true
 num-traits.workspace = true
-roaring = "0.11"
 serde_json.workspace = true
 vortex.workspace = true
 vortex-datafusion.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+datafusion-vortex-prune = { path = "../datafusion-vortex-prune" }
 parquet = { features = ["snap", "zstd"], workspace = true }
 regex.workspace = true
+roaring = "0.11"
 tempfile.workspace = true
 tokio = { features = ["rt-multi-thread"], workspace = true }
 

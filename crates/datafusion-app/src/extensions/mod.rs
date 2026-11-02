@@ -38,7 +38,7 @@ mod vortex;
 
 pub use builder::DftSessionStateBuilder;
 #[cfg(feature = "vortex")]
-pub(crate) use vortex::enable_url_table;
+pub(crate) use datafusion_vortex_prune::enable_url_table;
 
 #[async_trait::async_trait]
 pub trait Extension: Debug {
