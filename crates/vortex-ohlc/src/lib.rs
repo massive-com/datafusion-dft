@@ -11,7 +11,8 @@
 //!   within a scan.
 //! - [`compress`]: FoR + FastLanes for decimal and integer chunks, under DecimalByteParts.
 //! - [`strategy`]: the write strategy that sends each column through it.
-//! - [`write`]: writing a table with a plan, recorded in the file, and reading the plan back.
+//! - [`write`](mod@write): writing a table with a plan, recorded in the file, and reading the
+//!   plan back.
 //! - [`datafusion`]: reading the files from DataFusion with the source's schema: the planned
 //!   columns rebuilt, and filters on them pushed down into Vortex. Pruning scans on the zone maps,
 //!   the prices on their parts', is datafusion-vortex-prune's.
