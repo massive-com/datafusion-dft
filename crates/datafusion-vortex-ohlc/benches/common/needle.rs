@@ -8,6 +8,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::physical_expr::simplifier::PhysicalExprSimplifier;
 use datafusion::physical_expr::{split_conjunction, PhysicalExpr};
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
+use datafusion_vortex_ohlc::{BarsAdapterFactory, BarsExpressionConverter};
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::VortexSessionExecute;
 use vortex::arrow::ArrowSessionExt;
@@ -17,7 +18,6 @@ use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::convert::ExpressionConverter;
-use vortex_ohlc::datafusion::{BarsAdapterFactory, BarsExpressionConverter};
 
 use crate::common::data::new_session;
 

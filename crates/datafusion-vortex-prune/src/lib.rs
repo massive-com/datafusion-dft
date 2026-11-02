@@ -25,7 +25,7 @@
 //!   pruned ones, those created with `CREATE EXTERNAL TABLE` and those queried by path.
 //!
 //! Files written by vortex-ohlc are read as the source they were written from (see
-//! `vortex_ohlc::datafusion::source_table`), and their prices pruned on the bounds of the parts
+//! `datafusion_vortex_ohlc::source_table`), and their prices pruned on the bounds of the parts
 //! they are stored as.
 
 mod prune;

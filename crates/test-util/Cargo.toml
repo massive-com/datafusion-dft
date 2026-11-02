@@ -1,0 +1,14 @@
+[package]
+description = "The table of bars vortex-ohlc's tests and datafusion-vortex-ohlc's write and read back"
+edition.workspace = true
+name = "test-util"
+publish = false
+version = "0.1.0"
+
+[dependencies]
+arrow.workspace = true
+vortex.workspace = true
+vortex-ohlc = { path = "../vortex-ohlc" }
+
+[lints]
+workspace = true

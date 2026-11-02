@@ -41,6 +41,7 @@ use datafusion::object_store::local::LocalFileSystem;
 use datafusion::object_store::ObjectStore;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_vortex_ohlc::source_table;
 use vortex::array::memory::MemorySessionExt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::std_file::FileReadAt;
@@ -48,7 +49,6 @@ use vortex::io::VortexReadAt;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
 use vortex_datafusion::VortexSource;
-use vortex_ohlc::datafusion::source_table;
 
 use crate::ZonePruner;
 

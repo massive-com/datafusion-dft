@@ -2602,6 +2602,7 @@ dependencies = [
  "datafusion-functions-rocksdb",
  "datafusion-net",
  "datafusion-udfs-wasm",
+ "datafusion-vortex-ohlc",
  "datafusion-vortex-prune",
  "deltalake",
  "directories",
@@ -2626,7 +2627,6 @@ dependencies = [
  "url",
  "vortex",
  "vortex-datafusion",
- "vortex-ohlc",
 ]
 
 [[package]]
@@ -3458,6 +3458,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-vortex-ohlc"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "criterion",
+ "datafusion",
+ "datafusion-vortex-prune",
+ "futures",
+ "parquet",
+ "regex",
+ "roaring",
+ "tempfile",
+ "test-util",
+ "tokio",
+ "vortex",
+ "vortex-datafusion",
+ "vortex-ohlc",
+]
+
+[[package]]
 name = "datafusion-vortex-prune"
 version = "0.1.0"
 dependencies = [
@@ -3465,6 +3485,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "datafusion-session",
+ "datafusion-vortex-ohlc",
  "futures",
  "moka",
  "roaring",
@@ -8569,6 +8590,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-util"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "vortex",
+ "vortex-ohlc",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9862,19 +9892,10 @@ name = "vortex-ohlc"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "criterion",
- "datafusion",
- "datafusion-vortex-prune",
- "futures",
  "num-traits",
- "parquet",
- "regex",
- "roaring",
  "serde_json",
- "tempfile",
- "tokio",
+ "test-util",
  "vortex",
- "vortex-datafusion",
 ]
 
 [[package]]

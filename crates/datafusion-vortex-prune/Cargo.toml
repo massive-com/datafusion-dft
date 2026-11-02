@@ -9,6 +9,7 @@ arrow.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-session.workspace = true
+datafusion-vortex-ohlc = { path = "../datafusion-vortex-ohlc" }
 futures.workspace = true
 moka.workspace = true
 roaring = "0.11"

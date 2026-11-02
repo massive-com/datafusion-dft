@@ -2,7 +2,7 @@
 //! the Parquet v2 file (DataFusion's Parquet reader with its defaults, and with
 //! `pushdown_filters`), and against one over the Vortex file with the Parquet table's schema,
 //! its columns rebuilt and its price filters pushed down into Vortex (see
-//! `vortex_ohlc::datafusion`). Each runs on one partition and on one per core.
+//! `datafusion_vortex_ohlc`). Each runs on one partition and on one per core.
 //!
 //! A needle selects every column of the rows it matches; each of its terms compares a column
 //! with a literal of the column's own type, so no format's filter is held back by a cast. The
@@ -46,6 +46,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use datafusion_vortex_ohlc::{vortex_format_factory, BarsAdapterFactory};
 use datafusion_vortex_prune::{reader_factory, PrunedTable, VortexExecFactory, ZonePruner};
 use futures::StreamExt;
 use roaring::RoaringTreemap;
@@ -54,7 +55,6 @@ use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
-use vortex_ohlc::datafusion::{vortex_format_factory, BarsAdapterFactory};
 use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
 
 use common::needle::{matching_rows, needles, Needle, Op, Value};
