@@ -3468,7 +3468,6 @@ dependencies = [
  "futures",
  "parquet",
  "regex",
- "roaring",
  "tempfile",
  "test-util",
  "tokio",

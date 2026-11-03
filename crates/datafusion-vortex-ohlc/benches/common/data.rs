@@ -21,7 +21,6 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::plan::Transform;
 use vortex_ohlc::profile::{plan, DecimalProfiler};
 use vortex_ohlc::write::{stored_arrays, write_options, DEFAULT_ROW_BLOCK};
 
@@ -43,53 +42,33 @@ const VORTEX_VERSION: u32 = 6;
 const CONVERT_BATCH_SIZE: usize = 65_536;
 
 pub struct Files {
-    pub source: PathBuf,
     pub parquet: PathBuf,
     pub vortex: PathBuf,
-    /// The same, without the OHLC struct: the four prices rescaled like any other decimal
-    /// column.
-    pub vortex_prices: PathBuf,
 }
 
-/// A session with Vortex's defaults on `runtime`, which runs everything on the calling thread,
-/// able to write the files (see [`vortex_ohlc::edition`]).
-pub fn new_session(runtime: &CurrentThreadRuntime) -> VortexSession {
-    let session = VortexSession::default().with_handle(runtime.handle());
-    vortex_ohlc::edition::enable(&session).unwrap();
-    session
-}
-
-/// The source, and the files written from it (see the module docs), writing those that are
-/// missing.
+/// The files written from the source (see the module docs), writing those that are missing.
 pub fn files() -> Files {
     let source = std::env::var_os(SOURCE).unwrap_or_else(|| panic!("set {SOURCE} to the source"));
-    let source = PathBuf::from(source);
+    let source = Path::new(&source);
     assert!(source.exists(), "no source at {}", source.display());
     let dir = Path::new(DATA_DIR);
     std::fs::create_dir_all(dir).unwrap();
     let files = Files {
         parquet: dir.join("v2.parquet"),
         vortex: dir.join(format!("upstream-{VORTEX_VERSION}.vortex")),
-        vortex_prices: dir.join(format!("upstream-prices-{VORTEX_VERSION}.vortex")),
-        source,
     };
     // Each file is written under a temporary name and renamed once complete, so an interrupted
     // write isn't taken for a finished one.
-    let tmp = |path: &Path| path.with_extension("tmp");
-    if !files.parquet.exists() {
-        eprintln!("writing {}", files.parquet.display());
-        write_parquet_v2(&files.source, &tmp(&files.parquet));
-        std::fs::rename(tmp(&files.parquet), &files.parquet).unwrap();
-    }
-    let runtime = CurrentThreadRuntime::new();
-    let session = new_session(&runtime);
-    for (path, ohlc) in [(&files.vortex, true), (&files.vortex_prices, false)] {
+    let ensure = |path: &Path, write: fn(&Path, &Path)| {
         if !path.exists() {
             eprintln!("writing {}", path.display());
-            write_vortex(&runtime, &session, &files.source, &tmp(path), ohlc);
-            std::fs::rename(tmp(path), path).unwrap();
+            let tmp = path.with_extension("tmp");
+            write(source, &tmp);
+            std::fs::rename(&tmp, path).unwrap();
         }
-    }
+    };
+    ensure(&files.parquet, write_parquet_v2);
+    ensure(&files.vortex, write_vortex);
     files
 }
 
@@ -116,15 +95,13 @@ fn write_parquet_v2(source: &Path, dest: &Path) {
     writer.close().unwrap();
 }
 
-/// Profile the source, then write it with the plan that follows, recorded in the file, with the
-/// prices in the OHLC struct or each rescaled on its own (`ohlc`).
-fn write_vortex(
-    runtime: &CurrentThreadRuntime,
-    session: &VortexSession,
-    source: &Path,
-    dest: &Path,
-    ohlc: bool,
-) {
+/// Profile the source, then write it with the plan that follows, recorded in the file.
+fn write_vortex(source: &Path, dest: &Path) {
+    // Vortex's defaults, able to write the file (see `vortex_ohlc::edition`), on a runtime that
+    // runs everything on this thread.
+    let runtime = CurrentThreadRuntime::new();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    vortex_ohlc::edition::enable(&session).unwrap();
     let batches = || {
         open_parquet(source)
             .with_batch_size(CONVERT_BATCH_SIZE)
@@ -136,19 +113,12 @@ fn write_vortex(
     for batch in batches() {
         profiler.add(&batch.unwrap());
     }
-    let mut plan = plan(&profiler.finish());
-    if !ohlc {
-        for transform in plan.values_mut() {
-            if let Transform::Ohlc(k) = *transform {
-                *transform = Transform::Rescale(k);
-            }
-        }
-    }
+    let plan = plan(&profiler.finish());
     eprintln!("  plan: {plan:?}");
 
-    let arrays = stored_arrays(session, &plan, &schema, batches().map(|b| b.unwrap())).unwrap();
-    write_options(session, &schema, &plan, DEFAULT_ROW_BLOCK)
-        .blocking(runtime)
+    let arrays = stored_arrays(&session, &plan, &schema, batches().map(|b| b.unwrap())).unwrap();
+    write_options(&session, &schema, &plan, DEFAULT_ROW_BLOCK)
+        .blocking(&runtime)
         .write(BufWriter::new(File::create(dest).unwrap()), arrays)
         .unwrap();
 }

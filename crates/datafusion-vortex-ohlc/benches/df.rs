@@ -2,7 +2,8 @@
 //! the Parquet v2 file (DataFusion's Parquet reader with its defaults, and with
 //! `pushdown_filters`), and against one over the Vortex file with the Parquet table's schema,
 //! its columns rebuilt and its price filters pushed down into Vortex (see
-//! `datafusion_vortex_ohlc`). Each runs on one partition and on one per core.
+//! `datafusion_vortex_ohlc`), with and without a `ZonePruner`. Each runs on one partition and on
+//! one per core.
 //!
 //! A needle selects every column of the rows it matches; each of its terms compares a column
 //! with a literal of the column's own type, so no format's filter is held back by a cast. The
@@ -32,32 +33,25 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::row::{RowConverter, SortField};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
-use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
+use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::execution::SessionStateBuilder;
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_vortex_ohlc::{vortex_format_factory, BarsAdapterFactory};
 use datafusion_vortex_prune::{reader_factory, PrunedTable, VortexExecFactory, ZonePruner};
 use futures::StreamExt;
-use roaring::RoaringTreemap;
 use tokio::runtime::Runtime;
 use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::{VortexAccessPlan, VortexSource};
-use vortex_ohlc::write::DEFAULT_ROW_BLOCK;
+use vortex_datafusion::VortexAccessPlan;
 
-use common::needle::{matching_rows, needles, Needle, Op, Value};
+use common::needle::{needles, Needle, Op, Value};
 use common::{data, Selection};
 
 /// The table every query reads.
@@ -74,22 +68,14 @@ enum Reader {
     Vortex,
     /// The Vortex file, pruned on Vortex's own zone maps as the scan runs.
     VortexUnpruned,
-    /// The file without the OHLC struct, the prices rescaled on their own, its scans pruned by a
-    /// `ZonePruner`.
-    VortexPrices,
-    /// Vortex with each needle's scan given exactly the zones that hold a match before it
-    /// starts (see [`IdealSelection`]): the best that pruning before the scan can do.
-    VortexIdeal,
 }
 
 impl Reader {
-    const ALL: [Reader; 6] = [
+    const ALL: [Reader; 4] = [
         Reader::Parquet,
         Reader::ParquetPushdown,
         Reader::Vortex,
         Reader::VortexUnpruned,
-        Reader::VortexPrices,
-        Reader::VortexIdeal,
     ];
 
     fn name(self) -> &'static str {
@@ -98,34 +84,14 @@ impl Reader {
             Reader::ParquetPushdown => "parquet pushdown",
             Reader::Vortex => "vortex",
             Reader::VortexUnpruned => "vortex unpruned",
-            Reader::VortexPrices => "vortex prices",
-            Reader::VortexIdeal => "vortex ideal",
         }
     }
-
-    /// For a Vortex reader, the file it reads and whether a `ZonePruner` prunes its scans.
-    fn vortex(self) -> Option<(VortexFile, bool)> {
-        Some(match self {
-            Reader::Parquet | Reader::ParquetPushdown => return None,
-            Reader::Vortex => (VortexFile::Ohlc, true),
-            Reader::VortexUnpruned | Reader::VortexIdeal => (VortexFile::Ohlc, false),
-            Reader::VortexPrices => (VortexFile::Prices, true),
-        })
-    }
-}
-
-/// The Vortex files (see `common::data`).
-#[derive(Clone, Copy)]
-enum VortexFile {
-    Ohlc,
-    Prices,
 }
 
 /// The files, and the Parquet table's schema, which the Vortex table takes too.
 struct Tables {
     parquet: String,
     vortex: String,
-    vortex_prices: String,
     schema: SchemaRef,
 }
 
@@ -134,7 +100,6 @@ impl Tables {
         let files = data::files();
         let parquet = files.parquet.to_str().unwrap().to_string();
         let vortex = files.vortex.to_str().unwrap().to_string();
-        let vortex_prices = files.vortex_prices.to_str().unwrap().to_string();
         let ctx = SessionContext::new();
         runtime
             .block_on(ctx.register_parquet(TABLE, &parquet, ParquetReadOptions::default()))
@@ -143,149 +108,44 @@ impl Tables {
         Self {
             parquet,
             vortex,
-            vortex_prices,
             schema,
         }
     }
 
     /// A session on `partitions` partitions with [`TABLE`] read by `reader`.
-    fn context(
-        &self,
-        runtime: &Runtime,
-        reader: Reader,
-        partitions: usize,
-        ideal: Option<&ScanSelection>,
-    ) -> SessionContext {
+    fn context(&self, runtime: &Runtime, reader: Reader, partitions: usize) -> SessionContext {
         let mut config = SessionConfig::new().with_target_partitions(partitions);
         if reader == Reader::ParquetPushdown {
             config.options_mut().execution.parquet.pushdown_filters = true;
         }
-        let mut ctx = SessionContext::new_with_config(config);
-        match reader {
-            Reader::Parquet | Reader::ParquetPushdown => runtime
-                .block_on(ctx.register_parquet(TABLE, &self.parquet, ParquetReadOptions::default()))
-                .unwrap(),
-            _ => {
-                let (file, pruned) = reader.vortex().unwrap();
-                let path = match file {
-                    VortexFile::Ohlc => &self.vortex,
-                    VortexFile::Prices => &self.vortex_prices,
-                };
-                // Vortex does its I/O on the runtime it finds when the session is made.
-                let _runtime = runtime.enter();
-                let session = VortexSession::default();
-                let pruner = Arc::new(ZonePruner::new(session.clone()));
-                let options = ListingOptions::new(vortex_format_factory(session).default())
-                    .with_file_extension(".vortex");
-                let config = ListingTableConfig::new(ListingTableUrl::parse(path).unwrap())
-                    .with_listing_options(options)
-                    .with_schema(Arc::clone(&self.schema))
-                    .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
-                let listing = Arc::new(ListingTable::try_new(config).unwrap());
-                // The scans read the file directly, as dft reads a local file.
-                let url = ObjectStoreUrl::local_filesystem();
-                let store = ctx.runtime_env().object_store(&url).unwrap();
-                let mut factory = VortexExecFactory::new(reader_factory(&url, store));
-                if pruned {
-                    factory = factory.with_pruner(pruner);
-                }
-                ctx.register_table(TABLE, Arc::new(PrunedTable::new(listing, factory)))
-                    .unwrap();
-                if let (Reader::VortexIdeal, Some(ideal)) = (reader, ideal) {
-                    let state = SessionStateBuilder::new_from_existing(ctx.state())
-                        .with_physical_optimizer_rule(Arc::new(IdealSelection(ideal.clone())))
-                        .build();
-                    ctx = SessionContext::new_with_state(state);
-                }
-            }
+        let ctx = SessionContext::new_with_config(config);
+        if matches!(reader, Reader::Parquet | Reader::ParquetPushdown) {
+            let options = ParquetReadOptions::default();
+            runtime
+                .block_on(ctx.register_parquet(TABLE, &self.parquet, options))
+                .unwrap();
+            return ctx;
         }
+        // Vortex does its I/O on the runtime it finds when the session is made.
+        let _runtime = runtime.enter();
+        let session = VortexSession::default();
+        let options = ListingOptions::new(vortex_format_factory(session.clone()).default())
+            .with_file_extension(".vortex");
+        let config = ListingTableConfig::new(ListingTableUrl::parse(&self.vortex).unwrap())
+            .with_listing_options(options)
+            .with_schema(Arc::clone(&self.schema))
+            .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
+        let listing = Arc::new(ListingTable::try_new(config).unwrap());
+        // The scans read the file directly, as dft reads a local file.
+        let url = ObjectStoreUrl::local_filesystem();
+        let store = ctx.runtime_env().object_store(&url).unwrap();
+        let mut factory = VortexExecFactory::new(reader_factory(&url, store));
+        if reader == Reader::Vortex {
+            factory = factory.with_pruner(Arc::new(ZonePruner::new(session)));
+        }
+        ctx.register_table(TABLE, Arc::new(PrunedTable::new(listing, factory)))
+            .unwrap();
         ctx
-    }
-}
-
-/// Gives every file of a Vortex scan the selection it holds, as a rule that prunes before the
-/// scan would.
-#[derive(Debug)]
-struct IdealSelection(ScanSelection);
-
-impl PhysicalOptimizerRule for IdealSelection {
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(|plan| {
-            let Some(conf) = plan
-                .downcast_ref::<DataSourceExec>()
-                .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
-            else {
-                return Ok(Transformed::no(plan));
-            };
-            if conf.file_source().downcast_ref::<VortexSource>().is_none() {
-                return Ok(Transformed::no(plan));
-            }
-            let groups = conf
-                .file_groups
-                .iter()
-                .map(|group| {
-                    let files = group.iter().map(|file| {
-                        let mut file = file.clone();
-                        let plan = VortexAccessPlan::default().with_selection(self.0.clone());
-                        file.extensions.insert(plan);
-                        file
-                    });
-                    FileGroup::new(files.collect())
-                })
-                .collect();
-            let conf = FileScanConfigBuilder::from(conf.clone())
-                .with_file_groups(groups)
-                .build();
-            Ok(Transformed::yes(
-                DataSourceExec::from_data_source(conf) as Arc<dyn ExecutionPlan>
-            ))
-        })
-        .data()
-    }
-
-    fn name(&self) -> &str {
-        "ideal_selection"
-    }
-
-    fn schema_check(&self) -> bool {
-        true
-    }
-}
-
-/// The rows of the zones of the Vortex file that hold a match for `sql`, found by a scan with the
-/// filter the Vortex table pushes into its scans; `None` if it doesn't go to Vortex whole.
-fn ideal_selection(tables: &Tables, runtime: &Runtime, sql: &str) -> Option<ScanSelection> {
-    let ctx = tables.context(runtime, Reader::VortexUnpruned, 1, None);
-    let plan = runtime.block_on(async {
-        let query = ctx.sql(sql).await.unwrap();
-        query.create_physical_plan().await.unwrap()
-    });
-    let predicate = scan_predicate(&plan)?;
-    let path = std::path::Path::new(&tables.vortex);
-    let (matches, rows) = matching_rows(path, &tables.schema, &predicate)?;
-    let zone = DEFAULT_ROW_BLOCK as u64;
-    let mut zones: Vec<u64> = matches.into_iter().map(|row| row / zone).collect();
-    zones.dedup();
-    let mut selected = RoaringTreemap::new();
-    for z in zones {
-        selected.insert_range(z * zone..((z + 1) * zone).min(rows));
-    }
-    Some(ScanSelection::IncludeRoaring(selected))
-}
-
-/// The filter pushed into the Vortex scan in `plan`, over the table's columns.
-fn scan_predicate(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn PhysicalExpr>> {
-    let source = plan
-        .downcast_ref::<DataSourceExec>()
-        .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
-        .and_then(|conf| conf.file_source().downcast_ref::<VortexSource>());
-    match source {
-        Some(source) => source.predicate().cloned(),
-        None => plan.children().into_iter().find_map(scan_predicate),
     }
 }
 
@@ -455,19 +315,10 @@ impl Setup {
     /// Check every reader of `sql` that runs (under `id/<reader>/<partitions>`) against Parquet
     /// with DataFusion's defaults, print what each counted, and time them as one group; `label`
     /// names the query in what's printed.
-    fn bench(
-        &self,
-        c: &mut Criterion,
-        id: &str,
-        label: &str,
-        sql: &str,
-        scan: bool,
-        ideal: Option<&ScanSelection>,
-    ) {
+    fn bench(&self, c: &mut Criterion, id: &str, label: &str, sql: &str, scan: bool) {
         let runs: Vec<(Reader, usize)> = Reader::ALL
             .into_iter()
             .flat_map(|reader| self.partitions.map(|partitions| (reader, partitions)))
-            .filter(|(reader, _)| *reader != Reader::VortexIdeal || ideal.is_some())
             .filter(|(reader, partitions)| {
                 self.selection
                     .runs(&format!("{id}/{}/{partitions}", reader.name()))
@@ -477,34 +328,20 @@ impl Setup {
             return;
         }
         let rt = &self.runtime;
-        let baseline = self.tables.context(rt, Reader::Parquet, 1, None);
+        let baseline = self.tables.context(rt, Reader::Parquet, 1);
         let (expected, metrics) = rt.block_on(check(&baseline, sql));
         println!("{label}: {} rows; {sql}", expected.rows);
         println!("  parquet/1: {}", metrics.join(" "));
-        for &(reader, partitions) in &runs {
-            let ctx = self.tables.context(rt, reader, partitions, ideal);
+        let mut contexts = Vec::new();
+        for (reader, partitions) in runs {
             let name = format!("{}/{partitions}", reader.name());
-            // Three times, a moment apart: the first reads the zone maps (see `ZonePruner`), and
-            // the last runs as the timed ones do, with them cached.
-            let mut metrics = Vec::new();
-            let mut first = Vec::new();
-            for run in 0..3 {
-                let (actual, last) = rt.block_on(check(&ctx, sql));
-                assert_eq!(actual, expected, "{label}: {name}");
-                if run == 0 {
-                    first = last
-                        .iter()
-                        .filter_map(|m| m.strip_prefix("selected_rows="))
-                        .map(|rows| format!("first_selected_rows={rows}"))
-                        .collect();
-                }
-                metrics = last;
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            metrics.extend(first);
-            if reader != Reader::Parquet || partitions != 1 {
+            let ctx = self.tables.context(rt, reader, partitions);
+            let (actual, metrics) = rt.block_on(check(&ctx, sql));
+            assert_eq!(actual, expected, "{label}: {name}");
+            if (reader, partitions) != (Reader::Parquet, 1) {
                 println!("  {name}: {}", metrics.join(" "));
             }
+            contexts.push((name, ctx));
         }
 
         let mut group = c.benchmark_group(id);
@@ -516,11 +353,8 @@ impl Setup {
                 .warm_up_time(Duration::from_secs(1))
                 .measurement_time(Duration::from_secs(3));
         }
-        for (reader, partitions) in runs {
-            let ctx = self.tables.context(rt, reader, partitions, ideal);
-            group.bench_function(format!("{}/{partitions}", reader.name()), |b| {
-                b.iter(|| rt.block_on(run(&ctx, sql)))
-            });
+        for (name, ctx) in contexts {
+            group.bench_function(name, |b| b.iter(|| rt.block_on(run(&ctx, sql))));
         }
         group.finish();
     }
@@ -531,13 +365,7 @@ fn df_needles(c: &mut Criterion) {
     for needle in &needles() {
         let sql = needle_sql(needle, &setup.tables.schema);
         let id = format!("df needle/{}", needle.name);
-        let ideal = setup
-            .partitions
-            .iter()
-            .any(|p| setup.selection.runs(&format!("{id}/vortex ideal/{p}")))
-            .then(|| ideal_selection(&setup.tables, &setup.runtime, &sql))
-            .flatten();
-        setup.bench(c, &id, needle.name, &sql, false, ideal.as_ref());
+        setup.bench(c, &id, needle.name, &sql, false);
     }
 }
 
@@ -558,7 +386,7 @@ fn df_scans(c: &mut Criterion) {
     ];
     for (label, columns) in projections {
         let sql = format!("SELECT {columns} FROM {TABLE}");
-        setup.bench(c, &format!("df scan/{label}"), label, &sql, true, None);
+        setup.bench(c, &format!("df scan/{label}"), label, &sql, true);
     }
 }
 

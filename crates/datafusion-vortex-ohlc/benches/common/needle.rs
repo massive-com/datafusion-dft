@@ -1,25 +1,5 @@
 //! Needle-in-a-haystack lookups: a handful of selective filters, each returning every column of
-//! the rows it matches, and the rows of the Vortex file that match one (see [`matching_rows`]).
-
-use std::path::Path;
-use std::sync::Arc;
-
-use arrow::datatypes::SchemaRef;
-use datafusion::physical_expr::simplifier::PhysicalExprSimplifier;
-use datafusion::physical_expr::{split_conjunction, PhysicalExpr};
-use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_vortex_ohlc::{BarsAdapterFactory, BarsExpressionConverter};
-use vortex::array::arrays::PrimitiveArray;
-use vortex::array::VortexSessionExecute;
-use vortex::arrow::ArrowSessionExt;
-use vortex::expr::and_collect;
-use vortex::file::OpenOptionsSessionExt;
-use vortex::io::runtime::current::CurrentThreadRuntime;
-use vortex::io::runtime::BlockingRuntime;
-use vortex::layout::layouts::row_idx::row_idx;
-use vortex_datafusion::convert::ExpressionConverter;
-
-use crate::common::data::new_session;
+//! the rows it matches.
 
 /// How a term compares its column with its value.
 #[derive(Clone, Copy, Debug)]
@@ -237,54 +217,4 @@ pub fn needles() -> Vec<Needle> {
             terms: vec![ticker("AAPL"), above("dollar_volume", 19_700_000, 0)],
         },
     ]
-}
-
-// ---------------------------------------------------------------------------------------------
-// Vortex
-// ---------------------------------------------------------------------------------------------
-
-/// The rows of the Vortex file at `path` that `predicate` (over `table`, the table's schema)
-/// matches, ascending, and the file's row count: a scan with only the row index projected,
-/// filtered as a scan of a Vortex table filters, with `predicate` adapted to the file by
-/// [`BarsAdapterFactory`] and handed to Vortex by [`BarsExpressionConverter`], as
-/// vortex-datafusion's opener does. `None` if a conjunct doesn't go to Vortex.
-pub fn matching_rows(
-    path: &Path,
-    table: &SchemaRef,
-    predicate: &Arc<dyn PhysicalExpr>,
-) -> Option<(Vec<u64>, u64)> {
-    let runtime = CurrentThreadRuntime::new();
-    let session = new_session(&runtime);
-    let file = runtime
-        .block_on(session.open_options().open_path(path))
-        .unwrap();
-    let schema = Arc::new(session.arrow().to_arrow_schema(file.dtype()).unwrap());
-    let adapter = BarsAdapterFactory
-        .create(Arc::clone(table), Arc::clone(&schema))
-        .unwrap();
-    let predicate = adapter.rewrite(Arc::clone(predicate)).unwrap();
-    let predicate = PhysicalExprSimplifier::new(&schema)
-        .simplify(predicate)
-        .unwrap();
-    let converter = BarsExpressionConverter::new(session.clone());
-    let conjuncts = split_conjunction(&predicate)
-        .into_iter()
-        .map(|conjunct| converter.try_convert(conjunct, &schema).unwrap())
-        .collect::<Option<Vec<_>>>()?;
-    let filter = and_collect(conjuncts)?.bind(file.dtype()).unwrap();
-    let filter = filter.optimize_recursive().unwrap();
-    let mut ctx = session.create_execution_ctx();
-    let hits = file
-        .scan()
-        .unwrap()
-        .with_filter(filter)
-        .with_projection(row_idx().bind(file.dtype()).unwrap())
-        .into_array_iter(&runtime)
-        .unwrap();
-    let mut rows: Vec<u64> = Vec::new();
-    for chunk in hits {
-        let chunk = chunk.unwrap().execute::<PrimitiveArray>(&mut ctx).unwrap();
-        rows.extend_from_slice(chunk.as_slice::<u64>());
-    }
-    Some((rows, file.row_count()))
 }
