@@ -19,6 +19,7 @@ vortex-ohlc = { path = "../vortex-ohlc" }
 
 [dev-dependencies]
 tempfile.workspace = true
+test-util = { path = "../test-util" }
 tokio.workspace = true
 
 [lints]
