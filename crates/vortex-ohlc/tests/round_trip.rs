@@ -15,10 +15,8 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::ohlc::ohlc_from_parts;
-use vortex_ohlc::plan::{
-    apply_plan, planned_schema, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES,
-};
+use vortex_ohlc::ohlc::{ohlc_from_parts, Part, Price};
+use vortex_ohlc::plan::{apply_plan, planned_schema, Plan, Transform, OHLC};
 
 use test_util::{source, source_plan, write, ROWS, ROW_BLOCK};
 
@@ -76,9 +74,9 @@ fn encoding_ids(array: &ArrayRef) -> Vec<String> {
 fn round_trip() {
     let source = source();
     let plan = source_plan(&source);
-    assert!(OHLC_PRICES
+    assert!(Price::ALL
         .iter()
-        .all(|p| plan.get(*p) == Some(&Transform::Ohlc(2))));
+        .all(|p| plan.get(p.name()) == Some(&Transform::Ohlc(2))));
     assert_eq!(plan.get("volume"), Some(&Transform::Rescale(6)));
 
     let (chunks, read) = write_and_read(&source, &plan);
@@ -97,10 +95,10 @@ fn round_trip() {
                 .as_ref()
         })
         .collect();
-    let prices: Vec<&[i128]> = OHLC_PRICES
+    let prices: Vec<&[i128]> = Price::ALL
         .iter()
         .map(|p| {
-            let column = source.column_by_name(p).unwrap();
+            let column = source.column_by_name(p.name()).unwrap();
             column.as_primitive::<Decimal128Type>().values().as_ref()
         })
         .collect();
@@ -113,7 +111,7 @@ fn round_trip() {
     let mut v2 = false;
     for chunk in &chunks {
         let ohlc = child(chunk, OHLC);
-        for part in OHLC_PARTS {
+        for part in Part::ALL.map(Part::name) {
             let ids = encoding_ids(&child(&ohlc, part));
             assert!(ids[0].contains("decimal_byte_parts"), "{part}: {ids:?}");
             assert!(

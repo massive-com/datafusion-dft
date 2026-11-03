@@ -15,48 +15,47 @@ use vortex::expr::{
 use vortex::scalar::{DecimalValue, Scalar};
 use vortex::scalar_fn::fns::operators::Operator;
 
-use crate::plan::{OHLC, OHLC_PARTS};
+use crate::ohlc::{Part, Price};
+use crate::plan::OHLC;
 
 /// A price as an expression over the [`OHLC`] struct's parts (in a table of `table`), with only
-/// Vortex's own functions; `None` for anything but the four prices, or a table without the
-/// struct. close = open + body, high = (open + upper) + max(body, 0) and low = (open - lower) +
+/// Vortex's own functions; `None` for a table without the struct. close = open + body, high = (open + upper) + max(body, 0) and low = (open - lower) +
 /// min(body, 0): the larger and smaller of open and close are open plus the body where its sign
 /// is right. Keeping the body only there (`mask`, then `fill_null` with 0) runs vectorized, where
 /// a `zip` picking open or close slices both at every run of its mask, and the body's sign
 /// changes from one bar to the next.
-pub fn price(table: &DType, price: &str) -> Option<Expression> {
+pub fn price(table: &DType, price: Price) -> Option<Expression> {
     let parts = OhlcParts::new(table)?;
     let p = parts.precision;
     // The body where `sign` holds, 0 elsewhere, at p + 1 digits.
     let body_where = |sign: Expression| {
-        let body = fill_null(mask(parts.raw("body"), sign), parts.zero());
+        let body = fill_null(mask(parts.raw(Part::Body), sign), parts.zero());
         let decimal = DecimalDType::new(p + 1, parts.scale);
         cast(body, DType::Decimal(decimal, Nullability::Nullable))
     };
+    let open = parts.part(Part::Open, p);
     Some(match price {
-        "open" => parts.part("open", p),
-        "close" => parts.close(),
+        Price::Open => open,
+        Price::Close => parts.close(),
         // p + 2 digits.
-        "high" => {
-            let base = checked_add(parts.part("open", p), parts.part("upper", p));
+        Price::High => {
+            let base = checked_add(open, parts.part(Part::Upper, p));
             checked_add(base, body_where(parts.up()))
         }
-        "low" => {
-            let base = binary(Operator::Sub, parts.part("open", p), parts.part("lower", p));
+        Price::Low => {
+            let base = binary(Operator::Sub, open, parts.part(Part::Lower, p));
             checked_add(base, body_where(parts.down()))
         }
-        _ => return None,
     })
 }
 
 /// `price op literal`, where the literal is the decimal `unscaled / 10^scale`, as a filter over
-/// the [`OHLC`] struct's parts (in a table of `table`); `op` is a comparison. `None` for
-/// anything but the four prices, a table without the struct, or a literal the price's type can't
-/// hold exactly. The price is compared as [`price`] rebuilds it: one sum per row is quicker than
+/// the [`OHLC`] struct's parts (in a table of `table`); `op` is a comparison. `None` for a table
+/// without the struct, or a literal the price's type can't hold exactly. The price is compared as [`price`] rebuilds it: one sum per row is quicker than
 /// comparing high and low one branch of the body's sign at a time, which takes a sum for each.
 pub fn compare_price(
     table: &DType,
-    price: &str,
+    price: Price,
     op: Operator,
     unscaled: i128,
     scale: i8,
@@ -98,7 +97,8 @@ impl OhlcParts {
     /// `None` if the table of `dtype` has no [`OHLC`] struct of decimal parts.
     fn new(dtype: &DType) -> Option<Self> {
         let parts = dtype.as_struct_fields_opt()?.field(OHLC)?;
-        let DType::Decimal(decimal, _) = parts.as_struct_fields_opt()?.field(OHLC_PARTS[0])? else {
+        let DType::Decimal(decimal, _) = parts.as_struct_fields_opt()?.field(Part::Open.name())?
+        else {
             return None;
         };
         Some(Self {
@@ -107,15 +107,15 @@ impl OhlcParts {
         })
     }
 
-    fn raw(&self, name: &str) -> Expression {
-        get_item(name, get_item(OHLC, root()))
+    fn raw(&self, part: Part) -> Expression {
+        get_item(part.name(), get_item(OHLC, root()))
     }
 
-    /// The part `name`, cast to `precision`.
-    fn part(&self, name: &str, precision: u8) -> Expression {
+    /// `part`, cast to `precision`.
+    fn part(&self, part: Part, precision: u8) -> Expression {
         let decimal = DecimalDType::new(precision, self.scale);
         cast(
-            self.raw(name),
+            self.raw(part),
             DType::Decimal(decimal, Nullability::Nullable),
         )
     }
@@ -123,7 +123,7 @@ impl OhlcParts {
     /// open + body, at `p + 1` digits.
     fn close(&self) -> Expression {
         let p = self.precision;
-        checked_add(self.part("open", p), self.part("body", p))
+        checked_add(self.part(Part::Open, p), self.part(Part::Body, p))
     }
 
     fn zero(&self) -> Expression {
@@ -137,11 +137,11 @@ impl OhlcParts {
 
     /// Where close is at least open.
     fn up(&self) -> Expression {
-        gt_eq(self.raw("body"), self.zero())
+        gt_eq(self.raw(Part::Body), self.zero())
     }
 
     /// Where close is below open.
     fn down(&self) -> Expression {
-        lt(self.raw("body"), self.zero())
+        lt(self.raw(Part::Body), self.zero())
     }
 }

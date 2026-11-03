@@ -58,7 +58,8 @@ use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::VortexSession;
 use vortex_datafusion::convert::{DefaultExpressionConverter, ExpressionConverter};
 use vortex_datafusion::VortexFormatFactory;
-use vortex_ohlc::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
+use vortex_ohlc::ohlc::{Part, Price};
+use vortex_ohlc::plan::OHLC;
 use vortex_ohlc::prices::{compare_price, decimal_literal};
 
 mod source;
@@ -80,29 +81,32 @@ pub fn vortex_format_factory(session: VortexSession) -> VortexFormatFactory {
 /// type, a `Decimal128` at a scale at least the parts'.
 #[derive(Debug, Eq)]
 pub struct OhlcPrice {
-    /// The price's index in [`OHLC_PRICES`].
-    price: usize,
+    price: Price,
     ohlc: Arc<dyn PhysicalExpr>,
     field: FieldRef,
 }
 
 impl OhlcPrice {
-    /// The price the table's `field` holds, from `ohlc`; `None` unless `field` is one of
-    /// [`OHLC_PRICES`] and a `Decimal128`.
+    /// The price the table's `field` holds, from `ohlc`; `None` unless `field` is a [`Price`] and
+    /// a `Decimal128`.
     pub fn new(field: FieldRef, ohlc: Arc<dyn PhysicalExpr>) -> Option<Self> {
-        let price = OHLC_PRICES.iter().position(|p| p == field.name())?;
+        let price = Price::from_name(field.name())?;
         matches!(field.data_type(), DataType::Decimal128(..)).then_some(Self { price, ohlc, field })
     }
 
     pub fn name(&self) -> &'static str {
-        OHLC_PRICES[self.price]
+        self.price.name()
     }
 
-    /// The parts the price is rebuilt from, in [`OHLC_PARTS`] order: open, then the body for
-    /// any price but open, and the wick on its side for high and low.
+    /// Whether the price is rebuilt from each part, in [`Part::ALL`] order: open, then the body
+    /// for any price but open, and the wick on its side for high and low.
     fn parts_needed(&self) -> [bool; 4] {
-        let [open, high, low, _] = OHLC_PRICES.map(|p| p == self.name());
-        [true, !open, high, low]
+        Part::ALL.map(|part| match part {
+            Part::Open => true,
+            Part::Body => self.price != Price::Open,
+            Part::Upper => self.price == Price::High,
+            Part::Lower => self.price == Price::Low,
+        })
     }
 }
 
@@ -142,19 +146,20 @@ impl PhysicalExpr for OhlcPrice {
         let mut nulls = ohlc.nulls().cloned();
         let mut parts: [Option<&PrimitiveArray<Decimal128Type>>; 4] = [None; 4];
         let mut parts_scale = None;
-        for ((name, part), needed) in OHLC_PARTS.iter().zip(&mut parts).zip(self.parts_needed()) {
+        for ((part, values), needed) in Part::ALL.iter().zip(&mut parts).zip(self.parts_needed()) {
             if !needed {
                 continue;
             }
+            let name = part.name();
             let Some(column) = ohlc.column_by_name(name) else {
                 return exec_err!("{self}: {OHLC} has no {name}");
             };
-            let Some(values) = column.as_primitive_opt::<Decimal128Type>() else {
+            let Some(column) = column.as_primitive_opt::<Decimal128Type>() else {
                 return exec_err!("{self}: {name} is {}", column.data_type());
             };
-            nulls = NullBuffer::union(nulls.as_ref(), values.nulls());
-            parts_scale = Some(values.scale());
-            *part = Some(values);
+            nulls = NullBuffer::union(nulls.as_ref(), column.nulls());
+            parts_scale = Some(column.scale());
+            *values = Some(column);
         }
         let shift = scale - parts_scale.expect("open is always needed");
         if shift < 0 {
@@ -169,14 +174,14 @@ impl PhysicalExpr for OhlcPrice {
         // The parts have OHLC_PRECISION digits and the price at most 18, so the sums and the
         // rescale fit an i64: a loop of its own for each price, in i64, vectorizes.
         let widen = |price: i64| (price * factor) as i128;
-        let rebuilt: Vec<i128> = match self.name() {
-            "open" => open.iter().map(|&o| widen(o as i64)).collect(),
-            "close" => open
+        let rebuilt: Vec<i128> = match self.price {
+            Price::Open => open.iter().map(|&o| widen(o as i64)).collect(),
+            Price::Close => open
                 .iter()
                 .zip(needed(body))
                 .map(|(&o, &b)| widen(o as i64 + b as i64))
                 .collect(),
-            "high" => open
+            Price::High => open
                 .iter()
                 .zip(needed(body))
                 .zip(needed(upper))
@@ -185,7 +190,7 @@ impl PhysicalExpr for OhlcPrice {
                     widen(o + b.max(0) + u)
                 })
                 .collect(),
-            _ => open
+            Price::Low => open
                 .iter()
                 .zip(needed(body))
                 .zip(needed(lower))
@@ -334,7 +339,7 @@ impl PhysicalExprAdapterFactory for BarsAdapterFactory {
         if let Some((index, field)) = physical_file_schema.column_with_name(OHLC) {
             if matches!(field.data_type(), DataType::Struct(_)) {
                 let ohlc: Arc<dyn PhysicalExpr> = Arc::new(Column::new(OHLC, index));
-                for price in OHLC_PRICES {
+                for price in Price::ALL.map(Price::name) {
                     let Ok(field) = logical_file_schema.field_with_name(price) else {
                         continue;
                     };
@@ -491,7 +496,7 @@ impl BarsExpressionConverter {
         else {
             return Ok(None);
         };
-        Ok(compare_price(&table, price.name(), op, unscaled, scale))
+        Ok(compare_price(&table, price.price, op, unscaled, scale))
     }
 }
 
@@ -554,8 +559,8 @@ mod tests {
         )]);
         let ohlc: Arc<dyn PhysicalExpr> = Arc::new(Column::new(OHLC, 0));
         let converter = BarsExpressionConverter::new(VortexSession::default());
-        for price in OHLC_PRICES {
-            let field = Arc::new(Field::new(price, DataType::Decimal128(18, 6), false));
+        for price in Price::ALL {
+            let field = Arc::new(Field::new(price.name(), DataType::Decimal128(18, 6), false));
             let price: Arc<dyn PhysicalExpr> =
                 Arc::new(OhlcPrice::new(field, Arc::clone(&ohlc)).unwrap());
             let literal: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Decimal128(

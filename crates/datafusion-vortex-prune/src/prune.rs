@@ -72,7 +72,8 @@ use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::VortexAccessPlan;
-use vortex_ohlc::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
+use vortex_ohlc::ohlc::{Part, Price};
+use vortex_ohlc::plan::OHLC;
 
 /// How many bytes of zone maps a [`ZonePruner`] keeps by default: tens of KB a file, so some
 /// thousands of files.
@@ -404,10 +405,8 @@ impl ZoneStatistics<'_> {
             let stored = if max { max_values } else { min_values };
             return cast(stored, field.data_type()).ok();
         }
-        if OHLC_PRICES.contains(&column.name.as_str()) {
-            return price_bounds(&self.zones.columns, &column.name, max, field.data_type());
-        }
-        None
+        let price = Price::from_name(&column.name)?;
+        price_bounds(&self.zones.columns, price, max, field.data_type())
     }
 }
 
@@ -447,42 +446,40 @@ impl PruningStatistics for ZoneStatistics<'_> {
 ///
 /// So a price's min is at least what its parts' mins give (the lower wick's max, for low), and
 /// its max at most what their maxes give. The parts' bounds are `columns`' (see [`FileZones`]).
-/// `None` unless `price` is one of [`OHLC_PRICES`], `columns` has the parts it needs, and
-/// `data_type` is a `Decimal128` at a scale at least theirs.
+/// `None` unless `columns` has the parts it needs, and `data_type` is a `Decimal128` at a scale
+/// at least theirs.
 fn price_bounds(
     columns: &HashMap<String, (ArrayRef, ArrayRef)>,
-    price: &str,
+    price: Price,
     max: bool,
     data_type: &DataType,
 ) -> Option<ArrayRef> {
     let DataType::Decimal128(precision, scale) = *data_type else {
         return None;
     };
-    let part = |name: &str, max: bool| -> Option<&Decimal128Array> {
-        let (min_values, max_values) = columns.get(&format!("{OHLC}.{name}"))?;
+    let part = |part: Part, max: bool| -> Option<&Decimal128Array> {
+        let (min_values, max_values) = columns.get(&format!("{OHLC}.{}", part.name()))?;
         (if max { max_values } else { min_values }).as_primitive_opt::<Decimal128Type>()
     };
-    let [open, body, upper, lower] = OHLC_PARTS;
-    let (o, b) = (part(open, max)?, part(body, max)?);
+    let (o, b) = (part(Part::Open, max)?, part(Part::Body, max)?);
     let shift = scale.checked_sub(o.scale()).filter(|s| *s >= 0)?;
     let factor = 10i128.pow(shift as u32);
     let at = |array: &Decimal128Array, i: usize| array.is_valid(i).then(|| array.value(i));
     let bound: Decimal128Array = match price {
-        "open" => (0..o.len()).map(|i| at(o, i)).collect(),
-        "close" => (0..o.len()).map(|i| Some(at(o, i)? + at(b, i)?)).collect(),
-        "high" => {
-            let u = part(upper, max)?;
+        Price::Open => (0..o.len()).map(|i| at(o, i)).collect(),
+        Price::Close => (0..o.len()).map(|i| Some(at(o, i)? + at(b, i)?)).collect(),
+        Price::High => {
+            let u = part(Part::Upper, max)?;
             (0..o.len())
                 .map(|i| Some(at(o, i)? + at(b, i)?.max(0) + at(u, i)?))
                 .collect()
         }
-        "low" => {
-            let l = part(lower, !max)?;
+        Price::Low => {
+            let l = part(Part::Lower, !max)?;
             (0..o.len())
                 .map(|i| Some(at(o, i)? + at(b, i)?.min(0) - at(l, i)?))
                 .collect()
         }
-        _ => return None,
     };
     let bound = bound
         .unary::<_, Decimal128Type>(|v| v * factor)
@@ -547,10 +544,10 @@ mod tests {
                     .collect()
             })
             .collect();
-        OHLC_PARTS
+        Part::ALL
             .iter()
             .enumerate()
-            .map(|(i, name)| {
+            .map(|(i, part)| {
                 let bound = |pick: fn(i128, i128) -> i128| -> ArrayRef {
                     let values = parts
                         .iter()
@@ -562,7 +559,7 @@ mod tests {
                     Arc::new(array)
                 };
                 (
-                    format!("{OHLC}.{name}"),
+                    format!("{OHLC}.{}", part.name()),
                     (bound(i128::min), bound(i128::max)),
                 )
             })
@@ -571,7 +568,7 @@ mod tests {
 
     fn bounds(
         columns: &HashMap<String, (ArrayRef, ArrayRef)>,
-        price: &str,
+        price: Price,
         max: bool,
     ) -> Vec<Option<i128>> {
         let array = price_bounds(columns, price, max, &TABLE).unwrap();
@@ -583,7 +580,7 @@ mod tests {
     fn bounds_contain_every_price() {
         let zones = zones_of_bars();
         let columns = part_zone_maps(&zones);
-        for (index, price) in OHLC_PRICES.iter().enumerate() {
+        for (index, price) in Price::ALL.into_iter().enumerate() {
             let (min, max) = (
                 bounds(&columns, price, false),
                 bounds(&columns, price, true),
@@ -595,7 +592,7 @@ mod tests {
                 let (min, max) = (min[zone].unwrap(), max[zone].unwrap());
                 assert!(
                     min <= lo && hi <= max,
-                    "{price} in zone {zone}: {lo}..{hi} not in {min}..{max}"
+                    "{price:?} in zone {zone}: {lo}..{hi} not in {min}..{max}"
                 );
             }
         }
@@ -606,8 +603,8 @@ mod tests {
         let zones = zones_of_bars();
         let columns = part_zone_maps(&zones);
         let (min, max) = (
-            bounds(&columns, "open", false),
-            bounds(&columns, "open", true),
+            bounds(&columns, Price::Open, false),
+            bounds(&columns, Price::Open, true),
         );
         for (zone, bars) in zones.iter().enumerate() {
             let opens = bars.iter().map(|bar| bar[0] * 100);
@@ -619,9 +616,9 @@ mod tests {
     #[test]
     fn a_zone_without_bounds_bounds_nothing() {
         let columns = part_zone_maps(&zones_of_bars());
-        for price in OHLC_PRICES {
+        for price in Price::ALL {
             for max in [false, true] {
-                assert_eq!(bounds(&columns, price, max)[3], None, "{price}");
+                assert_eq!(bounds(&columns, price, max)[3], None, "{price:?}");
             }
         }
     }
@@ -629,13 +626,13 @@ mod tests {
     #[test]
     fn no_bounds_it_cant_give() {
         let columns = part_zone_maps(&zones_of_bars());
-        // Not a price, a table type below the parts' scale or not a decimal, no parts.
-        assert!(price_bounds(&columns, "volume", false, &TABLE).is_none());
-        assert!(price_bounds(&columns, "high", false, &DataType::Decimal128(18, 2)).is_none());
-        assert!(price_bounds(&columns, "high", false, &DataType::Int64).is_none());
+        // A table type below the parts' scale or not a decimal, no parts.
+        let high = |columns, data_type| price_bounds(columns, Price::High, false, data_type);
+        assert!(high(&columns, &DataType::Decimal128(18, 2)).is_none());
+        assert!(high(&columns, &DataType::Int64).is_none());
         let mut no_upper = columns.clone();
-        no_upper.remove(&format!("{OHLC}.upper"));
-        assert!(price_bounds(&no_upper, "high", false, &TABLE).is_none());
-        assert!(price_bounds(&no_upper, "low", false, &TABLE).is_some());
+        no_upper.remove(&format!("{OHLC}.{}", Part::Upper.name()));
+        assert!(high(&no_upper, &TABLE).is_none());
+        assert!(price_bounds(&no_upper, Price::Low, false, &TABLE).is_some());
     }
 }
