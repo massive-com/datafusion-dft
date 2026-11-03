@@ -155,7 +155,12 @@ impl PhysicalExpr for OhlcPrice {
         if shift < 0 {
             return exec_err!("{self}: the parts' scale is above the price's");
         }
-        let rebuilt = self.price.rebuild(parts, 10i64.pow(shift as u32));
+        // The prices fit the table's precision, so i64 holds them if that's at most 18 digits.
+        let rebuilt = if precision <= 18 {
+            self.price.rebuild(parts, 10i64.pow(shift as u32))
+        } else {
+            self.price.rebuild(parts, 10i128.pow(shift as u32))
+        };
         let array = Decimal128Array::new(rebuilt.into(), nulls)
             .with_precision_and_scale(precision, scale)?;
         Ok(ColumnarValue::Array(Arc::new(array)))
@@ -504,7 +509,37 @@ mod tests {
     use super::*;
     use arrow::datatypes::Field;
     use vortex::VortexSessionDefault;
-    use vortex_ohlc::plan::ohlc_fields;
+    use vortex_ohlc::plan::{apply_plan, ohlc_fields, planned_schema};
+    use vortex_ohlc::profile::{plan, DecimalProfiler};
+
+    /// Prices wider than an i64 come back whole: 60000.5 in a `Decimal(38, 18)` source is stored
+    /// rescaled by 17, and rebuilding it at the source's scale takes 23 digits.
+    #[test]
+    fn wide_prices_rebuild_at_the_source_scale() {
+        let decimal = DataType::Decimal128(38, 18);
+        let value = 600_005 * 10i128.pow(17);
+        let fields: Vec<Field> = Price::ALL
+            .iter()
+            .map(|price| Field::new(price.name(), decimal.clone(), false))
+            .collect();
+        let source = Arc::new(Schema::new(fields));
+        let column = Decimal128Array::from(vec![value])
+            .with_precision_and_scale(38, 18)
+            .unwrap();
+        let columns = vec![Arc::new(column) as _; Price::ALL.len()];
+        let batch = RecordBatch::try_new(Arc::clone(&source), columns).unwrap();
+        let mut profiler = DecimalProfiler::new(&source);
+        profiler.add(&batch);
+        let plan = plan(&profiler.finish());
+        let stored = apply_plan(&plan, &planned_schema(&plan, &source), batch);
+        let ohlc: Arc<dyn PhysicalExpr> = Arc::new(Column::new(OHLC, 0));
+        for price in Price::ALL {
+            let field = Arc::new(Field::new(price.name(), decimal.clone(), false));
+            let price = OhlcPrice::new(field, Arc::clone(&ohlc)).unwrap();
+            let rebuilt = price.evaluate(&stored).unwrap().into_array(1).unwrap();
+            assert_eq!(rebuilt.as_primitive::<Decimal128Type>().value(0), value);
+        }
+    }
 
     #[test]
     fn price_comparisons_go_to_vortex() {
