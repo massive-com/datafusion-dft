@@ -4,8 +4,8 @@
 //! - `v2.parquet`: the source rewritten as Parquet v2 (zstd level 1, the source's row groups),
 //!   the Parquet baseline;
 //! - `upstream-<VORTEX_VERSION>.vortex`: the source with the plan [`vortex_ohlc::profile`] picks
-//!   for it (and `transactions` packed), written with [`vortex_ohlc::strategy`]. Bump
-//!   [`VORTEX_VERSION`] whenever what the crate writes changes, so the file is written again.
+//!   for it, written with [`vortex_ohlc::write`]. Bump [`VORTEX_VERSION`] whenever what the crate
+//!   writes changes, so the file is written again.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -23,8 +23,7 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_ohlc::plan::Transform;
 use vortex_ohlc::profile::{plan, DecimalProfiler};
-use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
-use vortex_ohlc::write::{stored_arrays, write_options};
+use vortex_ohlc::write::{stored_arrays, write_options, DEFAULT_ROW_BLOCK};
 
 /// The month of minute bars `decimal_parts_bench` reads: August 2006, every ticker from A to ZZ,
 /// sorted by ticker.
@@ -39,14 +38,11 @@ const DATA_DIR: &str = concat!(
 
 /// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout, 3
 /// since the bars layout at the root, 4 since it's gone, 5 since Vortex's compressor packs the
-/// planned columns.
-const VORTEX_VERSION: u32 = 5;
+/// planned columns, 6 since Vortex's default strategy writes every column.
+const VORTEX_VERSION: u32 = 6;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;
-
-/// The integer column the plan packs, as `decimal_parts_bench` does.
-const TRANSACTIONS: &str = "transactions";
 
 pub struct Files {
     pub source: PathBuf,
@@ -142,7 +138,6 @@ fn write_vortex(
         profiler.add(&batch.unwrap());
     }
     let mut plan = plan(&profiler.finish());
-    plan.insert(TRANSACTIONS.to_string(), Transform::Packed);
     if !ohlc {
         for transform in plan.values_mut() {
             if let Transform::Ohlc(k) = *transform {

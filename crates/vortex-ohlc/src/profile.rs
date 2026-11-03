@@ -106,8 +106,6 @@ impl DecimalProfiler {
 /// [`lossless_k`](DecimalProfile::lossless_k), and the four prices, where the source has them,
 /// as the [`OHLC`](crate::plan::OHLC) struct, at the `k` all four allow. That takes no nulls,
 /// one scale, and parts that fit [`OHLC_PRECISION`]; otherwise the prices are only rescaled.
-///
-/// Integer columns aren't profiled; mark the ones to pack with [`Transform::Packed`].
 pub fn plan(profiles: &[DecimalProfile]) -> Plan {
     let mut plan: Plan = profiles
         .iter()

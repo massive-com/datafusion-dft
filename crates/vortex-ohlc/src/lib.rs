@@ -1,6 +1,6 @@
 //! Market aggregates (OHLC bars) in Vortex, stored with nothing but Vortex's own encodings and
 //! layouts. What is ours is how the columns are laid out before writing, which of Vortex's
-//! encodings may compress them, and how they are read back:
+//! encodings may compress them ([`edition`]), and how they are read back:
 //!
 //! - [`plan`]: the transforms applied to columns before writing (decimals rescaled to drop the
 //!   trailing zeros every value has, and the four prices stored as one struct of parts), and the
@@ -9,7 +9,6 @@
 //! - [`ohlc`]: a bar's parts from its prices, and back.
 //! - [`prices`]: the prices as Vortex expressions over the parts, to rebuild or filter on them
 //!   within a scan.
-//! - [`strategy`]: the write strategy, with the planned columns compressed as [`edition`] allows.
 //! - [`write`](mod@write): writing a table with a plan, recorded in the file, and reading the
 //!   plan back.
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
@@ -22,5 +21,4 @@ pub mod ohlc;
 pub mod plan;
 pub mod prices;
 pub mod profile;
-pub mod strategy;
 pub mod write;

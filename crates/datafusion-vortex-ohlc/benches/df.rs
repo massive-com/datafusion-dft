@@ -17,10 +17,10 @@
 //!
 //! For quicker iterations, `benches/quick.filter` holds a filter for one needle or scan of each
 //! kind of work, every Vortex reader at one partition per core:
-//! `cargo bench --bench df -- "$(cat crates/vortex-ohlc/benches/quick.filter)"`. Run them all
-//! before relying on a result. Parquet's results don't change with this crate: they are kept in
-//! `target/vortex-ohlc-bench/parquet-results.txt`, to compare against without timing Parquet
-//! again.
+//! `cargo bench --bench df -- "$(cat crates/datafusion-vortex-ohlc/benches/quick.filter)"`. Run
+//! them all before relying on a result. Parquet's results don't change with this crate: they are
+//! kept in `target/vortex-ohlc-bench/parquet-results.txt`, to compare against without timing
+//! Parquet again.
 
 mod common;
 
@@ -55,7 +55,7 @@ use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexAccessPlan, VortexSource};
-use vortex_ohlc::strategy::DEFAULT_ROW_BLOCK;
+use vortex_ohlc::write::DEFAULT_ROW_BLOCK;
 
 use common::needle::{matching_rows, needles, Needle, Op, Value};
 use common::{data, Selection};

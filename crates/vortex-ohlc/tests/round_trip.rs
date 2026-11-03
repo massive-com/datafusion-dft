@@ -1,6 +1,6 @@
-//! Profile a table of bars, plan from it, write it through `write_strategy` and read it back:
+//! Profile a table of bars, plan from it, write it with `write_options` and read it back:
 //! the file holds exactly the planned batch, the prices put back together from the OHLC parts are
-//! the source's, and the decimal and packed columns are stored as the strategy chose.
+//! the source's, and the parts and integers are bit-packed in the encodings the edition allows.
 
 use arrow::array::cast::AsArray;
 use arrow::array::types::Decimal128Type;
@@ -121,7 +121,7 @@ fn round_trip() {
         assert_eq!(rebuilt, [0, 1, 2, 3].map(|i| prices[i][row]), "row {row}");
     }
 
-    // The parts and the packed column are bit-packed, in the encodings the edition allows.
+    // The parts and transactions are bit-packed, in the encodings the edition allows.
     let mut v2 = false;
     for chunk in &chunks {
         let ohlc = child(chunk, OHLC);
