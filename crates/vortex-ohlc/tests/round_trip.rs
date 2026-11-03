@@ -19,30 +19,18 @@ use vortex_ohlc::ohlc::ohlc_from_parts;
 use vortex_ohlc::plan::{
     apply_plan, planned_schema, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES,
 };
-use vortex_ohlc::write::{file_plan, file_source_schema};
 
 use test_util::{source, source_plan, write, ROWS, ROW_BLOCK};
 
-/// Write `source` with `plan`, and check the file records the plan, and the source's schema
-/// from it, given the file's schema or the source's own; return the chunks read back, as Vortex
-/// arrays, and as one Arrow batch.
+/// Write `source` with `plan`; return the chunks read back, as Vortex arrays, and as one Arrow
+/// batch.
 fn write_and_read(source: &RecordBatch, plan: &Plan) -> (Vec<ArrayRef>, RecordBatch) {
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
-    // Metadata segments are only loaded when asked for.
     let file = session
         .open_options()
-        .include_metadata()
         .open_buffer(write(source, plan))
         .unwrap();
-    assert_eq!(file_plan(&file).as_ref(), Some(plan));
-    let stored = session.arrow().to_arrow_schema(file.dtype()).unwrap();
-    for table in [&stored, source.schema().as_ref()] {
-        assert_eq!(
-            file_source_schema(&file, table).as_ref(),
-            Some(source.schema().as_ref())
-        );
-    }
     let schema = planned_schema(plan, &source.schema());
     let chunks: Vec<ArrayRef> = file
         .scan()

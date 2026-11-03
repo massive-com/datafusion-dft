@@ -361,7 +361,7 @@ OPTIONS (predicate_pushdown 'true');
 
 The table options are the Vortex reader options described in the [config guide](config.md). See the [CLI guide](cli.md) for writing Vortex files with `--output`.
 
-Files written by the `vortex-ohlc` crate store decimal columns rescaled and the four OHLC prices as one `ohlc` struct of parts, and record how. dft reads them with the schema they were written from: `open`, `high`, `low` and `close` are rebuilt from the parts at their original type, rescaled columns are read back at their original scale, and filters on any of them go to Vortex on the stored columns and prune the file's zones. The plan is read from the first file of a table.
+Files written by the `vortex-ohlc` crate store decimal columns rescaled, without the trailing zeros every value had, and the four OHLC prices as one `ohlc` struct of parts. dft reads them with `open`, `high`, `low` and `close` rebuilt from the parts, and filters on the prices go to Vortex on the parts and prune the file's zones. Decimal columns, prices included, are read at the scale they are stored at: the same values as the source, with fewer digits after the decimal point in their type. A table declared with the source's schema reads them at the source's scale.
 
 ### ClickHouse (`--features=clickhouse`)
 

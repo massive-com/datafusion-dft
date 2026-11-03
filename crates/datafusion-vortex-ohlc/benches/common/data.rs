@@ -95,7 +95,7 @@ fn write_parquet_v2(source: &Path, dest: &Path) {
     writer.close().unwrap();
 }
 
-/// Profile the source, then write it with the plan that follows, recorded in the file.
+/// Profile the source, then write it with the plan that follows.
 fn write_vortex(source: &Path, dest: &Path) {
     // Vortex's defaults, able to write the file (see `vortex_ohlc::edition`), on a runtime that
     // runs everything on this thread.
@@ -116,8 +116,8 @@ fn write_vortex(source: &Path, dest: &Path) {
     let plan = plan(&profiler.finish());
     eprintln!("  plan: {plan:?}");
 
-    let arrays = stored_arrays(&session, &plan, &schema, batches().map(|b| b.unwrap())).unwrap();
-    write_options(&session, &schema, &plan, DEFAULT_ROW_BLOCK)
+    let arrays = stored_arrays(&session, &schema, &plan, batches().map(|b| b.unwrap())).unwrap();
+    write_options(&session, DEFAULT_ROW_BLOCK)
         .blocking(&runtime)
         .write(BufWriter::new(File::create(dest).unwrap()), arrays)
         .unwrap();

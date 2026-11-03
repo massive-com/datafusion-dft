@@ -163,11 +163,10 @@ impl PrunedTable {
         Self { inner, factory }
     }
 
-    /// `listing`, a listing table over Vortex files, read as the source they were written from
-    /// where the first of them records a vortex-ohlc plan (see [`source_table`]), its scans
-    /// pruned by `pruner` before they start. Its files, and
-    /// their zone maps, are read as [`reader_factory`] picks for its object store.
-    pub async fn over(
+    /// `listing`, a listing table over Vortex files, as a table of bars (see [`source_table`]),
+    /// its scans pruned by `pruner` before they start. Its files, and their zone maps, are read as
+    /// [`reader_factory`] picks for its object store.
+    pub fn over(
         listing: &ListingTable,
         state: &dyn Session,
         pruner: Arc<ZonePruner>,
@@ -178,11 +177,8 @@ impl PrunedTable {
             .ok_or_else(|| internal_datafusion_err!("a listing table without paths"))?
             .object_store();
         let store = state.runtime_env().object_store(&url)?;
-        let readers = reader_factory(&url, store);
-        let source = source_table(listing, state, readers.as_ref(), pruner.session()).await?;
-        let listing = source.unwrap_or_else(|| listing.clone());
-        let factory = VortexExecFactory::new(readers).with_pruner(pruner);
-        Ok(Self::new(Arc::new(listing), factory))
+        let factory = VortexExecFactory::new(reader_factory(&url, store)).with_pruner(pruner);
+        Ok(Self::new(Arc::new(source_table(listing, state)?), factory))
     }
 
     /// `plan`, a scan of `inner`, rebuilt by the factory with `filters`.
