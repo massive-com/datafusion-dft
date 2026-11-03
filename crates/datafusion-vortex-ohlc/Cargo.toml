@@ -17,8 +17,6 @@ criterion.workspace = true
 datafusion-vortex-prune = { path = "../datafusion-vortex-prune" }
 parquet = { features = ["snap", "zstd"], workspace = true }
 regex.workspace = true
-tempfile.workspace = true
-test-util = { path = "../test-util" }
 tokio = { features = ["rt-multi-thread"], workspace = true }
 
 [lints]

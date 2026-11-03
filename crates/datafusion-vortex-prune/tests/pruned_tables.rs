@@ -1,25 +1,28 @@
-//! A file written by vortex-ohlc, read from DataFusion as dft reads it (see `PrunedTable::over`):
-//! the source's values, the prices rebuilt from their parts, and filters on the prices and the
-//! rescaled columns prune its zones.
+//! Vortex tables pruned before their scans start, as dft has them: a file written by vortex-ohlc,
+//! read with its prices rebuilt (see `PrunedTable::over`), and tables queried by path or created
+//! with `CREATE EXTERNAL TABLE`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::Result;
 use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_vortex_ohlc::vortex_format_factory;
-use datafusion_vortex_prune::{PrunedTable, ZonePruner};
+use datafusion_vortex_prune::{enable_url_table, PrunedTable, PrunedTableFactory, ZonePruner};
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::VortexAccessPlan;
+use vortex_datafusion::{VortexAccessPlan, VortexFormatFactory};
 
 use test_util::{source, source_plan, write};
 
@@ -42,7 +45,7 @@ fn selected(plan: &Arc<dyn ExecutionPlan>) -> Vec<bool> {
 }
 
 #[tokio::test]
-async fn read_from_datafusion() -> datafusion::common::Result<()> {
+async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
     let source = source();
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("bars.vortex");
@@ -101,6 +104,61 @@ async fn read_from_datafusion() -> datafusion::common::Result<()> {
         let plan = query.clone().create_physical_plan().await?;
         assert_eq!(selected(&plan), [true], "{filter}");
         assert_eq!(query.count().await?, 500, "{filter}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tables_by_path_and_external_are_pruned() -> Result<()> {
+    let session = VortexSession::default();
+    let config = SessionConfig::new().with_extension(Arc::new(ZonePruner::new(session.clone())));
+    let mut builder = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features();
+    builder
+        .file_formats()
+        .get_or_insert_with(Vec::new)
+        .push(Arc::new(VortexFormatFactory::new_with_session(session)));
+    builder
+        .table_factories()
+        .get_or_insert_with(HashMap::new)
+        .insert(
+            "VORTEX".to_string(),
+            Arc::new(PrunedTableFactory::default()),
+        );
+    let ctx = enable_url_table(SessionContext::new_with_state(builder.build()));
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("ids.vortex");
+    let path = path.to_str().unwrap();
+    let sql = |sql: String| {
+        let ctx = ctx.clone();
+        async move { ctx.sql(&sql).await }
+    };
+    // Enough rows for some zones.
+    sql(format!(
+        "COPY (SELECT value AS id FROM generate_series(1, 100000)) TO '{path}' STORED AS VORTEX"
+    ))
+    .await?
+    .collect()
+    .await?;
+    sql(format!(
+        "CREATE EXTERNAL TABLE ids STORED AS VORTEX LOCATION '{path}'"
+    ))
+    .await?
+    .collect()
+    .await?;
+
+    for table in [format!("'{path}'"), "ids".to_string()] {
+        // One zone of the file can match, so the scan reads that one only.
+        let query = sql(format!("SELECT * FROM {table} WHERE id > 99000")).await?;
+        let plan = query.clone().create_physical_plan().await?;
+        assert_eq!(selected(&plan), [true], "{table}");
+        assert_eq!(query.count().await?, 1000, "{table}");
+        // Every zone can, so the scan reads them all as it would have.
+        let query = sql(format!("SELECT * FROM {table} WHERE id > 1000")).await?;
+        let plan = query.clone().create_physical_plan().await?;
+        assert!(!selected(&plan).contains(&true), "{table}");
+        assert_eq!(query.count().await?, 99000, "{table}");
     }
     Ok(())
 }
