@@ -8,7 +8,7 @@ use arrow::array::types::Decimal128Type;
 use arrow::array::{Array, ArrayRef as ArrowArrayRef, Decimal128Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 
-use crate::ohlc::ohlc_to_parts;
+use crate::ohlc::{ohlc_to_parts, Part, Price};
 
 /// How a column is stored. Columns missing from a [`Plan`] are kept as they are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,22 +16,16 @@ pub enum Transform {
     /// Drop `k` trailing zero digits: `Decimal(p, s)` becomes `Decimal(p, s - k)`, each
     /// unscaled value divided by `10^k`. Lossless only because every value has them.
     Rescale(u8),
-    /// One of [`OHLC_PRICES`], rescaled by `k` as above and stored with the other three as one
-    /// struct column, [`OHLC`]: open as it is, plus small offsets that are mostly zero (see
-    /// [`OHLC_PARTS`]). All four prices carry this transform; the struct takes open's place.
+    /// One of the four [`Price`]s, rescaled by `k` as above and stored with the other three as
+    /// one struct column, [`OHLC`]: open as it is, plus small offsets that are mostly zero (see
+    /// [`Part`]). All four prices carry this transform; the struct takes open's place.
     Ohlc(u8),
 }
 
 pub type Plan = BTreeMap<String, Transform>;
 
-/// The struct column holding the four [`Transform::Ohlc`] prices.
+/// The struct column holding the four [`Transform::Ohlc`] prices, as its [`Part`]s.
 pub const OHLC: &str = "ohlc";
-/// The prices it holds, in the source's column order.
-pub const OHLC_PRICES: [&str; 4] = ["open", "high", "low", "close"];
-/// Its fields: `open`, `body = close - open` (signed), `upper = high - max(open, close)` and
-/// `lower = min(open, close) - low` (both never negative, since `low <= open, close <= high`).
-/// The wicks are zero in most bars and the body in about half.
-pub const OHLC_PARTS: [&str; 4] = ["open", "body", "upper", "lower"];
 
 /// The [`OHLC`] parts' precision: 16 digits, so a price filter's sum of up to three parts has at
 /// most 18 and is an i64 decimal too. [`apply_plan`] checks that every part fits.
@@ -39,9 +33,15 @@ pub const OHLC_PRECISION: u8 = 16;
 
 /// The [`OHLC`] struct's fields: every part a `Decimal(OHLC_PRECISION, scale)`.
 pub fn ohlc_fields(scale: i8) -> Fields {
-    OHLC_PARTS
+    Part::ALL
         .iter()
-        .map(|&part| Field::new(part, DataType::Decimal128(OHLC_PRECISION, scale), false))
+        .map(|part| {
+            Field::new(
+                part.name(),
+                DataType::Decimal128(OHLC_PRECISION, scale),
+                false,
+            )
+        })
         .collect()
 }
 
@@ -66,7 +66,7 @@ pub fn planned_schema(plan: &Plan, schema: &Schema) -> Arc<Schema> {
                     field.with_data_type(DataType::Decimal128(precision, scale - *k as i8))
                 }
                 // The struct goes where open was; the other prices are in it.
-                Some(Transform::Ohlc(k)) if field.name() == OHLC_PRICES[0] => {
+                Some(Transform::Ohlc(k)) if field.name() == Price::Open.name() => {
                     let (_, scale) = decimal_params(&field);
                     let fields = ohlc_fields(scale - *k as i8);
                     field
@@ -105,7 +105,7 @@ pub fn apply_plan(plan: &Plan, schema: &Arc<Schema>, batch: RecordBatch) -> Reco
             let (precision, scale) = decimal_params(field);
             let values = column.as_primitive::<Decimal128Type>();
             Some(match transform {
-                Transform::Ohlc(k) if field.name() == OHLC_PRICES[0] => {
+                Transform::Ohlc(k) if field.name() == Price::Open.name() => {
                     ohlc_struct(&batch, *k, scale - *k as i8)
                 }
                 Transform::Ohlc(_) => return None,
@@ -130,7 +130,8 @@ pub fn apply_plan(plan: &Plan, schema: &Arc<Schema>, batch: RecordBatch) -> Reco
 /// A batch's four prices as the [`OHLC`] struct, rescaled by `k` to parts at `scale`.
 fn ohlc_struct(batch: &RecordBatch, k: u8, scale: i8) -> ArrowArrayRef {
     let factor = 10i128.pow(k as u32);
-    let [open, high, low, close] = OHLC_PRICES.map(|name| {
+    let [open, high, low, close] = Price::ALL.map(|price| {
+        let name = price.name();
         let column = batch.column_by_name(name).unwrap();
         assert_eq!(column.null_count(), 0, "{name} must be non-null");
         column.as_primitive::<Decimal128Type>().values()

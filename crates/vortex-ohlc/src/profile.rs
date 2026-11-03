@@ -7,7 +7,8 @@ use arrow::array::types::Decimal128Type;
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 
-use crate::plan::{Plan, Transform, OHLC_PRECISION, OHLC_PRICES};
+use crate::ohlc::Price;
+use crate::plan::{Plan, Transform, OHLC_PRECISION};
 
 /// What one decimal column's unscaled integers look like.
 #[derive(Clone, Debug)]
@@ -112,13 +113,13 @@ pub fn plan(profiles: &[DecimalProfile]) -> Plan {
         .filter(|p| p.lossless_k() > 0)
         .map(|p| (p.name.clone(), Transform::Rescale(p.lossless_k())))
         .collect();
-    let prices: Option<Vec<&DecimalProfile>> = OHLC_PRICES
+    let prices: Option<Vec<&DecimalProfile>> = Price::ALL
         .iter()
-        .map(|&price| profiles.iter().find(|p| p.name == price))
+        .map(|price| profiles.iter().find(|p| p.name == price.name()))
         .collect();
     if let Some(k) = prices.and_then(|prices| ohlc_k(&prices)) {
-        for price in OHLC_PRICES {
-            plan.insert(price.to_string(), Transform::Ohlc(k));
+        for price in Price::ALL {
+            plan.insert(price.name().to_string(), Transform::Ohlc(k));
         }
     }
     plan
@@ -221,13 +222,13 @@ mod tests {
     #[test]
     fn prices_become_the_ohlc_struct_at_the_smallest_k() {
         let plan = plan_of(prices(false, false));
-        assert!(OHLC_PRICES
+        assert!(Price::ALL
             .iter()
-            .all(|p| plan.get(*p) == Some(&Transform::Ohlc(4))));
+            .all(|p| plan.get(p.name()) == Some(&Transform::Ohlc(4))));
         let plan = plan_of(prices(true, false));
-        assert!(OHLC_PRICES
+        assert!(Price::ALL
             .iter()
-            .all(|p| plan.get(*p) == Some(&Transform::Ohlc(3))));
+            .all(|p| plan.get(p.name()) == Some(&Transform::Ohlc(3))));
     }
 
     #[test]

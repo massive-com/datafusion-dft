@@ -26,7 +26,8 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig};
 use datafusion::logical_expr::Expr;
-use vortex_ohlc::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
+use vortex_ohlc::ohlc::{Part, Price};
+use vortex_ohlc::plan::OHLC;
 
 use crate::BarsAdapterFactory;
 
@@ -64,7 +65,7 @@ pub fn source_table(listing: &ListingTable, state: &dyn Session) -> Result<Listi
 /// `fields`, with an [`OHLC`] struct of decimal parts replaced by the four prices: each a
 /// `Decimal128` at the parts' scale, two digits wider than them, which holds a sum of three.
 fn with_prices(fields: &[FieldRef]) -> Vec<Field> {
-    let mut out = Vec::with_capacity(fields.len() + OHLC_PRICES.len() - 1);
+    let mut out = Vec::with_capacity(fields.len() + Price::ALL.len() - 1);
     for field in fields {
         let parts = match field.data_type() {
             DataType::Struct(parts) if field.name() == OHLC => parts,
@@ -75,9 +76,11 @@ fn with_prices(fields: &[FieldRef]) -> Vec<Field> {
         };
         let names = parts.iter().map(|part| part.name().as_str());
         match parts.first().map(|open| open.data_type()) {
-            Some(&DataType::Decimal128(precision, scale)) if names.eq(OHLC_PARTS) => {
+            Some(&DataType::Decimal128(precision, scale))
+                if names.eq(Part::ALL.map(Part::name)) =>
+            {
                 let price = DataType::Decimal128(precision + 2, scale);
-                for name in OHLC_PRICES {
+                for name in Price::ALL.map(Price::name) {
                     out.push(Field::new(name, price.clone(), field.is_nullable()));
                 }
             }
