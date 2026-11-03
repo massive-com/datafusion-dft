@@ -38,8 +38,9 @@ const DATA_DIR: &str = concat!(
 );
 
 /// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout, 3
-/// since the bars layout at the root, 4 since it's gone.
-const VORTEX_VERSION: u32 = 4;
+/// since the bars layout at the root, 4 since it's gone, 5 since Vortex's compressor packs the
+/// planned columns.
+const VORTEX_VERSION: u32 = 5;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;

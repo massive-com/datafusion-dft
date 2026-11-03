@@ -35,7 +35,7 @@ pub fn write_options(
         serde_json::to_vec(&transforms_json(plan, source)).expect("a plan serializes to JSON");
     session
         .write_options()
-        .with_strategy(write_strategy(source, plan, row_block))
+        .with_strategy(write_strategy(session, source, plan, row_block))
         .with_metadata_segment(TRANSFORMS_KEY, ByteBuffer::copy_from(transforms))
 }
 

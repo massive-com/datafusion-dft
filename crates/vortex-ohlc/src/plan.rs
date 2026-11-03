@@ -21,8 +21,8 @@ pub enum Transform {
     /// struct column, [`OHLC`]: open as it is, plus small offsets that are mostly zero (see
     /// [`OHLC_PARTS`]). All four prices carry this transform; the struct takes open's place.
     Ohlc(u8),
-    /// An integer column, left as it is but compressed with FoR + FastLanes (see
-    /// [`crate::compress`]) rather than BtrBlocks, without a dictionary: a bit width per 1024
+    /// An integer column, left as it is but compressed on the writer's session (see
+    /// [`crate::strategy`]), whose edition allows blocked FoR and bit-packing: a bit width per 1024
     /// values, so the blocks of quiet tickers pack narrower than the chunk's busiest.
     Packed,
 }
