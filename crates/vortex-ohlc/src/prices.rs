@@ -19,11 +19,11 @@ use crate::ohlc::{Part, Price};
 use crate::plan::OHLC;
 
 /// A price as an expression over the [`OHLC`] struct's parts (in a table of `table`), with only
-/// Vortex's own functions; `None` for a table without the struct. close = open + body, high = (open + upper) + max(body, 0) and low = (open - lower) +
-/// min(body, 0): the larger and smaller of open and close are open plus the body where its sign
-/// is right. Keeping the body only there (`mask`, then `fill_null` with 0) runs vectorized, where
-/// a `zip` picking open or close slices both at every run of its mask, and the body's sign
-/// changes from one bar to the next.
+/// Vortex's own functions; `None` for a table without the struct. close = open + body,
+/// high = (open + upper) + max(body, 0) and low = (open - lower) + min(body, 0): the larger and
+/// smaller of open and close are open plus the body where its sign is right. Keeping the body only
+/// there (`mask`, then `fill_null` with 0) runs vectorized, where a `zip` picking open or close
+/// slices both at every run of its mask, and the body's sign changes from one bar to the next.
 pub fn price(table: &DType, price: Price) -> Option<Expression> {
     let parts = OhlcParts::new(table)?;
     let p = parts.precision;
@@ -49,10 +49,11 @@ pub fn price(table: &DType, price: Price) -> Option<Expression> {
     })
 }
 
-/// `price op literal`, where the literal is the decimal `unscaled / 10^scale`, as a filter over
-/// the [`OHLC`] struct's parts (in a table of `table`); `op` is a comparison. `None` for a table
-/// without the struct, or a literal the price's type can't hold exactly. The price is compared as [`price`] rebuilds it: one sum per row is quicker than
-/// comparing high and low one branch of the body's sign at a time, which takes a sum for each.
+/// `price op literal`, where the literal is the decimal `unscaled / 10^scale`, as a filter over the
+/// [`OHLC`] struct's parts (in a table of `table`); `op` is a comparison. `None` for a table
+/// without the struct, or a literal the price's type can't hold exactly. The price is compared as
+/// [`price`] rebuilds it: one sum per row is quicker than comparing high and low one branch of the
+/// body's sign at a time, which takes a sum for each.
 pub fn compare_price(
     table: &DType,
     price: Price,
