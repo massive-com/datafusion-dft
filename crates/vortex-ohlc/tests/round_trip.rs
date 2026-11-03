@@ -16,7 +16,9 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_ohlc::ohlc::ohlc_from_parts;
-use vortex_ohlc::plan::{apply_plan, planned_schema, Plan, Transform, OHLC, OHLC_PRICES};
+use vortex_ohlc::plan::{
+    apply_plan, planned_schema, Plan, Transform, OHLC, OHLC_PARTS, OHLC_PRICES,
+};
 use vortex_ohlc::write::{file_plan, file_source_schema};
 
 use test_util::{source, source_plan, write, ROWS, ROW_BLOCK};
@@ -119,19 +121,26 @@ fn round_trip() {
         assert_eq!(rebuilt, [0, 1, 2, 3].map(|i| prices[i][row]), "row {row}");
     }
 
+    // The parts and the packed column are bit-packed, in the encodings the edition allows.
+    let mut v2 = false;
     for chunk in &chunks {
         let ohlc = child(chunk, OHLC);
-        for part in ["open", "body", "upper", "lower"] {
+        for part in OHLC_PARTS {
             let ids = encoding_ids(&child(&ohlc, part));
             assert!(ids[0].contains("decimal_byte_parts"), "{part}: {ids:?}");
             assert!(
-                ids.iter().any(|id| id.starts_with("fastlanes.for")),
+                ids.iter().any(|id| id.starts_with("fastlanes.")),
                 "{part}: {ids:?}"
             );
+            v2 |= ids.iter().any(|id| id.ends_with(".v2"));
         }
         let ids = encoding_ids(&child(chunk, "transactions"));
-        assert!(ids[0].starts_with("fastlanes.for"), "transactions: {ids:?}");
+        assert!(
+            ids.iter().any(|id| id.starts_with("fastlanes.")),
+            "transactions: {ids:?}"
+        );
     }
+    assert!(v2, "no part is in an encoding only the edition allows");
     // Only the last chunk has volumes wider than an i64, cut into an i64 and lower parts.
     let volume_children = |chunk: &ArrayRef| child(chunk, "volume").named_children().len();
     let last = chunks.last().unwrap();
