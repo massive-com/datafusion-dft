@@ -12,7 +12,7 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::plan::{Plan, Transform};
+use vortex_ohlc::plan::Plan;
 use vortex_ohlc::profile::{plan, DecimalProfiler};
 use vortex_ohlc::write::{stored_arrays, write_options};
 
@@ -93,13 +93,11 @@ pub fn source() -> RecordBatch {
     .unwrap()
 }
 
-/// `source`'s plan, from its profile, with `transactions` packed.
+/// `source`'s plan, from its profile.
 pub fn source_plan(source: &RecordBatch) -> Plan {
     let mut profiler = DecimalProfiler::new(&source.schema());
     profiler.add(source);
-    let mut plan = plan(&profiler.finish());
-    plan.insert("transactions".to_string(), Transform::Packed);
-    plan
+    plan(&profiler.finish())
 }
 
 /// `source` written with `plan`, in 1,000-row batches and `ROW_BLOCK`-row chunks.

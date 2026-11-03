@@ -21,10 +21,6 @@ pub enum Transform {
     /// struct column, [`OHLC`]: open as it is, plus small offsets that are mostly zero (see
     /// [`OHLC_PARTS`]). All four prices carry this transform; the struct takes open's place.
     Ohlc(u8),
-    /// An integer column, left as it is but compressed on the writer's session (see
-    /// [`crate::strategy`]), whose edition allows blocked FoR and bit-packing: a bit width per 1024
-    /// values, so the blocks of quiet tickers pack narrower than the chunk's busiest.
-    Packed,
 }
 
 pub type Plan = BTreeMap<String, Transform>;
@@ -87,7 +83,6 @@ pub fn transforms_json(plan: &Plan, source: &Schema) -> serde_json::Value {
                     };
                     ("ohlc", expr, Some(k))
                 }
-                Transform::Packed => ("packed", name.clone(), None),
             };
             let mut entry = serde_json::json!({
                 "transform": kind,
@@ -125,7 +120,6 @@ pub fn plan_from_json(json: &serde_json::Value) -> Option<Plan> {
             let transform = match entry["transform"].as_str()? {
                 "rescale" => Transform::Rescale(k()?),
                 "ohlc" => Transform::Ohlc(k()?),
-                "packed" => Transform::Packed,
                 _ => return None,
             };
             Some((name.clone(), transform))
@@ -189,7 +183,7 @@ pub fn planned_schema(plan: &Plan, schema: &Schema) -> Arc<Schema> {
         .filter_map(|field| {
             let field = field.as_ref().clone();
             Some(match plan.get(field.name()) {
-                None | Some(Transform::Packed) => field,
+                None => field,
                 Some(Transform::Rescale(k)) => {
                     let (precision, scale) = decimal_params(&field);
                     field.with_data_type(DataType::Decimal128(precision, scale - *k as i8))
@@ -228,13 +222,12 @@ pub fn apply_plan(plan: &Plan, schema: &Arc<Schema>, batch: RecordBatch) -> Reco
         .zip(batch.columns())
         .filter_map(|(field, column)| {
             let transform = match plan.get(field.name()) {
-                None | Some(Transform::Packed) => return Some(Arc::clone(column)),
+                None => return Some(Arc::clone(column)),
                 Some(transform) => transform,
             };
             let (precision, scale) = decimal_params(field);
             let values = column.as_primitive::<Decimal128Type>();
             Some(match transform {
-                Transform::Packed => unreachable!("returned unchanged above"),
                 Transform::Ohlc(k) if field.name() == OHLC_PRICES[0] => {
                     ohlc_struct(&batch, *k, scale - *k as i8)
                 }

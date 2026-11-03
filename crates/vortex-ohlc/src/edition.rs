@@ -1,4 +1,4 @@
-//! The edition a writer needs for what [`crate::strategy`] writes, beyond Vortex's `core`
+//! The edition a writer needs for what [`crate::write`] writes, beyond Vortex's `core`
 //! editions:
 //!
 //! three of Vortex's own wire formats, new in Vortex 0.89 and in no Vortex edition yet: blocked

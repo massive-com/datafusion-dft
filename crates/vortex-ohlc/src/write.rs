@@ -13,18 +13,26 @@ use vortex::array::iter::{ArrayIterator, ArrayIteratorAdapter};
 use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::ByteBuffer;
 use vortex::error::VortexResult;
-use vortex::file::{VortexFile, VortexWriteOptions, WriteOptionsSessionExt};
+use vortex::file::{VortexFile, VortexWriteOptions, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::session::VortexSession;
 
 use crate::plan::{
     apply_plan, plan_from_json, planned_schema, source_schema, transforms_json, Plan,
     TRANSFORMS_KEY,
 };
-use crate::strategy::write_strategy;
+
+/// Rows per chunk (row block) by default: 65,536, the row group size of the Parquet files the
+/// bars come from.
+pub const DEFAULT_ROW_BLOCK: usize = 65_536;
 
 /// The options to write a table with `source`'s schema, stored as `plan` says, in
-/// `row_block`-row chunks: [`write_strategy`], and the plan recorded in the file (see
-/// [`transforms_json`]). The session must enable [`crate::edition`].
+/// `row_block`-row chunks, with the plan recorded in the file (see [`transforms_json`]).
+///
+/// The strategy is Vortex's default on `session`, which must enable [`crate::edition`]: its
+/// compressor may then use blocked FoR, blocked bit-packing and DecimalByteParts with lower parts,
+/// and each part of the [`OHLC`](crate::plan::OHLC) struct is a column of its own, with its own
+/// zone map. Vortex's default also coalesces blocks up to about 1 MiB, which would merge the
+/// narrow columns into bigger chunks, so that is turned off: every chunk is one row block.
 pub fn write_options(
     session: &VortexSession,
     source: &Schema,
@@ -35,7 +43,12 @@ pub fn write_options(
         serde_json::to_vec(&transforms_json(plan, source)).expect("a plan serializes to JSON");
     session
         .write_options()
-        .with_strategy(write_strategy(session, source, plan, row_block))
+        .with_strategy(
+            WriteStrategyBuilder::from_session(session)
+                .with_row_block_size(row_block)
+                .with_data_block_target_bytes(None)
+                .build(),
+        )
         .with_metadata_segment(TRANSFORMS_KEY, ByteBuffer::copy_from(transforms))
 }
 
