@@ -15,7 +15,7 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::ohlc::{ohlc_from_parts, Part, Price};
+use vortex_ohlc::ohlc::{Part, Price};
 use vortex_ohlc::plan::{apply_plan, planned_schema, Plan, Transform, OHLC};
 
 use test_util::{source, source_plan, write, ROWS, ROW_BLOCK};
@@ -85,26 +85,16 @@ fn round_trip() {
     let planned = apply_plan(&plan, &schema, source.clone());
     assert_eq!(read.columns(), planned.columns());
 
-    // The prices put back together from the parts, at the source's scale.
+    // The prices rebuilt from the parts, at the source's scale.
     let ohlc = read.column_by_name(OHLC).unwrap().as_struct();
-    let parts: Vec<&[i128]> = (0..4)
-        .map(|i| {
-            ohlc.column(i)
-                .as_primitive::<Decimal128Type>()
-                .values()
-                .as_ref()
-        })
-        .collect();
-    let prices: Vec<&[i128]> = Price::ALL
-        .iter()
-        .map(|p| {
-            let column = source.column_by_name(p.name()).unwrap();
-            column.as_primitive::<Decimal128Type>().values().as_ref()
-        })
-        .collect();
-    for row in 0..ROWS {
-        let rebuilt = ohlc_from_parts([0, 1, 2, 3].map(|i| parts[i][row])).map(|v| v * 100);
-        assert_eq!(rebuilt, [0, 1, 2, 3].map(|i| prices[i][row]), "row {row}");
+    let parts = Part::ALL.map(|part| {
+        let column = ohlc.column_by_name(part.name()).unwrap();
+        column.as_primitive::<Decimal128Type>().values().as_ref()
+    });
+    for price in Price::ALL {
+        let column = source.column_by_name(price.name()).unwrap();
+        let source = column.as_primitive::<Decimal128Type>().values().as_ref();
+        assert_eq!(price.rebuild(parts, 100), source, "{price:?}");
     }
 
     // The parts and transactions are bit-packed, in the encodings the edition allows.
