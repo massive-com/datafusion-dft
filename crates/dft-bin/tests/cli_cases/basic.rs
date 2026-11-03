@@ -1027,14 +1027,24 @@ fn test_output_vortex_zone_maps_disabled() {
 #[cfg(feature = "vortex")]
 const VORTEX_ENCODING_SOURCE: &str = "SELECT value::bigint AS int_col, (value % 1000)::double * 0.25 AS float_col, 'v' || (value % 100) AS string_col, arrow_cast('b' || (value % 37), 'Binary') AS binary_col, arrow_cast(value / 100.0, 'Decimal128(12, 2)') AS decimal_col, to_timestamp_seconds(value * 60) AS ext_col FROM generate_series(1, 65536)";
 
-/// A query for the rows that differ between [`VORTEX_ENCODING_SOURCE`] and the file at `file`,
-/// in either direction, as `mismatched`.
+/// A query for how the file at `file` differs from [`VORTEX_ENCODING_SOURCE`]: the source's rows
+/// it doesn't hold (`missing`), and how many rows it has beyond the source's (`extra`). Every
+/// source row is unique, so a file with neither holds exactly the source's rows (see
+/// [`VORTEX_ROUND_TRIPPED`]). The row count catches duplicates, which DataFusion's `EXCEPT ALL`
+/// doesn't.
 #[cfg(feature = "vortex")]
 fn vortex_mismatched_rows(file: &str) -> String {
     format!(
-        "SELECT (SELECT count(*) FROM (({VORTEX_ENCODING_SOURCE}) EXCEPT ALL (SELECT * FROM '{file}'))) + (SELECT count(*) FROM ((SELECT * FROM '{file}') EXCEPT ALL ({VORTEX_ENCODING_SOURCE}))) AS mismatched"
+        "WITH expected AS ({VORTEX_ENCODING_SOURCE}), actual AS (SELECT * FROM '{file}') \
+         SELECT count(*) AS missing, \
+         (SELECT count(*) FROM actual) - (SELECT count(*) FROM expected) AS extra \
+         FROM (SELECT * FROM expected EXCEPT SELECT * FROM actual)"
     )
 }
+
+/// What [`vortex_mismatched_rows`] prints for a file that holds exactly the source's rows.
+#[cfg(feature = "vortex")]
+const VORTEX_ROUND_TRIPPED: &str = "| 0       | 0     |";
 
 #[test]
 #[cfg(feature = "vortex")]
@@ -1094,7 +1104,7 @@ fn test_output_vortex_every_listed_encoding_round_trips() {
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&read.stdout);
-        if !read.status.success() || !stdout.contains("| 0          |") {
+        if !read.status.success() || !stdout.contains(VORTEX_ROUND_TRIPPED) {
             failures.push(format!(
                 "{kind}.{encoding}: read back differs: {stdout}{}",
                 String::from_utf8_lossy(&read.stderr)
@@ -1127,7 +1137,7 @@ fn test_output_vortex_blocked_encodings_round_trip() {
         .arg(vortex_mismatched_rows(path.to_str().unwrap()))
         .assert()
         .success()
-        .stdout(contains_str("| 0          |"));
+        .stdout(contains_str(VORTEX_ROUND_TRIPPED));
 }
 
 #[test]
