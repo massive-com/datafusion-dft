@@ -489,42 +489,25 @@ mod tests {
     use vortex_ohlc::ohlc::ohlc_to_parts;
     use vortex_ohlc::plan::OHLC_PRECISION;
 
-    /// The parts' scale in these tests, and the table's: prices rescaled by 2.
+    /// The parts' scale in these tests, test-util's prices' (see [`zones_of_bars`]), and the
+    /// table's: prices rescaled by 2.
     const PART_SCALE: i8 = 4;
     const TABLE: DataType = DataType::Decimal128(18, 6);
 
-    /// Bars of three zones, `[open, high, low, close]` unscaled at [`PART_SCALE`]: rising and
-    /// falling bodies, flat bars, wicks on either side or none, and prices from cents to
-    /// thousands, from a fixed pseudo-random sequence.
+    /// The bars of test-util's table, `[open, high, low, close]` unscaled at [`PART_SCALE`], in
+    /// zones of its row block: rising and falling bodies, flat bars, and wicks on either side or
+    /// none.
     fn zones_of_bars() -> Vec<Vec<[i128; 4]>> {
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut next = |below: u64| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state % below) as i128
-        };
-        [100, 10_000, 10_000_000]
-            .into_iter()
-            .map(|base| {
-                (0..200)
-                    .map(|_| {
-                        let open = base + next(base as u64);
-                        let close = match next(3) {
-                            0 => open,
-                            1 => open + next(base as u64 / 10 + 1),
-                            _ => open - next(base as u64 / 10 + 1),
-                        };
-                        let mut wick = || match next(2) {
-                            0 => 0,
-                            _ => next(base as u64 / 20 + 1),
-                        };
-                        let high = open.max(close) + wick();
-                        let low = open.min(close) - wick();
-                        [open, high, low, close]
-                    })
-                    .collect()
-            })
+        let source = test_util::source();
+        let [open, high, low, close] = Price::ALL.map(|price| {
+            let column = source.column_by_name(price.name()).unwrap();
+            column.as_primitive::<Decimal128Type>().values().to_vec()
+        });
+        let bars: Vec<[i128; 4]> = (0..source.num_rows())
+            .map(|i| [open[i], high[i], low[i], close[i]])
+            .collect();
+        bars.chunks(test_util::ROW_BLOCK)
+            .map(<[_]>::to_vec)
             .collect()
     }
 
