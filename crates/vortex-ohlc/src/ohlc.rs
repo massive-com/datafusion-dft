@@ -1,7 +1,7 @@
 //! A bar's four prices ([`Price`]) as the parts the [`OHLC`](crate::plan::OHLC) struct stores
 //! ([`Part`]), and back.
 
-use num_traits::PrimInt;
+use num_traits::{AsPrimitive, PrimInt};
 
 /// One of a bar's four prices, each a column of the source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,28 +55,36 @@ impl Price {
     }
 
     /// The price of every bar from its parts' unscaled values, in [`Part::ALL`] order, times
-    /// `factor`. A part the price doesn't [use](Self::uses) may be empty; the others have a value
-    /// for every bar. The parts have at most 16 digits
-    /// ([`OHLC_PRECISION`](crate::plan::OHLC_PRECISION)) and the price, times `factor`, at most
-    /// 18, so the sums fit an i64: a loop of its own for each price, in i64, vectorizes.
-    pub fn rebuild(self, [open, body, upper, lower]: [&[i128]; 4], factor: i64) -> Vec<i128> {
-        // `price` is a constant in each loop, so its match folds away.
-        let at = |price: Price, parts: [i128; 4]| {
-            (price.from_parts(parts.map(|v| v as i64)) * factor) as i128
+    /// `factor`, summed in `W`. A part the price doesn't [use](Self::uses) may be empty; the
+    /// others have a value for every bar.
+    ///
+    /// Every part and every partial sum is a price or the difference of two, at most twice the
+    /// largest price, so `W` = i64 holds them when the prices, times `factor`, have at most 18
+    /// digits; wider prices need i128.
+    pub fn rebuild<W>(self, [open, body, upper, lower]: [&[i128]; 4], factor: W) -> Vec<i128>
+    where
+        W: PrimInt + AsPrimitive<i128>,
+        i128: AsPrimitive<W>,
+    {
+        // `price` is a constant in each loop, so its match folds away. The closures hold
+        // `factor` by value: a loop the compiler doesn't inline here would otherwise load it
+        // through two references for every bar, which made scans on one partition 7-8% slower.
+        let at = move |price: Price, parts: [i128; 4]| {
+            (price.from_parts(parts.map(|v| v.as_())) * factor).as_()
         };
         match self {
             Price::Open => open
                 .iter()
-                .map(|&o| at(Price::Open, [o, 0, 0, 0]))
+                .map(move |&o| at(Price::Open, [o, 0, 0, 0]))
                 .collect(),
             Price::High => (open.iter().zip(body).zip(upper))
-                .map(|((&o, &b), &u)| at(Price::High, [o, b, u, 0]))
+                .map(move |((&o, &b), &u)| at(Price::High, [o, b, u, 0]))
                 .collect(),
             Price::Low => (open.iter().zip(body).zip(lower))
-                .map(|((&o, &b), &l)| at(Price::Low, [o, b, 0, l]))
+                .map(move |((&o, &b), &l)| at(Price::Low, [o, b, 0, l]))
                 .collect(),
             Price::Close => (open.iter().zip(body))
-                .map(|(&o, &b)| at(Price::Close, [o, b, 0, 0]))
+                .map(move |(&o, &b)| at(Price::Close, [o, b, 0, 0]))
                 .collect(),
         }
     }
