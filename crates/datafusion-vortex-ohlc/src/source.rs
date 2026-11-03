@@ -15,68 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A listing table over the files as a table of the source they were written from.
+//! A listing table over the files as a table of bars, with the prices in place of the struct
+//! that stores them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DataFusionError, Result};
-use datafusion::datasource::listing::{ListingTable, ListingTableConfig, PartitionedFile};
+use datafusion::common::Result;
+use datafusion::datasource::listing::{ListingTable, ListingTableConfig};
 use datafusion::logical_expr::Expr;
-use futures::StreamExt;
-use vortex::file::OpenOptionsSessionExt;
-use vortex::session::VortexSession;
-use vortex_datafusion::reader::VortexReaderFactory;
-use vortex_ohlc::write::file_source_schema;
+use vortex_ohlc::plan::{OHLC, OHLC_PARTS, OHLC_PRICES};
 
 use crate::BarsAdapterFactory;
 
-/// `listing`, a listing table over Vortex files, as a table of the source they were written from,
-/// if the first of them records a plan (see [`file_source_schema`]): with the source's schema
-/// (columns the table already has as the source has them are kept), and every file read through a
-/// [`BarsAdapterFactory`]. Its definition, constraints and column defaults are kept, and its files'
-/// statistics are kept in `state`'s cache, as DataFusion's `CREATE EXTERNAL TABLE` keeps them.
-/// The first file is opened on `session`, through `readers`. `None` if the table has no files, or
-/// the first records no plan that fits the table.
-pub async fn source_table(
-    listing: &ListingTable,
-    state: &dyn Session,
-    readers: &dyn VortexReaderFactory,
-    session: &VortexSession,
-) -> Result<Option<ListingTable>> {
-    let Some(url) = listing.table_paths().first() else {
-        return Ok(None);
-    };
-    let store = state.runtime_env().object_store(url.object_store())?;
-    let extension = &listing.options().file_extension;
-    let first = url
-        .list_all_files(state, store.as_ref(), extension)
-        .await?
-        .next()
-        .await
-        .transpose()?;
-    let Some(first) = first else {
-        return Ok(None);
-    };
-    let file = PartitionedFile::from(first);
-    let reader = readers.create_reader(&file, session)?;
-    let file = session
-        .open_options()
-        .include_metadata()
-        .with_file_size(file.object_meta.size)
-        .open_read(reader)
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+/// `listing`, a listing table over Vortex files, as a table of bars: an [`OHLC`] struct in its
+/// schema becomes the four prices, at the parts' scale, and every file is read through a
+/// [`BarsAdapterFactory`], so the prices are rebuilt from a file's struct. Its definition,
+/// constraints and column defaults are kept, and its files' statistics are kept in `state`'s
+/// cache, as DataFusion's `CREATE EXTERNAL TABLE` keeps them.
+pub fn source_table(listing: &ListingTable, state: &dyn Session) -> Result<ListingTable> {
     // The table's schema has the partition columns after the files'.
     let table = listing.schema();
     let partitions = listing.options().table_partition_cols.len();
     let files = &table.fields()[..table.fields().len() - partitions];
-    let stored = Schema::new_with_metadata(files.to_vec(), table.metadata().clone());
-    let Some(source) = file_source_schema(&file, &stored) else {
-        return Ok(None);
-    };
+    let schema = Schema::new_with_metadata(with_prices(files), table.metadata().clone());
     let column_defaults: HashMap<String, Expr> = table
         .fields()
         .iter()
@@ -87,14 +51,38 @@ pub async fn source_table(
         .collect();
     let config = ListingTableConfig::new_with_multi_paths(listing.table_paths().clone())
         .with_listing_options(listing.options().clone())
-        .with_schema(Arc::new(source))
+        .with_schema(Arc::new(schema))
         .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
     let cache = state.runtime_env().cache_manager.get_file_statistic_cache();
-    Ok(Some(
-        ListingTable::try_new(config)?
-            .with_cache(cache)
-            .with_definition(listing.get_table_definition().map(str::to_string))
-            .with_constraints(listing.constraints().cloned().unwrap_or_default())
-            .with_column_defaults(column_defaults),
-    ))
+    Ok(ListingTable::try_new(config)?
+        .with_cache(cache)
+        .with_definition(listing.get_table_definition().map(str::to_string))
+        .with_constraints(listing.constraints().cloned().unwrap_or_default())
+        .with_column_defaults(column_defaults))
+}
+
+/// `fields`, with an [`OHLC`] struct of decimal parts replaced by the four prices: each a
+/// `Decimal128` at the parts' scale, two digits wider than them, which holds a sum of three.
+fn with_prices(fields: &[FieldRef]) -> Vec<Field> {
+    let mut out = Vec::with_capacity(fields.len() + OHLC_PRICES.len() - 1);
+    for field in fields {
+        let parts = match field.data_type() {
+            DataType::Struct(parts) if field.name() == OHLC => parts,
+            _ => {
+                out.push(field.as_ref().clone());
+                continue;
+            }
+        };
+        let names = parts.iter().map(|part| part.name().as_str());
+        match parts.first().map(|open| open.data_type()) {
+            Some(&DataType::Decimal128(precision, scale)) if names.eq(OHLC_PARTS) => {
+                let price = DataType::Decimal128(precision + 2, scale);
+                for name in OHLC_PRICES {
+                    out.push(Field::new(name, price.clone(), field.is_nullable()));
+                }
+            }
+            _ => out.push(field.as_ref().clone()),
+        }
+    }
+    out
 }

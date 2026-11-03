@@ -109,9 +109,9 @@ pub fn write(source: &RecordBatch, plan: &Plan) -> Vec<u8> {
         .step_by(1_000)
         .map(|start| source.slice(start, 1_000.min(ROWS - start)))
         .collect();
-    let arrays = stored_arrays(&session, plan, &source.schema(), batches).unwrap();
+    let arrays = stored_arrays(&session, &source.schema(), plan, batches).unwrap();
     let mut bytes = Vec::new();
-    write_options(&session, &source.schema(), plan, ROW_BLOCK)
+    write_options(&session, ROW_BLOCK)
         .blocking(&runtime)
         .write(&mut bytes, arrays)
         .unwrap();

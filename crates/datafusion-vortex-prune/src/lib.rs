@@ -24,9 +24,9 @@
 //! - [`PrunedTableFactory`] and [`enable_url_table`] make a DataFusion session's Vortex tables
 //!   pruned ones, those created with `CREATE EXTERNAL TABLE` and those queried by path.
 //!
-//! Files written by vortex-ohlc are read as the source they were written from (see
-//! `datafusion_vortex_ohlc::source_table`), and their prices pruned on the bounds of the parts
-//! they are stored as.
+//! Files written by vortex-ohlc are read with the four prices in place of the struct that stores
+//! them (see `datafusion_vortex_ohlc::source_table`), and the prices pruned on the bounds of the
+//! parts.
 
 mod prune;
 mod table;

@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reading the files from DataFusion as the source they were written from: a table over them
-//! has the source's schema (a Parquet file's, say), and the scan rebuilds each file's planned
-//! columns into it.
+//! Reading the files from DataFusion as a table of bars: a table over them has the four prices
+//! where the files have the [`OHLC`] struct, and the scan rebuilds them from it. A table may also
+//! declare the source's own schema (a Parquet file's, say): the scan then reads each rescaled
+//! decimal column back at the source's scale too.
 //!
 //! - [`BarsAdapterFactory`] rewrites a scan's expressions from the table's columns to a file's:
 //!   a price becomes an [`OhlcPrice`] over the [`OHLC`] struct, a rescaled decimal column a
@@ -29,8 +30,8 @@
 //!   DataFusion ([`OhlcPrice`], [`Rescaled`]), which is quicker than Vortex's expressions for it.
 //!
 //! [`vortex_format_factory`] makes formats that read the files this way, given a table with the
-//! source's schema and a [`BarsAdapterFactory`]. [`source_table`] makes that table from a listing
-//! table over the files, with the plan the first of them records.
+//! prices and a [`BarsAdapterFactory`]. [`source_table`] makes that table from a listing table
+//! over the files.
 
 use std::collections::HashMap;
 use std::fmt;

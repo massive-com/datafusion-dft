@@ -38,12 +38,8 @@ use crate::{PrunedTable, ZonePruner};
 /// `table`, if it's a listing table of Vortex files, with its scans pruned to the zones their
 /// filter can match before they start, by the [`ZonePruner`] `state` keeps, which keeps the zone
 /// maps for as long as the session lasts (see [`PrunedTable::over`]). Files written by
-/// vortex-ohlc are read as the source they were written from: the table has the source's
-/// columns, not the ones the files store.
-async fn pruned(
-    table: Arc<dyn TableProvider>,
-    state: &dyn Session,
-) -> Result<Arc<dyn TableProvider>> {
+/// vortex-ohlc are read with the four prices in place of the struct that stores them.
+fn pruned(table: Arc<dyn TableProvider>, state: &dyn Session) -> Result<Arc<dyn TableProvider>> {
     let Some(listing) = table.downcast_ref::<ListingTable>() else {
         return Ok(table);
     };
@@ -53,7 +49,7 @@ async fn pruned(
     ) else {
         return Ok(table);
     };
-    Ok(Arc::new(PrunedTable::over(listing, state, pruner).await?))
+    Ok(Arc::new(PrunedTable::over(listing, state, pruner)?))
 }
 
 /// DataFusion's table factory, its Vortex tables made [`PrunedTable`]s: register it for `VORTEX`,
@@ -68,7 +64,7 @@ impl TableProviderFactory for PrunedTableFactory {
         state: &dyn Session,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>> {
-        pruned(self.0.create(state, cmd).await?, state).await
+        pruned(self.0.create(state, cmd).await?, state)
     }
 }
 
@@ -96,7 +92,7 @@ impl UrlTableFactory for PrunedUrlTables {
         let Some(state) = state else {
             return Ok(Some(table));
         };
-        pruned(table, &state).await.map(Some)
+        pruned(table, &state).map(Some)
     }
 }
 

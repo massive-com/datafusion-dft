@@ -1,10 +1,11 @@
 //! A file written by vortex-ohlc, read from DataFusion as dft reads it (see `PrunedTable::over`):
-//! the file is the source again, and filters on the rebuilt prices and the rescaled columns prune
-//! its zones.
+//! the source's values, the prices rebuilt from their parts, and filters on the prices and the
+//! rescaled columns prune its zones.
 
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
+use arrow::compute::{cast, concat_batches};
+use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::datasource::listing::{
@@ -60,13 +61,35 @@ async fn read_from_datafusion() -> datafusion::common::Result<()> {
         .await?;
     let listing = ListingTable::try_new(config)?;
     let pruner = Arc::new(ZonePruner::new(session));
-    let table = PrunedTable::over(&listing, &state, pruner).await?;
+    let table = PrunedTable::over(&listing, &state, pruner)?;
     ctx.register_table("bars", Arc::new(table))?;
 
+    // The source's values at the scales they are stored at: the prices at their parts', and the
+    // volumes in whole shares.
     let read = ctx.sql("SELECT * FROM bars").await?.collect().await?;
-    assert_eq!(read[0].schema().fields(), source.schema().fields());
-    let read = concat_batches(&source.schema(), &read)?;
-    assert_eq!(read.columns(), source.columns());
+    let schema = read[0].schema();
+    let types: Vec<(&str, &DataType)> = schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.data_type()))
+        .collect();
+    let price = DataType::Decimal128(18, 2);
+    assert_eq!(
+        types,
+        [
+            ("ticker", &DataType::Utf8View),
+            ("open", &price),
+            ("high", &price),
+            ("low", &price),
+            ("close", &price),
+            ("volume", &DataType::Decimal128(38, 0)),
+            ("transactions", &DataType::Int64),
+        ]
+    );
+    let read = concat_batches(&schema, &read)?;
+    for (read, source) in read.columns().iter().zip(source.columns()) {
+        assert_eq!(read, &cast(source, read.data_type())?);
+    }
 
     // Only the last ticker's highs are this high and only the first's lows this low, so each
     // scan reads the one zone of three holding them, pruned on the bounds of the parts the prices
