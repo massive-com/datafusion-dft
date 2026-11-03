@@ -40,8 +40,8 @@ use std::sync::Arc;
 
 use arrow::array::cast::AsArray;
 use arrow::array::types::Decimal128Type;
-use arrow::array::{Array, Decimal128Array, PrimitiveArray, RecordBatch};
-use arrow::buffer::{NullBuffer, ScalarBuffer};
+use arrow::array::{Array, Decimal128Array, RecordBatch};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{exec_err, Result, ScalarValue};
@@ -97,17 +97,6 @@ impl OhlcPrice {
     pub fn name(&self) -> &'static str {
         self.price.name()
     }
-
-    /// Whether the price is rebuilt from each part, in [`Part::ALL`] order: open, then the body
-    /// for any price but open, and the wick on its side for high and low.
-    fn parts_needed(&self) -> [bool; 4] {
-        Part::ALL.map(|part| match part {
-            Part::Open => true,
-            Part::Body => self.price != Price::Open,
-            Part::Upper => self.price == Price::High,
-            Part::Lower => self.price == Price::Low,
-        })
-    }
 }
 
 impl PartialEq for OhlcPrice {
@@ -143,11 +132,12 @@ impl PhysicalExpr for OhlcPrice {
         let DataType::Decimal128(precision, scale) = *self.field.data_type() else {
             unreachable!("checked in OhlcPrice::new");
         };
+        // The parts the price uses, and their nulls with the struct's.
         let mut nulls = ohlc.nulls().cloned();
-        let mut parts: [Option<&PrimitiveArray<Decimal128Type>>; 4] = [None; 4];
+        let mut parts: [&[i128]; 4] = [&[]; 4];
         let mut parts_scale = None;
-        for ((part, values), needed) in Part::ALL.iter().zip(&mut parts).zip(self.parts_needed()) {
-            if !needed {
+        for (part, values) in Part::ALL.into_iter().zip(&mut parts) {
+            if !self.price.uses(part) {
                 continue;
             }
             let name = part.name();
@@ -159,47 +149,13 @@ impl PhysicalExpr for OhlcPrice {
             };
             nulls = NullBuffer::union(nulls.as_ref(), column.nulls());
             parts_scale = Some(column.scale());
-            *values = Some(column);
+            *values = column.values();
         }
-        let shift = scale - parts_scale.expect("open is always needed");
+        let shift = scale - parts_scale.expect("every price uses open");
         if shift < 0 {
             return exec_err!("{self}: the parts' scale is above the price's");
         }
-        let factor = 10i64.pow(shift as u32);
-        let [open, body, upper, lower] = parts.map(|part| part.map(PrimitiveArray::values));
-        let open = open.expect("open is always needed");
-        fn needed(part: Option<&ScalarBuffer<i128>>) -> std::slice::Iter<'_, i128> {
-            part.expect("the price needs it").iter()
-        }
-        // The parts have OHLC_PRECISION digits and the price at most 18, so the sums and the
-        // rescale fit an i64: a loop of its own for each price, in i64, vectorizes.
-        let widen = |price: i64| (price * factor) as i128;
-        let rebuilt: Vec<i128> = match self.price {
-            Price::Open => open.iter().map(|&o| widen(o as i64)).collect(),
-            Price::Close => open
-                .iter()
-                .zip(needed(body))
-                .map(|(&o, &b)| widen(o as i64 + b as i64))
-                .collect(),
-            Price::High => open
-                .iter()
-                .zip(needed(body))
-                .zip(needed(upper))
-                .map(|((&o, &b), &u)| {
-                    let (o, b, u) = (o as i64, b as i64, u as i64);
-                    widen(o + b.max(0) + u)
-                })
-                .collect(),
-            Price::Low => open
-                .iter()
-                .zip(needed(body))
-                .zip(needed(lower))
-                .map(|((&o, &b), &l)| {
-                    let (o, b, l) = (o as i64, b as i64, l as i64);
-                    widen(o + b.min(0) - l)
-                })
-                .collect(),
-        };
+        let rebuilt = self.price.rebuild(parts, 10i64.pow(shift as u32));
         let array = Decimal128Array::new(rebuilt.into(), nulls)
             .with_precision_and_scale(precision, scale)?;
         Ok(ColumnarValue::Array(Arc::new(array)))

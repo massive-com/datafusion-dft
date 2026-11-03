@@ -1,7 +1,7 @@
 //! The four prices as Vortex expressions over the [`OHLC`] struct's parts ([`price`]), for a
 //! scan to filter on them without leaving Vortex ([`compare_price`]). Rebuilding them for the
-//! rows a scan returns is left to DataFusion (see datafusion-vortex-ohlc's `OhlcPrice`), which is
-//! quicker.
+//! rows a scan returns is left to [`Price::rebuild`] (see datafusion-vortex-ohlc's `OhlcPrice`),
+//! which is quicker.
 //!
 //! Vortex only adds and compares decimals of one type, and a sum is one digit wider than its
 //! operands, so each operand is cast to the precision its place needs: the parts start at their

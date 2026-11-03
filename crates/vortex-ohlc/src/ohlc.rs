@@ -30,6 +30,56 @@ impl Price {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|price| price.name() == name)
     }
+
+    /// Whether the price is rebuilt from `part`: every price from open, every price but open
+    /// from the body, and high and low from the wick on their side.
+    pub fn uses(self, part: Part) -> bool {
+        match part {
+            Part::Open => true,
+            Part::Body => self != Price::Open,
+            Part::Upper => self == Price::High,
+            Part::Lower => self == Price::Low,
+        }
+    }
+
+    /// The price of a bar from its parts, in [`Part::ALL`] order; the parts it doesn't
+    /// [use](Self::uses) are ignored. It grows with every part but the lower wick, which it
+    /// shrinks with.
+    pub fn from_parts<W: PrimInt>(self, [open, body, upper, lower]: [W; 4]) -> W {
+        match self {
+            Price::Open => open,
+            Price::High => open + body.max(W::zero()) + upper,
+            Price::Low => open + body.min(W::zero()) - lower,
+            Price::Close => open + body,
+        }
+    }
+
+    /// The price of every bar from its parts' unscaled values, in [`Part::ALL`] order, times
+    /// `factor`. A part the price doesn't [use](Self::uses) may be empty; the others have a value
+    /// for every bar. The parts have at most 16 digits
+    /// ([`OHLC_PRECISION`](crate::plan::OHLC_PRECISION)) and the price, times `factor`, at most
+    /// 18, so the sums fit an i64: a loop of its own for each price, in i64, vectorizes.
+    pub fn rebuild(self, [open, body, upper, lower]: [&[i128]; 4], factor: i64) -> Vec<i128> {
+        // `price` is a constant in each loop, so its match folds away.
+        let at = |price: Price, parts: [i128; 4]| {
+            (price.from_parts(parts.map(|v| v as i64)) * factor) as i128
+        };
+        match self {
+            Price::Open => open
+                .iter()
+                .map(|&o| at(Price::Open, [o, 0, 0, 0]))
+                .collect(),
+            Price::High => (open.iter().zip(body).zip(upper))
+                .map(|((&o, &b), &u)| at(Price::High, [o, b, u, 0]))
+                .collect(),
+            Price::Low => (open.iter().zip(body).zip(lower))
+                .map(|((&o, &b), &l)| at(Price::Low, [o, b, 0, l]))
+                .collect(),
+            Price::Close => (open.iter().zip(body))
+                .map(|(&o, &b)| at(Price::Close, [o, b, 0, 0]))
+                .collect(),
+        }
+    }
 }
 
 /// One of the [`OHLC`](crate::plan::OHLC) struct's fields, a bar's prices stored against each
@@ -70,14 +120,8 @@ pub fn ohlc_to_parts<W: PrimInt>(open: W, high: W, low: W, close: W) -> [W; 4] {
 }
 
 /// The prices of one bar from its parts, in [`Price::ALL`] order; undoes [`ohlc_to_parts`].
-pub fn ohlc_from_parts<W: PrimInt>([open, body, upper, lower]: [W; 4]) -> [W; 4] {
-    let close = open + body;
-    [
-        open,
-        open.max(close) + upper,
-        open.min(close) - lower,
-        close,
-    ]
+pub fn ohlc_from_parts<W: PrimInt>(parts: [W; 4]) -> [W; 4] {
+    Price::ALL.map(|price| price.from_parts(parts))
 }
 
 #[cfg(test)]

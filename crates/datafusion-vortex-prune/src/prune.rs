@@ -437,17 +437,12 @@ impl PruningStatistics for ZoneStatistics<'_> {
 }
 
 /// The zones' min (`max` false) or max of `price` as a `Decimal128` of `data_type`, from the
-/// bounds of the [`OHLC`] parts it is rebuilt from. Every price grows with open and the body,
-/// high with the upper wick, and low shrinks with the lower one:
-///
-/// - open = open, close = open + body;
-/// - high = open + max(body, 0) + upper;
-/// - low = open + min(body, 0) - lower.
-///
-/// So a price's min is at least what its parts' mins give (the lower wick's max, for low), and
-/// its max at most what their maxes give. The parts' bounds are `columns`' (see [`FileZones`]).
-/// `None` unless `columns` has the parts it needs, and `data_type` is a `Decimal128` at a scale
-/// at least theirs.
+/// bounds of the [`OHLC`] parts it is rebuilt from. A price grows with every part but the lower
+/// wick, which it shrinks with (see [`Price::from_parts`]): so its min is at least what the parts'
+/// mins give with the lower wick's max, and its max at most what their maxes give with the lower
+/// wick's min. The parts' bounds are `columns`' (see [`FileZones`]). `None` unless `columns` has
+/// the parts the price [uses](Price::uses), and `data_type` is a `Decimal128` at a scale at least
+/// theirs.
 fn price_bounds(
     columns: &HashMap<String, (ArrayRef, ArrayRef)>,
     price: Price,
@@ -457,34 +452,34 @@ fn price_bounds(
     let DataType::Decimal128(precision, scale) = *data_type else {
         return None;
     };
-    let part = |part: Part, max: bool| -> Option<&Decimal128Array> {
-        let (min_values, max_values) = columns.get(&format!("{OHLC}.{}", part.name()))?;
-        (if max { max_values } else { min_values }).as_primitive_opt::<Decimal128Type>()
-    };
-    let (o, b) = (part(Part::Open, max)?, part(Part::Body, max)?);
-    let shift = scale.checked_sub(o.scale()).filter(|s| *s >= 0)?;
+    // Each part's bound that bounds the price's: the other one, for the lower wick.
+    let mut parts: [Option<&Decimal128Array>; 4] = [None; 4];
+    for (part, bounds) in Part::ALL.into_iter().zip(&mut parts) {
+        if price.uses(part) {
+            let (min_values, max_values) = columns.get(&format!("{OHLC}.{}", part.name()))?;
+            let values = if max != (part == Part::Lower) {
+                max_values
+            } else {
+                min_values
+            };
+            *bounds = Some(values.as_primitive_opt::<Decimal128Type>()?);
+        }
+    }
+    let open = parts[0].expect("every price uses open");
+    let shift = scale.checked_sub(open.scale()).filter(|s| *s >= 0)?;
     let factor = 10i128.pow(shift as u32);
-    let at = |array: &Decimal128Array, i: usize| array.is_valid(i).then(|| array.value(i));
-    let bound: Decimal128Array = match price {
-        Price::Open => (0..o.len()).map(|i| at(o, i)).collect(),
-        Price::Close => (0..o.len()).map(|i| Some(at(o, i)? + at(b, i)?)).collect(),
-        Price::High => {
-            let u = part(Part::Upper, max)?;
-            (0..o.len())
-                .map(|i| Some(at(o, i)? + at(b, i)?.max(0) + at(u, i)?))
-                .collect()
-        }
-        Price::Low => {
-            let l = part(Part::Lower, !max)?;
-            (0..o.len())
-                .map(|i| Some(at(o, i)? + at(b, i)?.min(0) - at(l, i)?))
-                .collect()
-        }
+    // A part the price doesn't use is 0, and a zone without a bound bounds nothing.
+    let at = |part: Option<&Decimal128Array>, i: usize| match part {
+        None => Some(0),
+        Some(values) => values.is_valid(i).then(|| values.value(i)),
     };
-    let bound = bound
-        .unary::<_, Decimal128Type>(|v| v * factor)
-        .with_precision_and_scale(precision, scale)
-        .ok()?;
+    let bound: Decimal128Array = (0..open.len())
+        .map(|i| {
+            let [o, b, u, l] = parts.map(|part| at(part, i));
+            Some(price.from_parts([o?, b?, u?, l?]) * factor)
+        })
+        .collect();
+    let bound = bound.with_precision_and_scale(precision, scale).ok()?;
     Some(Arc::new(bound))
 }
 
