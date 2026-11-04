@@ -32,6 +32,11 @@ use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
 /// `array` decoded, through a [`Scaled`] decimal divided by one `10^k` for every row to its
 /// values: the same numbers at `k` less scale, at the width they're stored at rather than an
 /// i128's.
+///
+/// *Upstream*: with vortex#10701, DecimalByteParts (vortex#10905) and narrow `vortex.decimal`
+/// nodes (vortex#10995) decode to a `Widen` of the values at their stored width, whose compares
+/// and arithmetic stay narrow. This should then look through `Widen` as it does `Scaled`:
+/// executed to a `DecimalArray`, the values would be copied out at the precision's width.
 pub(crate) fn decoded(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<DecimalArray> {
     let Some(scaled) = array.as_opt::<Scaled>() else {
         return array.execute::<DecimalArray>(ctx);
