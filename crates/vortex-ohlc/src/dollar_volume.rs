@@ -25,7 +25,7 @@ use vortex::scalar_fn::{
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
-use crate::scaled::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
+use crate::scaled::decoded;
 
 /// The scalar function: its children are the residual, the volume and the open, all decimals,
 /// with the residual at the dollar volume's scale and the volume's and the open's adding up to no
@@ -114,29 +114,6 @@ pub(crate) fn residual(
 /// `10^k`; `None` for a negative `k`, or one too big for an i128.
 fn pow10(k: i32) -> Option<i128> {
     10i128.checked_pow(u32::try_from(k).ok()?)
-}
-
-/// `array` decoded, through a [`Scaled`] decimal divided by one `10^k` for every row to its
-/// values: the same numbers at `k` less scale, at the width they're stored at rather than an
-/// i128's.
-fn decoded(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<DecimalArray> {
-    let Some(scaled) = array.as_opt::<Scaled>() else {
-        return array.execute::<DecimalArray>(ctx);
-    };
-    let k = scaled.exponent().filter(|_| scaled.divisor().is_some());
-    let Some(k) = k.filter(|_| scaled.base() == 10) else {
-        return array.execute::<DecimalArray>(ctx);
-    };
-    let values = scaled.values().clone().execute::<DecimalArray>(ctx)?;
-    let decimal = values.decimal_dtype();
-    let scale = i8::try_from(i16::from(decimal.scale()) - i16::from(k))
-        .map_err(|_| vortex_err!("a scale of {} less {k}", decimal.scale()))?;
-    DecimalArray::try_new_handle(
-        values.buffer_handle().clone(),
-        values.values_type(),
-        DecimalDType::try_new(decimal.precision(), scale)?,
-        values.validity()?,
-    )
 }
 
 /// Run `$body` with `$values` bound to `$array`'s unscaled values at their width if it's an i32,
@@ -298,6 +275,7 @@ mod tests {
     use vortex::VortexSessionDefault;
 
     use super::*;
+    use crate::scaled::Scaled;
 
     /// `residual + volume × open` at the dollar volume's scale, a null volume counting as 0.
     #[test]

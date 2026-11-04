@@ -3,12 +3,14 @@
 
 use std::fmt;
 
+use num_traits::{AsPrimitive, PrimInt, WrappingMul};
+
 use vortex::array::arrays::decimal::DecimalArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{DecimalArray, StructArray};
 use vortex::array::{ArrayRef, ExecutionCtx, IntoArray};
 use vortex::buffer::Buffer;
-use vortex::dtype::{DType, DecimalDType, DecimalType};
+use vortex::dtype::{DType, DecimalDType, DecimalType, NativeDecimalType};
 use vortex::error::{vortex_bail, VortexResult};
 use vortex::expr::Expression;
 use vortex::scalar_fn::{
@@ -18,6 +20,7 @@ use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
 use crate::ohlc::{Part, Price};
+use crate::scaled::decoded;
 
 /// Which price, and the decimal type it's rebuilt into: the source's, at a scale at least the
 /// parts'.
@@ -99,45 +102,88 @@ impl ScalarFnVTable for OhlcPriceFn {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let ohlc = args.get(0)?.execute::<StructArray>(ctx)?;
-        let mut values: [Option<Buffer<i128>>; 4] = Default::default();
-        let mut parts_scale = None;
-        for (part, values) in Part::ALL.into_iter().zip(&mut values) {
-            if !options.price.uses(part) {
-                continue;
+        // The parts the price uses, at the scale and width they're stored at (through `scaled`).
+        let mut parts: [Option<DecimalArray>; 4] = Default::default();
+        for (part, values) in Part::ALL.into_iter().zip(&mut parts) {
+            if options.price.uses(part) {
+                let field = ohlc.unmasked_field_by_name(part.name())?.clone();
+                *values = Some(decoded(field, ctx)?);
             }
-            let field = ohlc.unmasked_field_by_name(part.name())?.clone();
-            let field = field.execute::<DecimalArray>(ctx)?;
-            parts_scale = Some(field.scale());
-            *values = Some(widened(&field)?);
         }
-        let shift = options.decimal.scale() - parts_scale.expect("every price uses open");
-        if shift < 0 {
-            vortex_bail!("the price's scale is below the parts'");
-        }
-        let parts = values.each_ref().map(|v| v.as_deref().unwrap_or(&[]));
         // The prices fit their precision, so i64 holds them if that's at most 18 digits.
-        let rebuilt = if options.decimal.precision() <= 18 {
-            options.price.rebuild(parts, 10i64.pow(shift as u32))
+        let validity = ohlc.struct_validity();
+        let array = if options.decimal.precision() <= 18 {
+            let rebuilt = rebuilt::<i64>(options, &parts)?;
+            DecimalArray::new(rebuilt, options.decimal, validity)
         } else {
-            options.price.rebuild(parts, 10i128.pow(shift as u32))
+            let rebuilt = rebuilt::<i128>(options, &parts)?;
+            DecimalArray::new(rebuilt, options.decimal, validity)
         };
-        let array = DecimalArray::new(
-            Buffer::from(rebuilt),
-            options.decimal,
-            ohlc.struct_validity(),
-        );
         Ok(array.into_array())
     }
 }
 
-/// A decimal array's unscaled values as i128s, whatever width they're stored at.
-fn widened(array: &DecimalArray) -> VortexResult<Buffer<i128>> {
+/// The price of every bar, in `W`, from `parts` (those it uses) at their own scales: each is
+/// brought to the finest of them, and their sum to the price's scale.
+fn rebuilt<W>(options: &PriceOptions, parts: &[Option<DecimalArray>; 4]) -> VortexResult<Buffer<W>>
+where
+    W: PrimInt + WrappingMul + NativeDecimalType + 'static,
+    i8: AsPrimitive<W>,
+    i16: AsPrimitive<W>,
+    i32: AsPrimitive<W>,
+    i64: AsPrimitive<W>,
+    i128: AsPrimitive<W>,
+{
+    let finest = (parts.iter().flatten())
+        .map(|part| part.scale())
+        .max()
+        .expect("every price uses open");
+    let Ok(shift) = u8::try_from(options.decimal.scale() - finest) else {
+        vortex_bail!("the price's scale is below the parts'");
+    };
+    let mut values: [Option<Buffer<W>>; 4] = Default::default();
+    for (part, values) in parts.iter().zip(&mut values) {
+        if let Some(part) = part {
+            *values = Some(widened(part, pow10((finest - part.scale()) as u8))?);
+        }
+    }
+    let values = values.each_ref().map(|v| v.as_deref().unwrap_or(&[]));
+    Ok(Buffer::from(options.price.rebuild(values, pow10(shift))))
+}
+
+/// `10^exponent` in `W`, wrapping where it doesn't fit (a price's scale is at most `W`'s digits).
+fn pow10<W: PrimInt + WrappingMul>(exponent: u8) -> W {
+    let ten = W::from(10).unwrap_or_else(W::one);
+    (0..exponent).fold(W::one(), |acc, _| acc.wrapping_mul(&ten))
+}
+
+/// A decimal array's unscaled values times `factor`, as `W`s, whatever width they're stored at.
+fn widened<W>(array: &DecimalArray, factor: W) -> VortexResult<Buffer<W>>
+where
+    W: PrimInt + NativeDecimalType + 'static,
+    i8: AsPrimitive<W>,
+    i16: AsPrimitive<W>,
+    i32: AsPrimitive<W>,
+    i64: AsPrimitive<W>,
+    i128: AsPrimitive<W>,
+{
+    fn widen<T, W>(values: &[T], factor: W) -> Buffer<W>
+    where
+        T: NativeDecimalType + AsPrimitive<W>,
+        W: PrimInt + 'static,
+    {
+        // A multiply of 64-bit lanes doesn't vectorize on NEON or AVX2, so only where needed.
+        match factor.is_one() {
+            true => values.iter().map(|&v| v.as_()).collect(),
+            false => values.iter().map(|&v| v.as_() * factor).collect(),
+        }
+    }
     Ok(match array.values_type() {
-        DecimalType::I128 => array.buffer::<i128>(),
-        DecimalType::I64 => array.buffer::<i64>().iter().map(|&v| v as i128).collect(),
-        DecimalType::I32 => array.buffer::<i32>().iter().map(|&v| v as i128).collect(),
-        DecimalType::I16 => array.buffer::<i16>().iter().map(|&v| v as i128).collect(),
-        DecimalType::I8 => array.buffer::<i8>().iter().map(|&v| v as i128).collect(),
+        DecimalType::I8 => widen(&array.buffer::<i8>(), factor),
+        DecimalType::I16 => widen(&array.buffer::<i16>(), factor),
+        DecimalType::I32 => widen(&array.buffer::<i32>(), factor),
+        DecimalType::I64 => widen(&array.buffer::<i64>(), factor),
+        DecimalType::I128 => widen(&array.buffer::<i128>(), factor),
         other => vortex_bail!("parts stored as {other:?}"),
     })
 }
@@ -153,8 +199,45 @@ mod tests {
     use vortex::session::VortexSession;
     use vortex::VortexSessionDefault;
 
+    use vortex::dtype::DecimalType;
+
     use super::ohlc_price;
     use crate::ohlc::{Part, Price};
+    use crate::scaled::Scaled;
+
+    /// Parts stored scaled by different powers of ten are brought to one scale before they're
+    /// summed, and prices of at most 18 digits come back as i64s: a bar opening at 12.34, closing
+    /// 0.5 higher, with a high 0.06 above that, in a `Decimal(18, 4)` source.
+    #[test]
+    fn scaled_parts_rebuild_in_i64() {
+        let session = VortexSession::default();
+        crate::register(&session);
+        let mut ctx = session.create_execution_ctx();
+        let part = |value: i32, scale: i8, k: u8| {
+            let values = Buffer::from(vec![value]);
+            // The quotients, at the scale of the values they stand for.
+            let dtype = DecimalDType::new(16, scale + k as i8);
+            let values = DecimalArray::new(values, dtype, Validity::NonNullable);
+            let scaled = Scaled::try_new_uniform(values.into_array(), 10, k).unwrap();
+            scaled.into_array()
+        };
+        let fields = [
+            ("open", part(1234, 2, 2)),
+            ("body", part(5, 1, 3)),
+            ("upper", part(6, 2, 2)),
+            ("lower", part(0, 4, 0)),
+        ];
+        let ohlc = StructArray::from_fields(&fields).unwrap().into_array();
+        let decimal = DecimalDType::new(18, 4);
+        let expected = [123_400i64, 129_000, 123_400, 128_400];
+        for (price, expected) in Price::ALL.into_iter().zip(expected) {
+            let expr = ohlc_price(price, decimal, root());
+            let rebuilt = ohlc.clone().apply_bound(&expr.bind(ohlc.dtype()).unwrap());
+            let rebuilt = rebuilt.unwrap().execute::<DecimalArray>(&mut ctx).unwrap();
+            assert_eq!(rebuilt.values_type(), DecimalType::I64, "{price:?}");
+            assert_eq!(rebuilt.buffer::<i64>()[0], expected, "{price:?}");
+        }
+    }
 
     /// Prices wider than an i64 come back whole: 60000.5 in a `Decimal(38, 18)` source, its
     /// parts rescaled by 17, takes 23 digits at the source's scale.

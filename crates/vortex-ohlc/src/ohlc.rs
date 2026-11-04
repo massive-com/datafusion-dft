@@ -1,7 +1,7 @@
 //! A bar's four prices ([`Price`]) as the parts the [`OHLC`](crate::bars::OHLC) struct stores
 //! ([`Part`]), and back.
 
-use num_traits::{AsPrimitive, PrimInt};
+use num_traits::PrimInt;
 
 /// One of a bar's four prices, each a column of the source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -61,30 +61,24 @@ impl Price {
     /// Every part and every partial sum is a price or the difference of two, at most twice the
     /// largest price, so `W` = i64 holds them when the prices, times `factor`, have at most 18
     /// digits; wider prices need i128.
-    pub fn rebuild<W>(self, [open, body, upper, lower]: [&[i128]; 4], factor: W) -> Vec<i128>
-    where
-        W: PrimInt + AsPrimitive<i128>,
-        i128: AsPrimitive<W>,
-    {
+    pub fn rebuild<W: PrimInt>(self, [open, body, upper, lower]: [&[W]; 4], factor: W) -> Vec<W> {
         // `price` is a constant in each loop, so its match folds away. The closures hold
         // `factor` by value: a loop the compiler doesn't inline here would otherwise load it
         // through two references for every bar, which made scans on one partition 7-8% slower.
-        let at = move |price: Price, parts: [i128; 4]| {
-            (price.from_parts(parts.map(|v| v.as_())) * factor).as_()
-        };
+        let at = move |price: Price, parts: [W; 4]| price.from_parts(parts) * factor;
         match self {
             Price::Open => open
                 .iter()
-                .map(move |&o| at(Price::Open, [o, 0, 0, 0]))
+                .map(move |&o| at(Price::Open, [o, W::zero(), W::zero(), W::zero()]))
                 .collect(),
             Price::High => (open.iter().zip(body).zip(upper))
-                .map(move |((&o, &b), &u)| at(Price::High, [o, b, u, 0]))
+                .map(move |((&o, &b), &u)| at(Price::High, [o, b, u, W::zero()]))
                 .collect(),
             Price::Low => (open.iter().zip(body).zip(lower))
-                .map(move |((&o, &b), &l)| at(Price::Low, [o, b, 0, l]))
+                .map(move |((&o, &b), &l)| at(Price::Low, [o, b, W::zero(), l]))
                 .collect(),
             Price::Close => (open.iter().zip(body))
-                .map(move |(&o, &b)| at(Price::Close, [o, b, 0, 0]))
+                .map(move |(&o, &b)| at(Price::Close, [o, b, W::zero(), W::zero()]))
                 .collect(),
         }
     }
