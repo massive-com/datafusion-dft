@@ -42,8 +42,10 @@ const DATA_DIR: &str = concat!(
 /// (`vortex_ohlc::blocked_for`), 21 since that choice is estimated from the widths blocked
 /// bit-packing picks, 22 since that encoding is `vortex_ohlc.scaled` (`vortex_ohlc.pow10` before),
 /// 23 since its metadata has a base, 24 since every decimal is rescaled a chunk at a time
-/// (`vortex_ohlc::scaled::DecimalPow10Scheme`). 9 to 16 were these steps in an earlier order.
-const VORTEX_VERSION: u32 = 24;
+/// (`vortex_ohlc::scaled::DecimalPow10Scheme`), 25 since the dollar volume is stored as a residual
+/// against volume × open (`vortex_ohlc::dollar_volume`). 9 to 16 were these steps in an earlier
+/// order.
+const VORTEX_VERSION: u32 = 25;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;

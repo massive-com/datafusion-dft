@@ -41,10 +41,12 @@ fn decimal(values: Vec<i128>, scale: i8) -> ArrowArrayRef {
 }
 
 /// Bars for 10 tickers in a row each, ticker `t` trading around `10 + 40t` dollars: prices at
-/// scale 4 in whole cents, volumes at scale 6 in whole shares.
+/// scale 4 in whole cents, volumes at scale 6 in whole shares, and dollar volumes at scale 12,
+/// the volume times a vwap in whole cents between the bar's low and high.
 pub fn source() -> RecordBatch {
     let mut rng = Lcg(7);
     let mut columns: [Vec<i128>; 5] = Default::default();
+    let mut dollar_volumes = Vec::new();
     let (mut tickers, mut transactions) = (Vec::new(), Vec::new());
     for row in 0..ROWS {
         let ticker = row * 10 / ROWS;
@@ -63,6 +65,8 @@ pub fn source() -> RecordBatch {
             column.push(cents * 100);
         }
         columns[4].push(volume * 1_000_000);
+        let vwap = low + rng.next((high - low + 1) as u64) as i128;
+        dollar_volumes.push(volume * vwap * 10_000_000_000);
         transactions.push(rng.next(500) as i64);
     }
     let [open, high, low, close, volume] = columns;
@@ -74,6 +78,7 @@ pub fn source() -> RecordBatch {
         Field::new("low", DataType::Decimal128(38, 4), false),
         Field::new("close", DataType::Decimal128(38, 4), false),
         Field::new("volume", DataType::Decimal128(38, 6), false),
+        Field::new("dollar_volume", DataType::Decimal128(38, 12), false),
         Field::new("transactions", DataType::Int64, false),
     ]);
     RecordBatch::try_new(
@@ -85,6 +90,7 @@ pub fn source() -> RecordBatch {
             decimal(low, 4),
             decimal(close, 4),
             decimal(volume, 6),
+            decimal(dollar_volumes, 12),
             Arc::new(Int64Array::from(transactions)),
         ],
     )

@@ -5,6 +5,8 @@
 //! - [`bars`]: the layout at the root of a table of bars, which stores the four prices as parts
 //!   and reads them back as prices ([`price_fn`]).
 //! - [`ohlc`]: a bar's parts from its prices, and back.
+//! - [`dollar_volume`]: a bar's dollar volume from its residual against volume × open, which the
+//!   layout stores in its place.
 //! - [`write`](mod@write): the options to write a table with.
 //! - [`edition`]: the edition that lets a writer emit what follows, and Vortex's blocked FoR and
 //!   bit-packing.
@@ -21,6 +23,7 @@ use vortex::session::VortexSession;
 
 pub mod bars;
 pub mod blocked_for;
+pub mod dollar_volume;
 pub mod edition;
 pub mod kernels;
 pub mod ohlc;
