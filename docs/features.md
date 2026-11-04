@@ -361,7 +361,7 @@ OPTIONS (predicate_pushdown 'true');
 
 The table options are the Vortex reader options described in the [config guide](config.md). See the [CLI guide](cli.md) for writing Vortex files with `--output`.
 
-Files written by the `vortex-ohlc` crate store the four OHLC prices as parts under a layout of their own, `vortex_ohlc.bars`, which reads them back as `open`, `high`, `low` and `close` with the source's types; filters on the prices are pruned on the parts' zones. Any Vortex session that registers the crate (`vortex_ohlc::register`) reads these files, dft's among them. Every column reads back with the source's type.
+Files written by the `vortex-ohlc` crate store the four OHLC prices as parts under a layout of their own, `vortex_ohlc.bars`, which reads them back as `open`, `high`, `low` and `close` with the source's types; filters on the prices are pruned on the parts' zones. Any Vortex session that registers the crate (`vortex_ohlc::register`) reads these files, dft's among them. Every column reads back with the source's type; the decimals' trailing zeros are dropped by an encoding of the crate's own, `vortex_ohlc.pow10`, which divides each block of 1,024 values by a power of ten they share.
 
 ### ClickHouse (`--features=clickhouse`)
 
