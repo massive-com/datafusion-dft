@@ -6,16 +6,15 @@
 //!   trailing zeros every value has, and the four prices stored as one struct of parts).
 //! - [`profile`]: measuring a source's decimal columns, and the plan that follows from that.
 //! - [`ohlc`]: a bar's parts from its prices, and back.
-//! - [`prices`]: the prices as Vortex expressions over the parts, to rebuild or filter on them
-//!   within a scan.
 //! - [`write`](mod@write): writing a table with a plan.
 //! - [`bars`]: the layout at the root of a table of bars, which stores the prices as parts and
 //!   reads them back as prices ([`price_fn`]).
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
 //! - [`kernels`]: filters on those blocked encodings that unpack only the blocks they keep.
 //!
-//! Reading the files from DataFusion, the prices rebuilt, is datafusion-vortex-ohlc's, and
-//! pruning scans on the zone maps (the prices on their parts') is datafusion-vortex-prune's.
+//! Reading the files from DataFusion, the rescaled columns at the source's scale, is
+//! datafusion-vortex-ohlc's, and pruning scans on the zone maps before they start (the prices on
+//! their parts') is datafusion-vortex-prune's.
 
 use vortex::session::VortexSession;
 
@@ -25,7 +24,6 @@ pub mod kernels;
 pub mod ohlc;
 pub mod plan;
 pub mod price_fn;
-pub mod prices;
 pub mod profile;
 pub mod write;
 
