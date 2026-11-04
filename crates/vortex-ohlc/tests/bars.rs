@@ -21,7 +21,7 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_ohlc::ohlc::Price;
 
-use test_util::{source, source_plan, ROWS, ROW_BLOCK};
+use test_util::{source, write, ROWS, ROW_BLOCK};
 
 /// test-util's prices: `Decimal(38, 4)`.
 fn price_dtype() -> DecimalDType {
@@ -33,11 +33,6 @@ fn session(runtime: &CurrentThreadRuntime) -> VortexSession {
     vortex_ohlc::edition::enable(&session).unwrap();
     vortex_ohlc::register(&session);
     session
-}
-
-/// test-util's source, planned as usual and written, so under the bars layout.
-fn write(source: &RecordBatch) -> Vec<u8> {
-    test_util::write(source, &source_plan(source))
 }
 
 /// `value` cents as a literal of the prices' type.

@@ -3,9 +3,9 @@
 //!
 //! - `v2.parquet`: the source rewritten as Parquet v2 (zstd level 1, the source's row groups),
 //!   the Parquet baseline;
-//! - `bars-<VORTEX_VERSION>.vortex`: the source with the plan [`vortex_ohlc::profile`] picks for
-//!   it, written with [`vortex_ohlc::write`], so under the bars layout. Bump [`VORTEX_VERSION`]
-//!   whenever what the crate writes changes, so the file is written again.
+//! - `bars-<VORTEX_VERSION>.vortex`: the source written with [`vortex_ohlc::write`], so under the
+//!   bars layout. Bump [`VORTEX_VERSION`] whenever what the crate writes changes, so the file is
+//!   written again.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -21,8 +21,7 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::profile::{plan, DecimalProfiler};
-use vortex_ohlc::write::{stored_arrays, write_options, DEFAULT_ROW_BLOCK};
+use vortex_ohlc::write::{arrays, write_options, DEFAULT_ROW_BLOCK};
 
 /// The month of minute bars the benches read: August 2006, every ticker from A to ZZ,
 /// sorted by ticker.
@@ -38,8 +37,10 @@ const DATA_DIR: &str = concat!(
 /// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout, 3
 /// since the bars layout at the root, 4 since it's gone, 5 since Vortex's compressor packs the
 /// planned columns, 6 since Vortex's default strategy writes every column, 8 since the bars
-/// layout is back at the root (7 was a trial of a patched compressor).
-const VORTEX_VERSION: u32 = 8;
+/// layout is back at the root (7 was a trial of a patched compressor), 17 since the layout
+/// computes the parts itself and nothing is planned or rescaled before writing. 9 to 16 were
+/// these steps in an earlier order.
+const VORTEX_VERSION: u32 = 17;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;
@@ -97,7 +98,6 @@ fn write_parquet_v2(source: &Path, dest: &Path) {
     writer.close().unwrap();
 }
 
-/// Profile the source, then write it with the plan that follows.
 fn write_vortex(source: &Path, dest: &Path) {
     // Vortex's defaults, able to write the file (see `vortex_ohlc::edition`), on a runtime that
     // runs everything on this thread.
@@ -105,23 +105,13 @@ fn write_vortex(source: &Path, dest: &Path) {
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
     vortex_ohlc::register(&session);
-    let batches = || {
-        open_parquet(source)
-            .with_batch_size(CONVERT_BATCH_SIZE)
-            .build()
-            .unwrap()
-    };
-    let schema = batches().schema();
-    let mut profiler = DecimalProfiler::new(&schema);
-    for batch in batches() {
-        profiler.add(&batch.unwrap());
-    }
-    let plan = plan(&profiler.finish());
-    eprintln!("  plan: {plan:?}");
-
-    let arrays = stored_arrays(&session, &schema, &plan, batches().map(|b| b.unwrap())).unwrap();
-    let options = write_options(&session, &schema, &plan, DEFAULT_ROW_BLOCK).unwrap();
-    options
+    let batches = open_parquet(source)
+        .with_batch_size(CONVERT_BATCH_SIZE)
+        .build()
+        .unwrap();
+    let schema = batches.schema();
+    let arrays = arrays(&session, &schema, batches.map(|batch| batch.unwrap())).unwrap();
+    write_options(&session, DEFAULT_ROW_BLOCK)
         .blocking(&runtime)
         .write(BufWriter::new(File::create(dest).unwrap()), arrays)
         .unwrap();

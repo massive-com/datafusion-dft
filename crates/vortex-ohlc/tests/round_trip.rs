@@ -1,14 +1,13 @@
-//! Profile a table of bars, plan from it, write it with `write_options` and read it back: the
-//! file reads back as the source, with the source's prices (the bars layout rebuilds them from
-//! their parts) and its other columns as planned, and under the layout the parts and integers are
-//! bit-packed in the encodings the edition allows.
+//! Write a table of bars with `write_options` and read it back: the file reads back as the
+//! source (the bars layout rebuilds the prices from their parts), and under the layout the parts
+//! and integers are bit-packed in the encodings the edition allows.
 
 use std::sync::Arc;
 
 use arrow::array::cast::AsArray;
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field};
 use vortex::array::{ArrayRef, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::file::OpenOptionsSessionExt;
@@ -19,26 +18,19 @@ use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::LayoutReader;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::bars::data_child;
-use vortex_ohlc::ohlc::{Part, Price};
-use vortex_ohlc::plan::{apply_plan, planned_schema, Plan, Transform, OHLC};
+use vortex_ohlc::bars::{data_child, OHLC};
+use vortex_ohlc::ohlc::Part;
 
-use test_util::{source, source_plan, write, ROWS, ROW_BLOCK};
+use test_util::{source, write, ROWS, ROW_BLOCK};
 
-/// Write `source` with `plan`, and read it back: its chunks as stored, under the bars layout, as
-/// Vortex arrays, and its rows through the layout, with `schema`, as one Arrow batch.
-fn write_and_read(
-    source: &RecordBatch,
-    plan: &Plan,
-    schema: &Schema,
-) -> (Vec<ArrayRef>, RecordBatch) {
+/// Write `source`, and read it back: its chunks as stored, under the bars layout, as Vortex
+/// arrays, and its rows through the layout, with `source`'s schema, as one Arrow batch.
+fn write_and_read(source: &RecordBatch) -> (Vec<ArrayRef>, RecordBatch) {
+    let schema = source.schema();
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::register(&session);
-    let file = session
-        .open_options()
-        .open_buffer(write(source, plan))
-        .unwrap();
+    let file = session.open_options().open_buffer(write(source)).unwrap();
     let scan = |reader: Arc<dyn LayoutReader>| -> Vec<ArrayRef> {
         ScanBuilder::new(session.clone(), reader)
             .into_array_iter(&runtime)
@@ -68,10 +60,7 @@ fn write_and_read(
             RecordBatch::from(array.as_struct().clone())
         })
         .collect();
-    (
-        chunks,
-        concat_batches(&Arc::new(schema.clone()), &batches).unwrap(),
-    )
+    (chunks, concat_batches(&schema, &batches).unwrap())
 }
 
 fn child(array: &ArrayRef, name: &str) -> ArrayRef {
@@ -95,22 +84,9 @@ fn encoding_ids(array: &ArrayRef) -> Vec<String> {
 #[test]
 fn round_trip() {
     let source = source();
-    let plan = source_plan(&source);
-    assert!(Price::ALL
-        .iter()
-        .all(|p| plan.get(p.name()) == Some(&Transform::Ohlc(2))));
-    assert_eq!(plan.get("volume"), Some(&Transform::Rescale(6)));
-
-    // What the file reads back as: the source, rescaled but for the prices.
-    let rescale: Plan = (plan.iter())
-        .filter(|(_, transform)| matches!(transform, Transform::Rescale(_)))
-        .map(|(name, transform)| (name.clone(), *transform))
-        .collect();
-    let schema = planned_schema(&rescale, &source.schema());
-    let (chunks, read) = write_and_read(&source, &plan, &schema);
+    let (chunks, read) = write_and_read(&source);
     assert_eq!(chunks.len(), ROWS.div_ceil(ROW_BLOCK));
-    let expected = apply_plan(&rescale, &schema, source.clone());
-    assert_eq!(read.columns(), expected.columns());
+    assert_eq!(read, source);
 
     // The parts and transactions are bit-packed, in the encodings the edition allows.
     let mut v2 = false;

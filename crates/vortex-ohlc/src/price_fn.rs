@@ -1,4 +1,4 @@
-//! `vortex_ohlc.price`: one of the four prices, rebuilt from the [`OHLC`](crate::plan::OHLC)
+//! `vortex_ohlc.price`: one of the four prices, rebuilt from the [`OHLC`](crate::bars::OHLC)
 //! struct's parts, as a Vortex scalar function. Its kernel is [`Price::rebuild`].
 
 use std::fmt;
@@ -33,7 +33,7 @@ impl fmt::Display for PriceOptions {
     }
 }
 
-/// The scalar function: its one child is the [`OHLC`](crate::plan::OHLC) struct.
+/// The scalar function: its one child is the [`OHLC`](crate::bars::OHLC) struct.
 #[derive(Clone, Debug)]
 pub struct OhlcPriceFn;
 

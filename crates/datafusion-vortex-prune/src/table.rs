@@ -41,7 +41,6 @@ use datafusion::object_store::local::LocalFileSystem;
 use datafusion::object_store::ObjectStore;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_vortex_ohlc::source_table;
 use vortex::array::memory::MemorySessionExt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::std_file::FileReadAt;
@@ -163,9 +162,9 @@ impl PrunedTable {
         Self { inner, factory }
     }
 
-    /// `listing`, a listing table over Vortex files, with their rescaled columns read at the
-    /// table's scale (see [`source_table`]), its scans pruned by `pruner` before they start. Its files, and their zone maps, are read as
-    /// [`reader_factory`] picks for its object store.
+    /// `listing`, a listing table over Vortex files, with its scans pruned by `pruner` before they
+    /// start. Its files, and their zone maps, are read as [`reader_factory`] picks for its object
+    /// store.
     pub fn over(
         listing: &ListingTable,
         state: &dyn Session,
@@ -178,7 +177,7 @@ impl PrunedTable {
             .object_store();
         let store = state.runtime_env().object_store(&url)?;
         let factory = VortexExecFactory::new(reader_factory(&url, store)).with_pruner(pruner);
-        Ok(Self::new(Arc::new(source_table(listing, state)?), factory))
+        Ok(Self::new(Arc::new(listing.clone()), factory))
     }
 
     /// `plan`, a scan of `inner`, rebuilt by the factory with `filters`.

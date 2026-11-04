@@ -50,8 +50,8 @@ pub struct Needle {
 ///   exist, so only min/max statistics can rule data out.
 /// - `high > 1000`: a range predicate on a decimal column, 6,540 bars (mostly BRK.A / BRK.B).
 /// - `low > 1000` and `close > 400.5`: the same on the other prices, 6,540 and 22,948 bars.
-///   With the prices stored against each other ([`OHLC`](vortex_ohlc::plan::OHLC)), each price filters through a
-///   different expression over the parts (see [`vortex_ohlc::prices`]).
+///   With the prices stored against each other ([`OHLC`](vortex_ohlc::bars::OHLC)), each price
+///   filters through a different sum of the parts (see [`vortex_ohlc::ohlc::Price`]).
 pub fn needles() -> Vec<Needle> {
     const NS: i64 = 1_000_000_000;
     // 2006-08-15 14:30 America/New_York, in seconds since the epoch.

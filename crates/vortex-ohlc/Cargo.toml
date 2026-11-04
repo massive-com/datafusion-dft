@@ -1,5 +1,5 @@
 [package]
-description = "OHLC bars in Vortex with only Vortex's own encodings: decimals rescaled and the four prices stored as one struct of parts"
+description = "OHLC bars in Vortex: the four prices stored as one struct of parts under a layout of their own"
 edition.workspace = true
 name = "vortex-ohlc"
 version = "0.1.0"
