@@ -67,8 +67,8 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
     let table = PrunedTable::over(&listing, &state, pruner)?;
     ctx.register_table("bars", Arc::new(table))?;
 
-    // The source's values at the scales they are stored at: the prices at their parts', and the
-    // volumes in whole shares.
+    // The source's values: the prices as the source has them (the bars layout rebuilds them), and
+    // the volumes at the scale they are stored at, in whole shares.
     let read = ctx.sql("SELECT * FROM bars").await?.collect().await?;
     let schema = read[0].schema();
     let types: Vec<(&str, &DataType)> = schema
@@ -76,7 +76,7 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
         .iter()
         .map(|field| (field.name().as_str(), field.data_type()))
         .collect();
-    let price = DataType::Decimal128(18, 2);
+    let price = DataType::Decimal128(38, 4);
     assert_eq!(
         types,
         [
