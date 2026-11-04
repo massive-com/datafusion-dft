@@ -15,18 +15,42 @@ use vortex::array::arrays::DecimalArray;
 use vortex::array::vtable::VTable;
 use vortex::array::{ArrayId, ArrayRef, Canonical, ExecutionCtx, IntoArray};
 use vortex::buffer::Buffer;
+use vortex::dtype::DecimalDType;
 use vortex::encodings::decimal_byte_parts::{
     decimal_byte_parts_v1_id, decimal_byte_parts_v2_id, split_decimal, DecimalByteParts,
     DecimalBytePartsSlots,
 };
-use vortex::error::VortexResult;
+use vortex::error::{vortex_err, VortexResult};
 use vortex_btrblocks::schemes::decimal::DecimalScheme;
 use vortex_btrblocks::{ArrayAndStats, CascadingCompressor, CompressorContext, Scheme, SchemeExt};
 use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 
 #[cfg(doc)]
 use super::Pow10Scheme;
-use super::Scaled;
+use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
+
+/// `array` decoded, through a [`Scaled`] decimal divided by one `10^k` for every row to its
+/// values: the same numbers at `k` less scale, at the width they're stored at rather than an
+/// i128's.
+pub(crate) fn decoded(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<DecimalArray> {
+    let Some(scaled) = array.as_opt::<Scaled>() else {
+        return array.execute::<DecimalArray>(ctx);
+    };
+    let k = scaled.exponent().filter(|_| scaled.divisor().is_some());
+    let Some(k) = k.filter(|_| scaled.base() == 10) else {
+        return array.execute::<DecimalArray>(ctx);
+    };
+    let values = scaled.values().clone().execute::<DecimalArray>(ctx)?;
+    let decimal = values.decimal_dtype();
+    let scale = i8::try_from(i16::from(decimal.scale()) - i16::from(k))
+        .map_err(|_| vortex_err!("a scale of {} less {k}", decimal.scale()))?;
+    DecimalArray::try_new_handle(
+        values.buffer_handle().clone(),
+        values.values_type(),
+        DecimalDType::try_new(decimal.precision(), scale)?,
+        values.validity()?,
+    )
+}
 
 /// `10^k`.
 fn factor(k: u8) -> i128 {
