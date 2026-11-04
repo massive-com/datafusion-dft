@@ -24,7 +24,9 @@
 //! Any other array is filtered through its values' kernels too, which then multiplies only the
 //! rows kept, and is decoded for the rest.
 //!
-//! [`Pow10Scheme`] lets Vortex's compressor pick it, in base 10, for a decimal's integer part.
+//! Its schemes so far are base 10's: [`DecimalPow10Scheme`] divides a chunk of decimals by the
+//! trailing zeros all its values have, and [`Pow10Scheme`] each block of a decimal's integer part
+//! by those its values have.
 
 use std::fmt::{Display, Formatter};
 use std::hash::Hasher;
@@ -62,10 +64,12 @@ use vortex::mask::Mask;
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
+mod decimal;
 mod encode;
 mod filter;
 mod scheme;
 
+pub use decimal::{chunk_exponent, DecimalPow10Scheme};
 pub use encode::scaled_encode;
 pub(crate) use scheme::is_decimal_values;
 pub use scheme::Pow10Scheme;
