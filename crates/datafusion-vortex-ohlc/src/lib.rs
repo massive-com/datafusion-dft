@@ -48,13 +48,13 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
-use vortex::dtype::DecimalDType;
-use vortex::expr::{and, binary as vortex_binary, get_item, or, root, Expression};
+use vortex::dtype::{DecimalDType, Nullability};
+use vortex::expr::{and, binary as vortex_binary, get_item, lit, or, root, Expression};
+use vortex::scalar::{DecimalValue, Scalar};
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::VortexSession;
 use vortex_datafusion::convert::{DefaultExpressionConverter, ExpressionConverter};
 use vortex_datafusion::VortexFormatFactory;
-use vortex_ohlc::prices::decimal_literal;
 
 mod source;
 pub use source::source_table;
@@ -345,4 +345,20 @@ fn comparison(op: &DFOperator) -> Option<Operator> {
         DFOperator::GtEq => Operator::Gte,
         _ => return None,
     })
+}
+
+/// The decimal `unscaled / 10^scale` as a literal of type `decimal`, or `None` if that type
+/// can't hold it exactly.
+fn decimal_literal(unscaled: i128, scale: i8, decimal: DecimalDType) -> Option<Expression> {
+    let shift = decimal.scale() as i32 - scale as i32;
+    let factor = 10i128.checked_pow(shift.unsigned_abs())?;
+    let value = if shift >= 0 {
+        unscaled.checked_mul(factor)?
+    } else {
+        (unscaled % factor == 0).then(|| unscaled / factor)?
+    };
+    let value = DecimalValue::I128(value);
+    value
+        .fits_in_precision(decimal)
+        .then(|| lit(Scalar::decimal(value, decimal, Nullability::NonNullable)))
 }
