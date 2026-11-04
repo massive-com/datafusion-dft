@@ -15,23 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reading the files from DataFusion as a table of bars: a table over them has the four prices
-//! where the files have the [`OHLC`] struct, and the scan rebuilds them from it. A table may also
-//! declare the source's own schema (a Parquet file's, say): the scan then reads each rescaled
-//! decimal column back at the source's scale too.
+//! Reading the files from DataFusion as the table they were written from. The bars layout gives a
+//! file the source's prices ([`vortex_ohlc::bars`]); what's left here is the rescaled decimal
+//! columns, which a file keeps at a smaller scale until the layout takes them over too. A table
+//! may declare the source's own schema (a Parquet file's, say): the scan then reads each rescaled
+//! column back at the source's scale.
 //!
 //! - [`BarsAdapterFactory`] rewrites a scan's expressions from the table's columns to a file's:
-//!   a price becomes an [`OhlcPrice`] over the [`OHLC`] struct, a rescaled decimal column a
-//!   [`Rescaled`], and everything else is left to DataFusion's default adapter.
-//! - [`BarsExpressionConverter`] decides what vortex-datafusion hands Vortex. A comparison of a
-//!   price with a literal goes in as [`compare_price`], so Vortex filters on the parts, and one
-//!   of a rescaled column with the literal at the column's stored scale. Everything else goes
-//!   through vortex-datafusion's default converter. Rebuilding the columns is left to
-//!   DataFusion ([`OhlcPrice`], [`Rescaled`]), which is quicker than Vortex's expressions for it.
+//!   a rescaled decimal column becomes a [`Rescaled`], and everything else is left to
+//!   DataFusion's default adapter.
+//! - [`BarsExpressionConverter`] decides what vortex-datafusion hands Vortex: a comparison of a
+//!   rescaled column with a literal goes in with the literal at the column's stored scale, and
+//!   everything else through vortex-datafusion's default converter.
 //!
-//! [`vortex_format_factory`] makes formats that read the files this way, given a table with the
-//! prices and a [`BarsAdapterFactory`]. [`source_table`] makes that table from a listing table
-//! over the files.
+//! [`vortex_format_factory`] makes formats that read the files this way, given a table with a
+//! [`BarsAdapterFactory`]. [`source_table`] makes that table from a listing table over the files.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -40,8 +38,7 @@ use std::sync::Arc;
 
 use arrow::array::cast::AsArray;
 use arrow::array::types::Decimal128Type;
-use arrow::array::{Array, Decimal128Array, RecordBatch};
-use arrow::buffer::NullBuffer;
+use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{exec_err, Result, ScalarValue};
@@ -51,16 +48,13 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
 };
-use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::DecimalDType;
 use vortex::expr::{and, binary as vortex_binary, get_item, or, root, Expression};
 use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::VortexSession;
 use vortex_datafusion::convert::{DefaultExpressionConverter, ExpressionConverter};
 use vortex_datafusion::VortexFormatFactory;
-use vortex_ohlc::ohlc::{Part, Price};
-use vortex_ohlc::plan::OHLC;
-use vortex_ohlc::prices::{compare_price, decimal_literal};
+use vortex_ohlc::prices::decimal_literal;
 
 mod source;
 pub use source::source_table;
@@ -76,122 +70,8 @@ pub fn vortex_format_factory(session: VortexSession) -> VortexFormatFactory {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Rebuilding the prices
+// Reading rescaled columns
 // ---------------------------------------------------------------------------------------------
-
-/// One of the four prices, rebuilt from the [`OHLC`] struct (its only child) into the table's
-/// type, a `Decimal128` at a scale at least the parts'.
-#[derive(Debug, Eq)]
-pub struct OhlcPrice {
-    price: Price,
-    ohlc: Arc<dyn PhysicalExpr>,
-    field: FieldRef,
-}
-
-impl OhlcPrice {
-    /// The price the table's `field` holds, from `ohlc`; `None` unless `field` is a [`Price`] and
-    /// a `Decimal128`.
-    pub fn new(field: FieldRef, ohlc: Arc<dyn PhysicalExpr>) -> Option<Self> {
-        let price = Price::from_name(field.name())?;
-        matches!(field.data_type(), DataType::Decimal128(..)).then_some(Self { price, ohlc, field })
-    }
-
-    pub fn name(&self) -> &'static str {
-        self.price.name()
-    }
-}
-
-impl PartialEq for OhlcPrice {
-    fn eq(&self, other: &Self) -> bool {
-        self.price == other.price && self.ohlc.eq(&other.ohlc) && self.field == other.field
-    }
-}
-
-impl Hash for OhlcPrice {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.price.hash(state);
-        self.ohlc.hash(state);
-        self.field.hash(state);
-    }
-}
-
-impl fmt::Display for OhlcPrice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}({})", self.name(), self.ohlc)
-    }
-}
-
-impl PhysicalExpr for OhlcPrice {
-    fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
-        Ok(Arc::clone(&self.field))
-    }
-
-    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let ohlc = self.ohlc.evaluate(batch)?.into_array(batch.num_rows())?;
-        let Some(ohlc) = ohlc.as_struct_opt() else {
-            return exec_err!("{self}: {OHLC} is {}, not a struct", ohlc.data_type());
-        };
-        let DataType::Decimal128(precision, scale) = *self.field.data_type() else {
-            unreachable!("checked in OhlcPrice::new");
-        };
-        // The parts the price uses, and their nulls with the struct's.
-        let mut nulls = ohlc.nulls().cloned();
-        let mut parts: [&[i128]; 4] = [&[]; 4];
-        let mut parts_scale = None;
-        for (part, values) in Part::ALL.into_iter().zip(&mut parts) {
-            if !self.price.uses(part) {
-                continue;
-            }
-            let name = part.name();
-            let Some(column) = ohlc.column_by_name(name) else {
-                return exec_err!("{self}: {OHLC} has no {name}");
-            };
-            let Some(column) = column.as_primitive_opt::<Decimal128Type>() else {
-                return exec_err!("{self}: {name} is {}", column.data_type());
-            };
-            nulls = NullBuffer::union(nulls.as_ref(), column.nulls());
-            parts_scale = Some(column.scale());
-            *values = column.values();
-        }
-        let shift = scale - parts_scale.expect("every price uses open");
-        if shift < 0 {
-            return exec_err!("{self}: the parts' scale is above the price's");
-        }
-        // The prices fit the table's precision, so i64 holds them if that's at most 18 digits.
-        let rebuilt = if precision <= 18 {
-            self.price.rebuild(parts, 10i64.pow(shift as u32))
-        } else {
-            self.price.rebuild(parts, 10i128.pow(shift as u32))
-        };
-        let array = Decimal128Array::new(rebuilt.into(), nulls)
-            .with_precision_and_scale(precision, scale)?;
-        Ok(ColumnarValue::Array(Arc::new(array)))
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
-        vec![&self.ohlc]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        mut children: Vec<Arc<dyn PhysicalExpr>>,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        let Some(ohlc) = children.pop().filter(|_| children.is_empty()) else {
-            return exec_err!("{self} has exactly one child");
-        };
-        Ok(Arc::new(Self {
-            price: self.price,
-            ohlc,
-            field: Arc::clone(&self.field),
-        }))
-    }
-
-    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(", self.name())?;
-        self.ohlc.fmt_sql(f)?;
-        write!(f, ")")
-    }
-}
 
 /// A decimal column a file stores rescaled (its only child), read back at the table's type, a
 /// `Decimal128` at a larger scale: each unscaled value multiplied by `10^k`. A rescale only
@@ -282,8 +162,7 @@ impl PhysicalExprAdapterFactory for BarsAdapterFactory {
         logical_file_schema: SchemaRef,
         physical_file_schema: SchemaRef,
     ) -> Result<Arc<dyn PhysicalExprAdapter>> {
-        // The decimal columns the file keeps at a smaller scale, and the prices the table has
-        // and the file keeps in its OHLC struct.
+        // The decimal columns the file keeps at a smaller scale.
         let mut columns: HashMap<String, Arc<dyn PhysicalExpr>> = HashMap::new();
         for field in logical_file_schema.fields() {
             let Some((index, stored)) = physical_file_schema.column_with_name(field.name()) else {
@@ -299,22 +178,6 @@ impl PhysicalExprAdapterFactory for BarsAdapterFactory {
                 }
             }
         }
-        if let Some((index, field)) = physical_file_schema.column_with_name(OHLC) {
-            if matches!(field.data_type(), DataType::Struct(_)) {
-                let ohlc: Arc<dyn PhysicalExpr> = Arc::new(Column::new(OHLC, index));
-                for price in Price::ALL.map(Price::name) {
-                    let Ok(field) = logical_file_schema.field_with_name(price) else {
-                        continue;
-                    };
-                    let field = Arc::new(field.clone());
-                    if physical_file_schema.column_with_name(price).is_none() {
-                        if let Some(price) = OhlcPrice::new(field, Arc::clone(&ohlc)) {
-                            columns.insert(price.name().to_string(), Arc::new(price));
-                        }
-                    }
-                }
-            }
-        }
         let inner =
             DefaultPhysicalExprAdapterFactory.create(logical_file_schema, physical_file_schema)?;
         Ok(Arc::new(BarsAdapter { columns, inner }))
@@ -323,11 +186,9 @@ impl PhysicalExprAdapterFactory for BarsAdapterFactory {
 
 #[derive(Debug)]
 struct BarsAdapter {
-    /// What each column the file stores another way is read as: an [`OhlcPrice`] or a
-    /// [`Rescaled`].
+    /// The columns the file keeps rescaled, each as its [`Rescaled`].
     columns: HashMap<String, Arc<dyn PhysicalExpr>>,
-    /// DataFusion's default, for every other column, and for the struct itself: a column the
-    /// table doesn't have, which it takes from the file as it is.
+    /// DataFusion's default, for every other column.
     inner: Arc<dyn PhysicalExprAdapter>,
 }
 
@@ -373,21 +234,18 @@ impl PhysicalExprAdapter for BarsAdapter {
 
 /// Converts expressions for vortex-datafusion to hand Vortex: see the module docs.
 pub struct BarsExpressionConverter {
-    session: VortexSession,
     inner: DefaultExpressionConverter,
 }
 
 impl BarsExpressionConverter {
     pub fn new(session: VortexSession) -> Self {
         Self {
-            inner: DefaultExpressionConverter::new(session.clone()),
-            session,
+            inner: DefaultExpressionConverter::new(session),
         }
     }
 
-    /// `expr`, which reads an [`OhlcPrice`] or a [`Rescaled`], as a Vortex filter: a comparison
-    /// of one with a literal, or an `AND` or `OR` of what can be converted; `None` for anything
-    /// else.
+    /// `expr`, which reads a [`Rescaled`], as a Vortex filter: a comparison of one with a
+    /// literal, or an `AND` or `OR` of what can be converted; `None` for anything else.
     fn convert_stored(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
@@ -428,38 +286,23 @@ impl BarsExpressionConverter {
             return Ok(None);
         };
         // A rescaled column is compared as it is stored, with the literal at its scale.
-        if let Some(rescaled) = column.downcast_ref::<Rescaled>() {
-            let Some(stored) = rescaled.column.downcast_ref::<Column>() else {
-                return Ok(None);
-            };
-            let DataType::Decimal128(precision, stored_scale) =
-                *schema.field_with_name(stored.name())?.data_type()
-            else {
-                return Ok(None);
-            };
-            let decimal = DecimalDType::new(precision, stored_scale);
-            let Some(literal) = decimal_literal(unscaled, scale, decimal) else {
-                return Ok(None);
-            };
-            let stored = get_item(stored.name(), root());
-            return Ok(Some(vortex_binary(op, stored, literal)));
-        }
-        let Some(price) = column.downcast_ref::<OhlcPrice>() else {
+        let Some(rescaled) = column.downcast_ref::<Rescaled>() else {
             return Ok(None);
         };
-        let Some(ohlc) = price.ohlc.downcast_ref::<Column>() else {
+        let Some(stored) = rescaled.column.downcast_ref::<Column>() else {
             return Ok(None);
         };
-        // A table of just the struct, as `compare_price` takes it.
-        let field = schema.field_with_name(ohlc.name())?.clone();
-        let Ok(table) = self
-            .session
-            .arrow()
-            .from_arrow_schema(&Schema::new(vec![field]))
+        let DataType::Decimal128(precision, stored_scale) =
+            *schema.field_with_name(stored.name())?.data_type()
         else {
             return Ok(None);
         };
-        Ok(compare_price(&table, price.price, op, unscaled, scale))
+        let decimal = DecimalDType::new(precision, stored_scale);
+        let Some(literal) = decimal_literal(unscaled, scale, decimal) else {
+            return Ok(None);
+        };
+        let stored = get_item(stored.name(), root());
+        Ok(Some(vortex_binary(op, stored, literal)))
     }
 }
 
@@ -477,13 +320,11 @@ impl ExpressionConverter for BarsExpressionConverter {
     }
 }
 
-/// Whether `expr` reads a column the file stores another way: an [`OhlcPrice`] or a
-/// [`Rescaled`].
+/// Whether `expr` reads a column the file keeps rescaled.
 fn reads_stored(expr: &Arc<dyn PhysicalExpr>) -> bool {
     let mut found = false;
     let _ = expr.apply(|expr| {
-        found =
-            expr.downcast_ref::<OhlcPrice>().is_some() || expr.downcast_ref::<Rescaled>().is_some();
+        found = expr.downcast_ref::<Rescaled>().is_some();
         Ok(if found {
             TreeNodeRecursion::Stop
         } else {
@@ -504,72 +345,4 @@ fn comparison(op: &DFOperator) -> Option<Operator> {
         DFOperator::GtEq => Operator::Gte,
         _ => return None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::datatypes::Field;
-    use vortex::VortexSessionDefault;
-    use vortex_ohlc::plan::{apply_plan, ohlc_fields, planned_schema};
-    use vortex_ohlc::profile::{plan, DecimalProfiler};
-
-    /// Prices wider than an i64 come back whole: 60000.5 in a `Decimal(38, 18)` source is stored
-    /// rescaled by 17, and rebuilding it at the source's scale takes 23 digits.
-    #[test]
-    fn wide_prices_rebuild_at_the_source_scale() {
-        let decimal = DataType::Decimal128(38, 18);
-        let value = 600_005 * 10i128.pow(17);
-        let fields: Vec<Field> = Price::ALL
-            .iter()
-            .map(|price| Field::new(price.name(), decimal.clone(), false))
-            .collect();
-        let source = Arc::new(Schema::new(fields));
-        let column = Decimal128Array::from(vec![value])
-            .with_precision_and_scale(38, 18)
-            .unwrap();
-        let columns = vec![Arc::new(column) as _; Price::ALL.len()];
-        let batch = RecordBatch::try_new(Arc::clone(&source), columns).unwrap();
-        let mut profiler = DecimalProfiler::new(&source);
-        profiler.add(&batch);
-        let plan = plan(&profiler.finish());
-        let stored = apply_plan(&plan, &planned_schema(&plan, &source), batch);
-        let ohlc: Arc<dyn PhysicalExpr> = Arc::new(Column::new(OHLC, 0));
-        for price in Price::ALL {
-            let field = Arc::new(Field::new(price.name(), decimal.clone(), false));
-            let price = OhlcPrice::new(field, Arc::clone(&ohlc)).unwrap();
-            let rebuilt = price.evaluate(&stored).unwrap().into_array(1).unwrap();
-            assert_eq!(rebuilt.as_primitive::<Decimal128Type>().value(0), value);
-        }
-    }
-
-    #[test]
-    fn price_comparisons_go_to_vortex() {
-        let schema = Schema::new(vec![Field::new(
-            OHLC,
-            DataType::Struct(ohlc_fields(4)),
-            false,
-        )]);
-        let ohlc: Arc<dyn PhysicalExpr> = Arc::new(Column::new(OHLC, 0));
-        let converter = BarsExpressionConverter::new(VortexSession::default());
-        for price in Price::ALL {
-            let field = Arc::new(Field::new(price.name(), DataType::Decimal128(18, 6), false));
-            let price: Arc<dyn PhysicalExpr> =
-                Arc::new(OhlcPrice::new(field, Arc::clone(&ohlc)).unwrap());
-            let literal: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Decimal128(
-                Some(1_000_000_000),
-                18,
-                6,
-            )));
-            // Either way round: `price > 1000` and `1000 < price`.
-            for expr in [
-                BinaryExpr::new(Arc::clone(&price), DFOperator::Gt, Arc::clone(&literal)),
-                BinaryExpr::new(literal, DFOperator::Lt, price),
-            ] {
-                let expr: Arc<dyn PhysicalExpr> = Arc::new(expr);
-                let converted = converter.try_convert(&expr, &schema).unwrap();
-                assert!(converted.is_some(), "{expr} isn't handed to Vortex");
-            }
-        }
-    }
 }

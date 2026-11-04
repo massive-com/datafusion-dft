@@ -141,3 +141,45 @@ fn widened(array: &DecimalArray) -> VortexResult<Buffer<i128>> {
         other => vortex_bail!("parts stored as {other:?}"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use vortex::array::arrays::{DecimalArray, StructArray};
+    use vortex::array::validity::Validity;
+    use vortex::array::{IntoArray, VortexSessionExecute};
+    use vortex::buffer::Buffer;
+    use vortex::dtype::DecimalDType;
+    use vortex::expr::root;
+    use vortex::session::VortexSession;
+    use vortex::VortexSessionDefault;
+
+    use super::ohlc_price;
+    use crate::ohlc::{Part, Price};
+
+    /// Prices wider than an i64 come back whole: 60000.5 in a `Decimal(38, 18)` source, its
+    /// parts rescaled by 17, takes 23 digits at the source's scale.
+    #[test]
+    fn wide_prices_rebuild_at_the_source_scale() {
+        let session = VortexSession::default();
+        crate::register(&session);
+        let mut ctx = session.create_execution_ctx();
+        let parts = DecimalDType::new(16, 1);
+        let fields = Part::ALL.map(|part| {
+            let value = if part == Part::Open { 600_005i64 } else { 0 };
+            let values = DecimalArray::new(Buffer::from(vec![value]), parts, Validity::NonNullable);
+            (part.name(), values.into_array())
+        });
+        let ohlc = StructArray::from_fields(&fields).unwrap().into_array();
+        let decimal = DecimalDType::new(38, 18);
+        for price in Price::ALL {
+            let expr = ohlc_price(price, decimal, root());
+            let rebuilt = ohlc.clone().apply_bound(&expr.bind(ohlc.dtype()).unwrap());
+            let rebuilt = rebuilt.unwrap().execute::<DecimalArray>(&mut ctx).unwrap();
+            assert_eq!(
+                rebuilt.buffer::<i128>()[0],
+                600_005 * 10i128.pow(17),
+                "{price:?}"
+            );
+        }
+    }
+}

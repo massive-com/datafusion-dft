@@ -15,33 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! A listing table over the files as a table of bars, with the prices in place of the struct
-//! that stores them.
+//! A listing table over the files as the table they were written from.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+use arrow::datatypes::Schema;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig};
 use datafusion::logical_expr::Expr;
-use vortex_ohlc::ohlc::{Part, Price};
-use vortex_ohlc::plan::OHLC;
 
 use crate::BarsAdapterFactory;
 
-/// `listing`, a listing table over Vortex files, as a table of bars: an [`OHLC`] struct in its
-/// schema becomes the four prices, at the parts' scale, and every file is read through a
-/// [`BarsAdapterFactory`], so the prices are rebuilt from a file's struct. Its definition,
-/// constraints and column defaults are kept, and its files' statistics are kept in `state`'s
-/// cache, as DataFusion's `CREATE EXTERNAL TABLE` keeps them.
+/// `listing`, a listing table over Vortex files, with every file read through a
+/// [`BarsAdapterFactory`], so the rescaled columns come back at the table's scale. Its schema,
+/// definition, constraints and column defaults are kept, and its files' statistics are kept in
+/// `state`'s cache, as DataFusion's `CREATE EXTERNAL TABLE` keeps them.
 pub fn source_table(listing: &ListingTable, state: &dyn Session) -> Result<ListingTable> {
     // The table's schema has the partition columns after the files'.
     let table = listing.schema();
     let partitions = listing.options().table_partition_cols.len();
     let files = &table.fields()[..table.fields().len() - partitions];
-    let schema = Schema::new_with_metadata(with_prices(files), table.metadata().clone());
+    let schema = Schema::new_with_metadata(files.to_vec(), table.metadata().clone());
     let column_defaults: HashMap<String, Expr> = table
         .fields()
         .iter()
@@ -60,32 +56,4 @@ pub fn source_table(listing: &ListingTable, state: &dyn Session) -> Result<Listi
         .with_definition(listing.get_table_definition().map(str::to_string))
         .with_constraints(listing.constraints().cloned().unwrap_or_default())
         .with_column_defaults(column_defaults))
-}
-
-/// `fields`, with an [`OHLC`] struct of decimal parts replaced by the four prices: each a
-/// `Decimal128` at the parts' scale, two digits wider than them, which holds a sum of three.
-fn with_prices(fields: &[FieldRef]) -> Vec<Field> {
-    let mut out = Vec::with_capacity(fields.len() + Price::ALL.len() - 1);
-    for field in fields {
-        let parts = match field.data_type() {
-            DataType::Struct(parts) if field.name() == OHLC => parts,
-            _ => {
-                out.push(field.as_ref().clone());
-                continue;
-            }
-        };
-        let names = parts.iter().map(|part| part.name().as_str());
-        match parts.first().map(|open| open.data_type()) {
-            Some(&DataType::Decimal128(precision, scale))
-                if names.eq(Part::ALL.map(Part::name)) =>
-            {
-                let price = DataType::Decimal128(precision + 2, scale);
-                for name in Price::ALL.map(Price::name) {
-                    out.push(Field::new(name, price.clone(), field.is_nullable()));
-                }
-            }
-            _ => out.push(field.as_ref().clone()),
-        }
-    }
-    out
 }
