@@ -1,20 +1,16 @@
-//! Market aggregates (OHLC bars) in Vortex, stored with nothing but Vortex's own encodings and
-//! layouts. What is ours is how the columns are laid out before writing, which of Vortex's
-//! encodings may compress them ([`edition`]), and how they are read back:
+//! Market aggregates (OHLC bars) in Vortex, stored with Vortex's own encodings under a layout of
+//! ours. A file has the source's dtype; how its columns are stored is up to the components
+//! registered on a session ([`register`]):
 //!
-//! - [`plan`]: the transforms applied to columns before writing (decimals rescaled to drop the
-//!   trailing zeros every value has, and the four prices stored as one struct of parts).
-//! - [`profile`]: measuring a source's decimal columns, and the plan that follows from that.
+//! - [`bars`]: the layout at the root of a table of bars, which stores the four prices as parts
+//!   and reads them back as prices ([`price_fn`]).
 //! - [`ohlc`]: a bar's parts from its prices, and back.
-//! - [`write`](mod@write): writing a table with a plan.
-//! - [`bars`]: the layout at the root of a table of bars, which stores the prices as parts and
-//!   reads them back as prices ([`price_fn`]).
+//! - [`write`](mod@write): the options to write a table with.
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
 //! - [`kernels`]: filters on those blocked encodings that unpack only the blocks they keep.
 //!
-//! Reading the files from DataFusion, the rescaled columns at the source's scale, is
-//! datafusion-vortex-ohlc's, and pruning scans on the zone maps before they start (the prices on
-//! their parts') is datafusion-vortex-prune's.
+//! Reading the files from DataFusion is datafusion-vortex-ohlc's, and pruning scans on the zone
+//! maps before they start (the prices on their parts') is datafusion-vortex-prune's.
 
 use vortex::session::VortexSession;
 
@@ -22,9 +18,7 @@ pub mod bars;
 pub mod edition;
 pub mod kernels;
 pub mod ohlc;
-pub mod plan;
 pub mod price_fn;
-pub mod profile;
 pub mod write;
 
 /// Register what a session needs to read vortex-ohlc's files, and to read them well: the

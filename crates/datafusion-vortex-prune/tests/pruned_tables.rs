@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::compute::{cast, concat_batches};
+use arrow::compute::concat_batches;
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
@@ -18,13 +18,12 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_vortex_ohlc::vortex_format_factory;
 use datafusion_vortex_prune::{enable_url_table, PrunedTable, PrunedTableFactory, ZonePruner};
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexAccessPlan, VortexFormatFactory};
 
-use test_util::{source, source_plan, write};
+use test_util::{source, write};
 
 /// For each file of each Vortex scan in `plan`, whether it was given a selection.
 fn selected(plan: &Arc<dyn ExecutionPlan>) -> Vec<bool> {
@@ -49,14 +48,15 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
     let source = source();
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("bars.vortex");
-    std::fs::write(&path, write(&source, &source_plan(&source)))?;
+    std::fs::write(&path, write(&source))?;
 
     // One partition, so the rows come back in the file's order.
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     let state = ctx.state();
     let session = VortexSession::default();
-    let options = ListingOptions::new(vortex_format_factory(session.clone()).default())
-        .with_file_extension(".vortex");
+    vortex_ohlc::register(&session);
+    let format = VortexFormatFactory::new_with_session(session.clone());
+    let options = ListingOptions::new(format.default()).with_file_extension(".vortex");
     let url = ListingTableUrl::parse(path.to_str().unwrap())?;
     let config = ListingTableConfig::new(url)
         .with_listing_options(options)
@@ -67,8 +67,8 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
     let table = PrunedTable::over(&listing, &state, pruner)?;
     ctx.register_table("bars", Arc::new(table))?;
 
-    // The source's values: the prices as the source has them (the bars layout rebuilds them), and
-    // the volumes at the scale they are stored at, in whole shares.
+    // The source's types and values: the bars layout rebuilds the prices from their parts, and
+    // stores the rest as it is.
     let read = ctx.sql("SELECT * FROM bars").await?.collect().await?;
     let schema = read[0].schema();
     let types: Vec<(&str, &DataType)> = schema
@@ -85,18 +85,16 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
             ("high", &price),
             ("low", &price),
             ("close", &price),
-            ("volume", &DataType::Decimal128(38, 0)),
+            ("volume", &DataType::Decimal128(38, 6)),
             ("transactions", &DataType::Int64),
         ]
     );
     let read = concat_batches(&schema, &read)?;
-    for (read, source) in read.columns().iter().zip(source.columns()) {
-        assert_eq!(read, &cast(source, read.data_type())?);
-    }
+    assert_eq!(read.columns(), source.columns());
 
     // Only the last ticker's highs are this high and only the first's lows this low, so each
     // scan reads the one zone of three holding them, pruned on the bounds of the parts the prices
-    // are rebuilt from. Only the last ticker's volumes are wider than an i64, and stored rescaled.
+    // are rebuilt from. Only the last ticker's volumes are wider than an i64.
     for filter in ["high > 360", "low < 20", "volume > 9223372036854775807"] {
         let query = ctx
             .sql(&format!("SELECT * FROM bars WHERE {filter}"))

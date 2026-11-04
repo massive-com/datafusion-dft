@@ -16,8 +16,9 @@ use arrow::array::Array;
 use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, Shared};
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use vortex::array::aggregate_fn::AggregateFnRef;
+use vortex::array::arrays::decimal::converted_buffer;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{DecimalArray, StructArray};
 use vortex::array::builtins::ArrayBuiltins;
@@ -26,6 +27,7 @@ use vortex::array::stats::bind::{bind_stats, StatBinder};
 use vortex::array::validity::Validity;
 use vortex::array::{ArrayRef, IntoArray, MaskFuture, RawMetadata, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
+use vortex::buffer::BufferMut;
 use vortex::dtype::{
     DType, DecimalDType, FieldMask, FieldName, FieldPath, Nullability, StructFields,
 };
@@ -33,7 +35,9 @@ use vortex::error::{vortex_bail, vortex_ensure, vortex_err, VortexResult};
 use vortex::expr::{get_item, pack, root, BoundExpression, ExactBoundExpr, Expression};
 use vortex::layout::layouts::zoned::Zoned;
 use vortex::layout::segments::{SegmentSinkRef, SegmentSource};
-use vortex::layout::sequence::{SendableSequentialStream, SequencePointer};
+use vortex::layout::sequence::{
+    SendableSequentialStream, SequencePointer, SequentialStreamAdapter, SequentialStreamExt,
+};
 use vortex::layout::{
     layout_children, ArrayFuture, Layout, LayoutChildType, LayoutDeserializeArgs, LayoutId,
     LayoutParts, LayoutReader, LayoutReaderContext, LayoutReaderRef, LayoutRef, LayoutStrategy,
@@ -44,9 +48,15 @@ use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
-use crate::ohlc::{Part, Price};
-use crate::plan::OHLC;
+use crate::ohlc::{ohlc_to_parts, Part, Price};
 use crate::price_fn::{ohlc_price, OhlcPriceFn};
+
+/// The stored table's struct column holding the four prices as their [`Part`]s, where open is in
+/// the source.
+pub const OHLC: &str = "ohlc";
+
+/// The most digits a part may have: an `i128`'s.
+const MAX_PART_PRECISION: u8 = 38;
 
 /// Register the layout and [`OhlcPriceFn`], so files that use them can be read back.
 pub fn register(session: &VortexSession) {
@@ -167,46 +177,102 @@ fn stored_dtype(source: &DType, parts: DecimalDType) -> VortexResult<DType> {
     Ok(DType::Struct(fields, source.nullability()))
 }
 
-/// The source's dtype, given the stored table's and the prices' decimal type, and the parts'
-/// decimal type: the four prices where the [`OHLC`] struct is. The inverse of [`stored_dtype`].
-fn source_dtype(stored: &DType, price: DecimalDType) -> VortexResult<(DType, DecimalDType)> {
-    let fields = stored
-        .as_struct_fields_opt()
-        .ok_or_else(|| vortex_err!("a table of bars is a struct, not {stored}"))?;
-    let (mut names, mut dtypes): (Vec<FieldName>, Vec<DType>) = (Vec::new(), Vec::new());
-    let mut parts = None;
-    for (name, dtype) in fields.names().iter().zip(fields.fields()) {
-        if name.as_ref() != OHLC {
-            names.push(name.clone());
-            dtypes.push(dtype);
-            continue;
-        }
-        let ohlc = dtype
-            .as_struct_fields_opt()
-            .ok_or_else(|| vortex_err!("{OHLC} is {dtype}, not a struct"))?;
-        let Some(DType::Decimal(decimal, _)) = ohlc.field(Part::Open.name()) else {
-            vortex_bail!("{OHLC} has no decimal open");
-        };
-        parts = Some(decimal);
-        for p in Price::ALL {
-            names.push(p.name().into());
-            dtypes.push(DType::Decimal(price, dtype.nullability()));
+/// A chunk of a table of bars as stored, with `parts` (see [`parts_dtype`]): the four prices as
+/// the [`OHLC`] struct's parts, where open is in the source (see [`stored_dtype`]).
+fn stored_chunk(
+    chunk: ArrayRef,
+    parts: DecimalDType,
+    session: &VortexSession,
+) -> VortexResult<ArrayRef> {
+    let mut ctx = session.create_execution_ctx();
+    let table = chunk.execute::<StructArray>(&mut ctx)?;
+    let len = table.len();
+    let mut prices = Vec::with_capacity(Price::ALL.len());
+    for price in Price::ALL {
+        let column = (table.unmasked_field_by_name(price.name())?.clone())
+            .execute::<DecimalArray>(&mut ctx)?;
+        let valid = column.validity()?.execute_mask(len, &mut ctx)?;
+        vortex_ensure!(
+            valid.all_true(),
+            "{} has nulls, which the bars layout can't store yet",
+            price.name()
+        );
+        prices.push(converted_buffer::<i128>(&column, &valid)?);
+    }
+    let [open, high, low, close] = [&prices[0], &prices[1], &prices[2], &prices[3]];
+    let limit = 10i128.pow(u32::from(parts.precision()));
+    let mut columns: [BufferMut<i128>; 4] = std::array::from_fn(|_| BufferMut::with_capacity(len));
+    for i in 0..len {
+        let bar = ohlc_to_parts(open[i], high[i], low[i], close[i])
+            .filter(|bar| bar.iter().all(|part| part.abs() < limit))
+            .ok_or_else(|| vortex_err!("a bar's parts don't fit {} digits", parts.precision()))?;
+        for (column, part) in columns.iter_mut().zip(bar) {
+            column.push(part);
         }
     }
-    let parts = parts.ok_or_else(|| vortex_err!("the table has no {OHLC} struct"))?;
-    let fields = StructFields::new(names.into(), dtypes);
-    Ok((DType::Struct(fields, stored.nullability()), parts))
+    let nullable = table
+        .unmasked_field_by_name(Price::Open.name())?
+        .dtype()
+        .is_nullable();
+    let ohlc = StructArray::try_new(
+        Part::ALL
+            .map(|part| FieldName::from(part.name()))
+            .to_vec()
+            .into(),
+        columns.map(|column| {
+            DecimalArray::new(column.freeze(), parts, Validity::NonNullable).into_array()
+        }),
+        len,
+        match nullable {
+            true => Validity::AllValid,
+            false => Validity::NonNullable,
+        },
+    )?;
+    let (mut names, mut fields): (Vec<FieldName>, Vec<ArrayRef>) = (Vec::new(), Vec::new());
+    for (name, field) in table.names().iter().zip(table.iter_unmasked_fields()) {
+        match Price::from_name(name.as_ref()) {
+            Some(Price::Open) => {
+                names.push(OHLC.into());
+                fields.push(ohlc.clone().into_array());
+            }
+            Some(_) => {}
+            None => {
+                names.push(name.clone());
+                fields.push(field.clone());
+            }
+        }
+    }
+    Ok(StructArray::try_new(names.into(), fields, len, table.struct_validity())?.into_array())
 }
 
-/// Writes the table with `inner` and wraps it in a [`BarsLayout`] whose prices are `price`.
+/// The parts' decimal type for a table of `source`'s dtype, if it is a table of bars: one with
+/// the four prices, all decimals of one type. The parts keep the prices' scale, with a digit more
+/// (a part is a price or the difference of two), up to [`MAX_PART_PRECISION`].
+fn parts_dtype(source: &DType) -> Option<DecimalDType> {
+    let fields = source.as_struct_fields_opt()?;
+    let [open, high, low, close] = Price::ALL.map(|price| fields.field(price.name()));
+    let Some(DType::Decimal(price, nullability)) = open else {
+        return None;
+    };
+    [high, low, close]
+        .iter()
+        .all(|dtype| *dtype == Some(DType::Decimal(price, nullability)))
+        .then(|| {
+            let precision = (price.precision() + 1).min(MAX_PART_PRECISION);
+            DecimalDType::new(precision, price.scale())
+        })
+}
+
+/// Writes a table of bars (see [`parts_dtype`]) with `inner`, its four prices as the [`OHLC`]
+/// struct's parts, and wraps it in a [`BarsLayout`] with the source's dtype. Writes any other
+/// table with `inner` as it is.
 pub struct BarsStrategy {
     inner: Arc<dyn LayoutStrategy>,
-    price: DecimalDType,
 }
 
 impl BarsStrategy {
-    pub fn new(inner: Arc<dyn LayoutStrategy>, price: DecimalDType) -> Self {
-        Self { inner, price }
+    pub fn new(inner: Arc<dyn LayoutStrategy>) -> Self {
+        Self { inner }
     }
 }
 
@@ -220,11 +286,26 @@ impl LayoutStrategy for BarsStrategy {
         eof: SequencePointer,
         session: &VortexSession,
     ) -> VortexResult<LayoutRef> {
+        let source = stream.dtype().clone();
+        let Some(parts) = parts_dtype(&source) else {
+            return (self.inner)
+                .write_stream(ctx, segment_sink, stream, eof, session)
+                .await;
+        };
+        let stored = stored_dtype(&source, parts)?;
+        let chunk_session = session.clone();
+        let stream = SequentialStreamAdapter::new(
+            stored,
+            stream.map(move |chunk| {
+                let (sequence, chunk) = chunk?;
+                Ok((sequence, stored_chunk(chunk, parts, &chunk_session)?))
+            }),
+        )
+        .sendable();
         let data = self
             .inner
             .write_stream(ctx, segment_sink, stream, eof, session)
             .await?;
-        let (source, parts) = source_dtype(data.dtype(), self.price)?;
         Ok(LayoutParts::new(
             BarsLayout,
             source,

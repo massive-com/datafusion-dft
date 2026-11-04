@@ -1,5 +1,5 @@
 [package]
-description = "Reading vortex-ohlc's files from DataFusion as the source they were written from: rescaled decimals at their source scale, and filters on them pushed into Vortex"
+description = "Reading vortex-ohlc's files from DataFusion: a Vortex format with vortex-ohlc registered, and the df bench"
 edition.workspace = true
 name = "datafusion-vortex-ohlc"
 version = "0.1.0"

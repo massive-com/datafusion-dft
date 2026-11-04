@@ -17,14 +17,14 @@ use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::VortexFormatFactory;
 
-use test_util::{source, source_plan, write};
+use test_util::{source, write};
 
 #[tokio::test]
 async fn vortex_datafusion_reads_the_source() -> Result<()> {
     let source = source();
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("bars.vortex");
-    std::fs::write(&path, write(&source, &source_plan(&source)))?;
+    std::fs::write(&path, write(&source))?;
 
     // One partition, so the rows come back in the file's order.
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));

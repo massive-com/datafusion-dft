@@ -1,4 +1,4 @@
-//! A bar's four prices ([`Price`]) as the parts the [`OHLC`](crate::plan::OHLC) struct stores
+//! A bar's four prices ([`Price`]) as the parts the [`OHLC`](crate::bars::OHLC) struct stores
 //! ([`Part`]), and back.
 
 use num_traits::{AsPrimitive, PrimInt};
@@ -90,7 +90,7 @@ impl Price {
     }
 }
 
-/// One of the [`OHLC`](crate::plan::OHLC) struct's fields, a bar's prices stored against each
+/// One of the [`OHLC`](crate::bars::OHLC) struct's fields, a bar's prices stored against each
 /// other: `open`, `body = close - open` (signed), `upper = high - max(open, close)` and
 /// `lower = min(open, close) - low` (both never negative, since `low <= open, close <= high`).
 /// The wicks are zero in most bars and the body in about half.
@@ -117,14 +117,14 @@ impl Part {
     }
 }
 
-/// The parts of one bar from its prices, in [`Part::ALL`] order.
-pub fn ohlc_to_parts<W: PrimInt>(open: W, high: W, low: W, close: W) -> [W; 4] {
-    [
+/// The parts of one bar from its prices, in [`Part::ALL`] order; `None` if one overflows `W`.
+pub fn ohlc_to_parts<W: PrimInt>(open: W, high: W, low: W, close: W) -> Option<[W; 4]> {
+    Some([
         open,
-        close - open,
-        high - open.max(close),
-        open.min(close) - low,
-    ]
+        close.checked_sub(&open)?,
+        high.checked_sub(&open.max(close))?,
+        open.min(close).checked_sub(&low)?,
+    ])
 }
 
 /// The prices of one bar from its parts, in [`Price::ALL`] order; undoes [`ohlc_to_parts`].
@@ -146,9 +146,10 @@ mod tests {
             [-5, 3, -9, -7],
         ];
         for [open, high, low, close] in bars {
-            let parts = ohlc_to_parts(open, high, low, close);
+            let parts = ohlc_to_parts(open, high, low, close).unwrap();
             assert!(parts[2] >= 0 && parts[3] >= 0, "wicks are never negative");
             assert_eq!(ohlc_from_parts(parts), [open, high, low, close]);
         }
+        assert_eq!(ohlc_to_parts(i8::MIN, 100, i8::MIN, 100), None);
     }
 }

@@ -1,5 +1,5 @@
 //! The table of bars vortex-ohlc's tests and datafusion-vortex-ohlc's write and read back: its
-//! source batch, its plan and the file written with it.
+//! source batch and the file written from it.
 
 use std::sync::Arc;
 
@@ -12,9 +12,7 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::plan::Plan;
-use vortex_ohlc::profile::{plan, DecimalProfiler};
-use vortex_ohlc::write::{stored_arrays, write_options};
+use vortex_ohlc::write::{arrays, write_options};
 
 pub const ROWS: usize = 5_000;
 pub const ROW_BLOCK: usize = 2_048;
@@ -57,7 +55,7 @@ pub fn source() -> RecordBatch {
         let high = open.max(close) + [0, 0, 0, 3][rng.next(4) as usize];
         let low = open.min(close) - [0, 0, 2][rng.next(3) as usize];
         let volume = match row >= WIDE_FROM {
-            // Wider than an i64 even once rescaled to whole shares.
+            // Wider than an i64.
             true => i64::MAX as i128 + 1 + rng.next(1_000) as i128,
             false => rng.next(100_000) as i128,
         };
@@ -93,16 +91,9 @@ pub fn source() -> RecordBatch {
     .unwrap()
 }
 
-/// `source`'s plan, from its profile.
-pub fn source_plan(source: &RecordBatch) -> Plan {
-    let mut profiler = DecimalProfiler::new(&source.schema());
-    profiler.add(source);
-    plan(&profiler.finish())
-}
-
-/// `source` written with `plan`, in 1,000-row batches and `ROW_BLOCK`-row chunks: under the bars
-/// layout if the plan stores the prices as parts (see [`write_options`]).
-pub fn write(source: &RecordBatch, plan: &Plan) -> Vec<u8> {
+/// `source` written in 1,000-row batches and `ROW_BLOCK`-row chunks, under the bars layout (see
+/// [`write_options`]).
+pub fn write(source: &RecordBatch) -> Vec<u8> {
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
@@ -111,10 +102,9 @@ pub fn write(source: &RecordBatch, plan: &Plan) -> Vec<u8> {
         .step_by(1_000)
         .map(|start| source.slice(start, 1_000.min(ROWS - start)))
         .collect();
-    let arrays = stored_arrays(&session, &source.schema(), plan, batches).unwrap();
+    let arrays = arrays(&session, &source.schema(), batches).unwrap();
     let mut bytes = Vec::new();
-    write_options(&session, &source.schema(), plan, ROW_BLOCK)
-        .unwrap()
+    write_options(&session, ROW_BLOCK)
         .blocking(&runtime)
         .write(&mut bytes, arrays)
         .unwrap();

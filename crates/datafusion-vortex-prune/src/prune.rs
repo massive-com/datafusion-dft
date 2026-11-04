@@ -31,7 +31,7 @@
 //! container:
 //!
 //! - a column the file stores as it is has its zone maps' min and max, in the table's type;
-//! - a rescaled decimal has them scaled back up to the table's scale;
+//! - a decimal stored at a smaller scale than the table's has them scaled up to the table's;
 //! - a price has bounds from those of the [`OHLC`] parts it is rebuilt from (see
 //!   [`price_bounds`]).
 //!
@@ -72,9 +72,9 @@ use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::VortexAccessPlan;
+use vortex_ohlc::bars::OHLC;
 use vortex_ohlc::bars::{data_child, BarsLayout};
 use vortex_ohlc::ohlc::{Part, Price};
-use vortex_ohlc::plan::OHLC;
 
 /// How many bytes of zone maps a [`ZonePruner`] keeps by default: tens of KB a file, so some
 /// thousands of files.
@@ -502,10 +502,10 @@ fn price_bounds(
 mod tests {
     use super::*;
     use vortex_ohlc::ohlc::ohlc_to_parts;
-    use vortex_ohlc::plan::OHLC_PRECISION;
 
-    /// The parts' scale in these tests, test-util's prices' (see [`zones_of_bars`]), and the
-    /// table's: prices rescaled by 2.
+    /// The parts' type in these tests: test-util's prices' scale (see [`zones_of_bars`]), and the
+    /// table's two digits more, as if the parts had been stored rescaled.
+    const PART_PRECISION: u8 = 16;
     const PART_SCALE: i8 = 4;
     const TABLE: DataType = DataType::Decimal128(18, 6);
 
@@ -533,7 +533,7 @@ mod tests {
             .iter()
             .map(|bars| {
                 bars.iter()
-                    .map(|&[o, h, l, c]| ohlc_to_parts(o, h, l, c))
+                    .map(|&[o, h, l, c]| ohlc_to_parts(o, h, l, c).unwrap())
                     .collect()
             })
             .collect();
@@ -547,7 +547,7 @@ mod tests {
                         .map(|bars| bars.iter().map(|p| p[i]).reduce(pick))
                         .chain([None]);
                     let array = Decimal128Array::from_iter(values)
-                        .with_precision_and_scale(OHLC_PRECISION, PART_SCALE)
+                        .with_precision_and_scale(PART_PRECISION, PART_SCALE)
                         .unwrap();
                     Arc::new(array)
                 };
