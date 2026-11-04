@@ -1,5 +1,5 @@
 [package]
-description = "OHLC bars in Vortex: the four prices stored as one struct of parts under a layout of their own"
+description = "OHLC bars in Vortex: the four prices stored as one struct of parts under a layout of their own, and decimals divided by a power of ten per block"
 edition.workspace = true
 name = "vortex-ohlc"
 version = "0.1.0"
@@ -10,7 +10,13 @@ async-trait.workspace = true
 fastlanes.workspace = true
 futures.workspace = true
 num-traits.workspace = true
+prost.workspace = true
 vortex.workspace = true
+# The encoding macros name these crates, and the compressor's scheme API is only partly in `vortex`.
+vortex-array.workspace = true
+vortex-btrblocks.workspace = true
+vortex-compressor.workspace = true
+vortex-error.workspace = true
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
