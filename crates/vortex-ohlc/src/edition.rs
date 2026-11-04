@@ -31,6 +31,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
         min_library_version: None,
     },
     added: &[
+        EditionMember::layout(&"vortex_ohlc.bars"),
         EditionMember::array(&"fastlanes.for.v2"),
         EditionMember::array(&"fastlanes.bitpacked.v2"),
         EditionMember::array(&"vortex.decimal_byte_parts.v2"),

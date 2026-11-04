@@ -9,6 +9,8 @@
 //! - [`prices`]: the prices as Vortex expressions over the parts, to rebuild or filter on them
 //!   within a scan.
 //! - [`write`](mod@write): writing a table with a plan.
+//! - [`bars`]: the layout at the root of a table of bars, which stores the prices as parts and
+//!   reads them back as prices ([`price_fn`]).
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
 //! - [`kernels`]: filters on those blocked encodings that unpack only the blocks they keep.
 //!
@@ -17,15 +19,19 @@
 
 use vortex::session::VortexSession;
 
+pub mod bars;
 pub mod edition;
 pub mod kernels;
 pub mod ohlc;
 pub mod plan;
+pub mod price_fn;
 pub mod prices;
 pub mod profile;
 pub mod write;
 
-/// Register what a session needs to read vortex-ohlc's files well: the filter [`kernels`].
+/// Register what a session needs to read vortex-ohlc's files, and to read them well: the
+/// [`bars`] layout and its price function, and the filter [`kernels`].
 pub fn register(session: &VortexSession) {
+    bars::register(session);
     kernels::register(session);
 }
