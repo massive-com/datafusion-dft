@@ -14,14 +14,13 @@ use vortex::VortexSessionDefault;
 
 fn main() {
     let session = VortexSession::default();
+    vortex_ohlc::register(&session);
     for path in std::env::args().skip(1) {
         let bytes = std::fs::read(&path).unwrap();
         let total = bytes.len();
         let file = session.open_options().open_buffer(bytes).unwrap();
         let segments = Arc::clone(file.footer().segment_map());
-        let fields = file.dtype().as_struct_fields_opt().expect("a table");
-        let names: Vec<_> = fields.names().iter().map(|name| name.to_string()).collect();
-        let table = find_table(file.footer().layout(), &names).expect("the table's layout");
+        let table = find_table(file.footer().layout()).expect("the table's layout");
         println!("{path}: {total} bytes");
         for (name, column) in table.child_names().zip(table.children().unwrap()) {
             let bytes: u64 = segment_ids(&column)
@@ -36,20 +35,17 @@ fn main() {
     }
 }
 
-/// The first layout at or under `layout` whose children are the columns `names`.
-fn find_table(layout: &LayoutRef, names: &[String]) -> Option<LayoutRef> {
-    if layout
-        .child_names()
-        .map(|name| name.to_string())
-        .eq(names.iter().cloned())
-    {
+/// The first layout at or under `layout` whose children are its struct's fields: the stored
+/// table, under a bars file's root.
+fn find_table(layout: &LayoutRef) -> Option<LayoutRef> {
+    let fields = layout.dtype().as_struct_fields_opt();
+    if fields.is_some_and(|fields| {
+        let names = fields.names().iter().map(|name| name.to_string());
+        layout.child_names().map(|name| name.to_string()).eq(names)
+    }) {
         return Some(Arc::clone(layout));
     }
-    layout
-        .children()
-        .ok()?
-        .iter()
-        .find_map(|child| find_table(child, names))
+    layout.children().ok()?.iter().find_map(find_table)
 }
 
 /// The segments of `layout` and every layout under it.
