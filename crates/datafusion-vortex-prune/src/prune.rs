@@ -72,6 +72,7 @@ use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::VortexAccessPlan;
+use vortex_ohlc::bars::{data_child, BarsLayout};
 use vortex_ohlc::ohlc::{Part, Price};
 use vortex_ohlc::plan::OHLC;
 
@@ -276,9 +277,14 @@ impl FileZones {
         file: &VortexFile,
         meta: ObjectMeta,
     ) -> VortexResult<Self> {
-        let root_layout = file.footer().layout();
-        let fields = file
-            .dtype()
+        // Under a bars layout, the zone maps are the stored table's, by its columns.
+        let mut root_layout = Arc::clone(file.footer().layout());
+        if root_layout.is::<BarsLayout>() {
+            root_layout = data_child(&root_layout)?;
+        }
+        let root_layout = &root_layout;
+        let dtype = root_layout.dtype().clone();
+        let fields = dtype
             .as_struct_fields_opt()
             .ok_or_else(|| vortex_err!("not a table"))?;
         // Each zoned column's zoned layout, by path.
