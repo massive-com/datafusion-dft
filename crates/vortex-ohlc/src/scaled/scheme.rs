@@ -14,7 +14,7 @@ use vortex_btrblocks::{
 use vortex_compressor::scheme::{CompressionEstimate, DeferredEstimate, EstimateVerdict};
 
 use super::encode::{block_exponents, scaled_encode_with};
-use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
+use super::{DecimalPow10Scheme, Scaled, ScaledArrayExt, ScaledArraySlotsExt};
 
 /// Stores a decimal's integer part as [`Scaled`] whenever a block of it is worth an exponent, then
 /// compresses its quotients, exponents and patches' values in turn. A block's kept quotients span
@@ -119,10 +119,12 @@ pub(crate) fn failed_estimate(error: VortexError) -> CompressionEstimate {
     )))
 }
 
-/// Whether the compressor is at a decimal column's integer part.
+/// Whether the compressor is at a decimal column's integer part, under Vortex's decimal scheme or
+/// [`DecimalPow10Scheme`].
 fn is_decimal_part(history: &[(SchemeId, usize)]) -> bool {
     matches!(history, [(parent, child)]
-        if *parent == DecimalScheme::v1().id() && *child == DecimalBytePartsSlots::MSP)
+        if (*parent == DecimalScheme::v1().id() || *parent == DecimalPow10Scheme.id())
+            && *child == DecimalBytePartsSlots::MSP)
 }
 
 /// Whether the compressor is at a decimal column's integer part, or at the quotients

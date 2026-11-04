@@ -12,11 +12,15 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use vortex::array::iter::{ArrayIterator, ArrayIteratorAdapter};
 use vortex::arrow::ArrowSessionExt;
+use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::error::VortexResult;
 use vortex::file::{VortexWriteOptions, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::session::VortexSession;
+use vortex_btrblocks::schemes::decimal::DecimalScheme;
+use vortex_btrblocks::SchemeExt;
 
 use crate::bars::BarsStrategy;
+use crate::scaled::DecimalPow10Scheme;
 
 /// Rows per chunk (row block) by default: 65,536, the row group size of the Parquet files the
 /// bars come from.
@@ -26,12 +30,18 @@ pub const DEFAULT_ROW_BLOCK: usize = 65_536;
 /// ([`BarsStrategy`]).
 ///
 /// The strategy is Vortex's default on `session`, which must enable [`crate::edition`]: its
-/// compressor may then use blocked FoR, blocked bit-packing and DecimalByteParts with lower
-/// parts, and each of a bar's parts is a column of its own, with its own zone map. Vortex's
-/// default also coalesces blocks up to about 1 MiB, which would merge the narrow columns into
-/// bigger chunks, so that is turned off: every chunk is one row block.
+/// compressor may then use our encodings, blocked FoR, blocked bit-packing and DecimalByteParts
+/// with lower parts, and each of a bar's parts is a column of its own, with its own zone map.
+/// Vortex's default also coalesces blocks up to about 1 MiB, which would merge the narrow columns
+/// into bigger chunks, so that is turned off: every chunk is one row block. Its decimal scheme
+/// gives way to [`DecimalPow10Scheme`], which stores decimals as it does, but without the
+/// trailing zeros a chunk's values all have.
 pub fn write_options(session: &VortexSession, row_block: usize) -> VortexWriteOptions {
+    let compressor = BtrBlocksCompressorBuilder::from_session(session)
+        .exclude_schemes([DecimalScheme::v1().id()])
+        .with_new_scheme(&DecimalPow10Scheme);
     let strategy = WriteStrategyBuilder::from_session(session)
+        .with_btrblocks_builder(compressor)
         .with_row_block_size(row_block)
         .with_data_block_target_bytes(None)
         .build();

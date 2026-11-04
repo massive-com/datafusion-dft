@@ -94,7 +94,12 @@ fn round_trip() {
         let ohlc = child(chunk, OHLC);
         for part in Part::ALL.map(Part::name) {
             let ids = encoding_ids(&child(&ohlc, part));
-            assert!(ids[0].contains("decimal_byte_parts"), "{part}: {ids:?}");
+            // Under `vortex_ohlc.scaled` where a chunk's values share trailing zeros.
+            let parts = match ids[0].as_str() {
+                "vortex_ohlc.scaled" => &ids[1],
+                _ => &ids[0],
+            };
+            assert!(parts.contains("decimal_byte_parts"), "{part}: {ids:?}");
             assert!(
                 ids.iter().any(|id| id.starts_with("fastlanes.")),
                 "{part}: {ids:?}"
@@ -108,8 +113,13 @@ fn round_trip() {
         );
     }
     assert!(v2, "no part is in an encoding only the edition allows");
-    // Only the last chunk has volumes wider than an i64, cut into an i64 and lower parts.
-    let volume_children = |chunk: &ArrayRef| child(chunk, "volume").named_children().len();
+    // Only the last chunk has volumes wider than an i64, even without their trailing zeros, cut
+    // into an i64 and lower parts.
+    let volume_children = |chunk: &ArrayRef| {
+        let volume = child(chunk, "volume");
+        assert_eq!(volume.encoding_id().to_string(), "vortex_ohlc.scaled");
+        child(&volume, "values").named_children().len()
+    };
     let last = chunks.last().unwrap();
     assert!(volume_children(last) > volume_children(&chunks[0]));
 }
