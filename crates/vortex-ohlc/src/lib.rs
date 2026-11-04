@@ -9,6 +9,7 @@
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
 //! - [`kernels`]: filters on those blocked encodings that unpack only the blocks they keep.
 //! - [`pow10`]: integers divided, a block at a time, by a power of ten the block shares.
+//! - [`blocked_for`]: a reference and a bit width per block for decimals, where that pays.
 //!
 //! Reading the files from DataFusion is datafusion-vortex-ohlc's, and pruning scans on the zone
 //! maps before they start (the prices on their parts') is datafusion-vortex-prune's.
@@ -16,6 +17,7 @@
 use vortex::session::VortexSession;
 
 pub mod bars;
+pub mod blocked_for;
 pub mod edition;
 pub mod kernels;
 pub mod ohlc;
@@ -25,11 +27,12 @@ pub mod write;
 
 /// Register what a session needs to read vortex-ohlc's files, and to read them well: the
 /// [`bars`] layout and its price function, the [`pow10`] encoding, the filter [`kernels`], and
-/// for writing, the compression scheme that picks [`pow10`].
+/// for writing, the compression schemes that pick [`pow10`] and [`blocked_for`].
 pub fn register(session: &VortexSession) {
     bars::register(session);
     kernels::register(session);
     pow10::register(session);
+    register_scheme(session, &blocked_for::BlockedForScheme);
 }
 
 /// Let compressors built from `session` use `scheme`, unless they already may.

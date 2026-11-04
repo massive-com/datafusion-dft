@@ -106,6 +106,18 @@ fn is_decimal_part(history: &[(SchemeId, usize)]) -> bool {
         if *parent == DecimalScheme::v1().id() && *child == DecimalBytePartsSlots::MSP)
 }
 
+/// Whether the compressor is at a decimal column's integer part, or at the quotients
+/// [`Pow10Scheme`] made of one.
+pub(crate) fn is_decimal_values(history: &[(SchemeId, usize)]) -> bool {
+    match history {
+        [_] => is_decimal_part(history),
+        [part, (parent, 0)] => {
+            is_decimal_part(std::slice::from_ref(part)) && *parent == Pow10Scheme.id()
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use vortex::array::arrays::DecimalArray;
