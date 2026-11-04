@@ -1,6 +1,6 @@
 //! Vortex tables pruned before their scans start, as dft has them: a file written by vortex-ohlc,
-//! read with its prices rebuilt (see `PrunedTable::over`), and tables queried by path or created
-//! with `CREATE EXTERNAL TABLE`.
+//! its prices under the bars layout (see `PrunedTable::over`), and tables queried by path or
+//! created with `CREATE EXTERNAL TABLE`.
 
 use std::collections::HashMap;
 use std::sync::Arc;

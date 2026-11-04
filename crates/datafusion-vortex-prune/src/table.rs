@@ -163,8 +163,8 @@ impl PrunedTable {
         Self { inner, factory }
     }
 
-    /// `listing`, a listing table over Vortex files, as a table of bars (see [`source_table`]),
-    /// its scans pruned by `pruner` before they start. Its files, and their zone maps, are read as
+    /// `listing`, a listing table over Vortex files, with their rescaled columns read at the
+    /// table's scale (see [`source_table`]), its scans pruned by `pruner` before they start. Its files, and their zone maps, are read as
     /// [`reader_factory`] picks for its object store.
     pub fn over(
         listing: &ListingTable,

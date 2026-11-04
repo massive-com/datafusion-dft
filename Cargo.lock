@@ -3468,6 +3468,8 @@ dependencies = [
  "futures",
  "parquet",
  "regex",
+ "tempfile",
+ "test-util",
  "tokio",
  "vortex",
  "vortex-datafusion",
