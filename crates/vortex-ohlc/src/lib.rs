@@ -15,6 +15,8 @@
 //!   time: a chunk of decimals by the trailing zeros all its values have, at a smaller scale, and
 //!   each block of its integer part by those the block's values have.
 //! - [`blocked_for`]: a reference and a bit width per block for decimals, where that pays.
+//! - [`gcd`]: timestamps' seconds into the day divided by the greatest common divisor of a
+//!   chunk's (minute bars' are multiples of 60), as [`scaled`] arrays.
 //!
 //! Reading the files from DataFusion is datafusion-vortex-ohlc's, and pruning scans on the zone
 //! maps before they start (the prices on their parts') is datafusion-vortex-prune's.
@@ -25,6 +27,7 @@ pub mod bars;
 pub mod blocked_for;
 pub mod dollar_volume;
 pub mod edition;
+pub mod gcd;
 pub mod kernels;
 pub mod ohlc;
 pub mod price_fn;
@@ -36,13 +39,15 @@ mod testing;
 
 /// Register what a session needs to read vortex-ohlc's files, and to read them well: the
 /// [`bars`] layout and its price function, the [`scaled`] encoding, the filter [`kernels`], and
-/// for writing, the compression schemes that pick [`scaled`] and [`blocked_for`].
+/// for writing, the compression schemes that pick [`scaled`] (with [`gcd`]'s) and
+/// [`blocked_for`].
 /// [`DecimalPow10Scheme`](scaled::DecimalPow10Scheme) takes the place of Vortex's decimal scheme,
 /// so it is [`write::write_options`]' alone.
 pub fn register(session: &VortexSession) {
     bars::register(session);
     kernels::register(session);
     scaled::register(session);
+    register_scheme(session, &gcd::GcdScheme);
     register_scheme(session, &blocked_for::BlockedForScheme);
 }
 

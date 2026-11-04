@@ -44,8 +44,9 @@ const DATA_DIR: &str = concat!(
 /// 23 since its metadata has a base, 24 since every decimal is rescaled a chunk at a time
 /// (`vortex_ohlc::scaled::DecimalPow10Scheme`), 25 since the dollar volume is stored as a residual
 /// against volume × open (`vortex_ohlc::dollar_volume`), 26 since the layout's metadata says
-/// whether it is. 9 to 16 were these steps in an earlier order.
-const VORTEX_VERSION: u32 = 26;
+/// whether it is, 27 since timestamps' seconds into the day are divided by their chunk's common
+/// divisor (`vortex_ohlc::gcd`). 9 to 16 were these steps in an earlier order.
+const VORTEX_VERSION: u32 = 27;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;
