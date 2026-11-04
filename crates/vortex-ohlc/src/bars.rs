@@ -641,6 +641,12 @@ impl PartZones {
     }
 
     /// Read every part's zone map.
+    ///
+    /// *Upstream*: Vortex's own `ZoneMap` reads a zone map, bounded statistics included, and
+    /// prunes with it (vortex-layout 0.89 `zoned/zone_map.rs:74,144`). Building one needs the
+    /// zoned layout's aggregate functions, which are `pub(crate)` (`ZonedData::aggregate_fns`,
+    /// `zoned/mod.rs:380`), as is the zone map `ZonedReader` keeps (`zoned/pruning.rs:156`). If
+    /// Vortex made either public, this and the pruner's `read_zone_map` could use it.
     fn read(
         &self,
         name: &Arc<str>,

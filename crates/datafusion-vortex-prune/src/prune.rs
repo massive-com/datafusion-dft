@@ -174,6 +174,12 @@ impl ZonePruner {
     /// The zone maps of `file` in the object store at `url`: the ones kept, unless the file has
     /// changed since they were read, or else read through `readers` (or by the query already
     /// reading them) and kept. `None` if they can't be read, until a later query tries again.
+    ///
+    /// *Upstream*: this opens the file again, reading its footer, which vortex-datafusion has
+    /// already put in DataFusion's file metadata cache as `CachedVortexMetadata`
+    /// (vortex-datafusion 0.89 `persistent/cache.rs:12`), in a private module. If Vortex made
+    /// it public, the footer could come from there. The catch: moka's joining of concurrent
+    /// reads of the same file would go.
     async fn zones(
         &self,
         url: &ObjectStoreUrl,
@@ -342,6 +348,9 @@ impl FileZones {
 
 /// The min and max per zone in the zone map `zones` of the column at `path`, as Arrow arrays;
 /// null where there is no bound.
+///
+/// *Upstream*: Vortex's `ZoneMap` could read it, if Vortex made a zoned layout's aggregate
+/// functions public (see `vortex_ohlc::bars`'s `PartZones::read`).
 async fn read_zone_map(
     session: &VortexSession,
     file: &VortexFile,
