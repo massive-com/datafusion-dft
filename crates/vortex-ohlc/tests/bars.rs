@@ -1,5 +1,5 @@
 //! A table of bars written under the bars layout reads back with the source's prices, through
-//! Vortex's own scan: the whole row, one price, a price filter, and pruning on a price.
+//! Vortex's own scan: the whole row, one price, a price filter, and pruning on prices.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use arrow::datatypes::DataType;
 use vortex::array::{ArrayRef, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::{DType, DecimalDType, Nullability};
-use vortex::expr::{and, get_item, gt, lit, lt_eq, root, Expression};
+use vortex::expr::{and, get_item, gt, lit, lt, lt_eq, or, root, Expression};
 use vortex::file::{OpenOptionsSessionExt, VortexFile};
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
@@ -152,24 +152,48 @@ fn the_root_prunes_on_a_price() {
     let session = session(&runtime);
     let source = source();
     let file = session.open_options().open_buffer(write(&source)).unwrap();
-    let high = source_prices(&source, Price::High);
-    // The zones with a high above $360.
-    let kept: Vec<bool> = high
-        .chunks(ROW_BLOCK)
-        .map(|zone| zone.iter().any(|&h| h > 360 * 10_000))
+    let [high, low] = [Price::High, Price::Low].map(|price| source_prices(&source, price));
+    // Per zone, whether a high is above $360, and whether a low is below $20.
+    let zones = |prices: &[i128], hit: fn(i128) -> bool| -> Vec<bool> {
+        prices
+            .chunks(ROW_BLOCK)
+            .map(|zone| zone.iter().any(|&p| hit(p)))
+            .collect()
+    };
+    let high_zones = zones(&high, |h| h > 360 * 10_000);
+    let low_zones = zones(&low, |l| l < 20 * 10_000);
+    assert!(high_zones.iter().any(|k| !k), "nothing to prune");
+    let either: Vec<bool> = (high_zones.iter().zip(&low_zones))
+        .map(|(h, l)| h | l)
         .collect();
-    assert!(kept.iter().any(|k| !k), "nothing to prune");
+    let both: Vec<bool> = (high_zones.iter().zip(&low_zones))
+        .map(|(h, l)| h & l)
+        .collect();
+    let high_gt = || gt(get_item("high", root()), cents(36_000));
+    let low_lt = || lt(get_item("low", root()), cents(2_000));
+    // A filter on prices alone, or on prices and other columns: the prices' part prunes.
+    let some_transactions = gt(get_item("transactions", root()), lit(10i64));
+    let cases = [
+        (high_gt(), &high_zones),
+        (or(high_gt(), low_lt()), &either),
+        (and(high_gt(), low_lt()), &both),
+        (and(high_gt(), some_transactions), &high_zones),
+    ];
     let reader = file.layout_reader().unwrap();
-    let expr = gt(get_item("high", root()), cents(36_000))
-        .bind(file.dtype())
-        .unwrap();
-    let mask = reader
-        .pruning_evaluation(&(0..ROWS as u64), &expr, Mask::new_true(ROWS))
-        .unwrap();
-    let mask = runtime.block_on(mask).unwrap();
-    for (zone, kept) in kept.iter().enumerate() {
-        let start = zone * ROW_BLOCK;
-        let rows = mask.slice(start..(start + ROW_BLOCK).min(ROWS));
-        assert_eq!(rows.true_count() > 0, *kept, "zone {zone}");
+    for (expr, kept) in cases {
+        let name = expr.to_string();
+        let mask = reader
+            .pruning_evaluation(
+                &(0..ROWS as u64),
+                &expr.bind(file.dtype()).unwrap(),
+                Mask::new_true(ROWS),
+            )
+            .unwrap();
+        let mask = runtime.block_on(mask).unwrap();
+        for (zone, kept) in kept.iter().enumerate() {
+            let start = zone * ROW_BLOCK;
+            let rows = mask.slice(start..(start + ROW_BLOCK).min(ROWS));
+            assert_eq!(rows.true_count() > 0, *kept, "{name}: zone {zone}");
+        }
     }
 }
