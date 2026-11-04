@@ -1,11 +1,11 @@
 //! [`Pow10Scheme`]: when Vortex's compressor stores integers as [`Pow10`].
 
-use vortex::array::arrays::PrimitiveArray;
-use vortex::array::patches::Patches;
+use std::sync::Arc;
+
 use vortex::array::vtable::VTable;
 use vortex::array::{ArrayId, ArrayRef, Canonical, ExecutionCtx, IntoArray};
 use vortex::encodings::decimal_byte_parts::DecimalBytePartsSlots;
-use vortex::error::VortexResult;
+use vortex::error::{vortex_err, VortexResult};
 use vortex_btrblocks::schemes::decimal::DecimalScheme;
 use vortex_btrblocks::{
     compress_patches, ArrayAndStats, CascadingCompressor, CompressorContext, Scheme, SchemeExt,
@@ -13,8 +13,8 @@ use vortex_btrblocks::{
 };
 use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 
-use super::encode::any_exponent;
-use super::{pow10_encode, Pow10, Pow10ArrayExt, Pow10ArraySlotsExt};
+use super::encode::{block_exponents, pow10_encode_with};
+use super::{Pow10, Pow10ArrayExt, Pow10ArraySlotsExt};
 
 /// Stores a decimal's integer part as [`Pow10`] whenever a block of it is worth an exponent, then
 /// compresses its quotients, exponents and patches' values in turn. A block's kept quotients span
@@ -55,12 +55,8 @@ impl Scheme for Pow10Scheme {
             && !compress_ctx.finished_cascading()
             && is_decimal_part(compress_ctx.cascade_history());
         let worth_it = eligible
-            && data
-                .array()
-                .clone()
-                .execute::<PrimitiveArray>(exec_ctx)
-                .and_then(|values| any_exponent(&values, exec_ctx))
-                .unwrap_or(false);
+            && (exponents(data, exec_ctx).0.as_ref())
+                .is_some_and(|exponents| exponents.iter().any(|&e| e != 0));
         CompressionEstimate::Verdict(match worth_it {
             true => EstimateVerdict::AlwaysUse,
             false => EstimateVerdict::Skip,
@@ -74,8 +70,10 @@ impl Scheme for Pow10Scheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let values = data.array().clone().execute::<PrimitiveArray>(exec_ctx)?;
-        let Some(array) = pow10_encode(&values, exec_ctx)? else {
+        let values = data.array_as_primitive().into_owned();
+        let exponents = exponents(data, exec_ctx);
+        let exponents = (exponents.0.as_ref()).ok_or_else(|| vortex_err!("no exponents"))?;
+        let Some(array) = pow10_encode_with(&values, exponents, exec_ctx)? else {
             return Ok(values.into_array());
         };
         let compress = |child: &ArrayRef, index: usize, exec_ctx: &mut ExecutionCtx| {
@@ -85,19 +83,23 @@ impl Scheme for Pow10Scheme {
         let exponents = compress(array.exponents(), 1, exec_ctx)?;
         let patches = match array.patches() {
             None => None,
-            Some(patches) => {
-                let patches = compress_patches(patches, exec_ctx)?;
-                Some(Patches::new(
-                    patches.array_len(),
-                    patches.offset(),
-                    patches.indices().clone(),
-                    compress(patches.values(), 2, exec_ctx)?,
-                    patches.chunk_offsets().clone(),
-                )?)
-            }
+            Some(patches) => Some(
+                compress_patches(patches, exec_ctx)?
+                    .map_values(|values| compress(&values, 2, exec_ctx))?,
+            ),
         };
         Ok(Pow10::try_new(encoded, exponents, patches)?.into_array())
     }
+}
+
+/// Each block's exponent, for both the estimate and [`Pow10Scheme::compress`], which get the same
+/// `data`; `None` if they couldn't be computed.
+struct Exponents(Option<Vec<u8>>);
+
+fn exponents(data: &ArrayAndStats, ctx: &mut ExecutionCtx) -> Arc<Exponents> {
+    data.get_or_insert_with(|| {
+        Exponents(block_exponents(&data.array_as_primitive().into_owned(), ctx).ok())
+    })
 }
 
 /// Whether the compressor is at a decimal column's integer part.

@@ -1,6 +1,7 @@
 //! Choosing each block's exponent, and dividing by it.
 
 use num_traits::{AsPrimitive, CheckedMul, PrimInt};
+use vortex::array::arrays::primitive::PrimitiveArrayExt;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::dtype::NativePType;
 use vortex::array::patches::Patches;
@@ -18,6 +19,20 @@ pub fn pow10_encode(
     array: &PrimitiveArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Option<Pow10Array>> {
+    let exponents = block_exponents(array, ctx)?;
+    pow10_encode_with(array, &exponents, ctx)
+}
+
+/// `array` as a [`Pow10Array`] with each block's exponent in `exponents`, as
+/// [`block_exponents`] chose them; `None` when they're all 0.
+pub(super) fn pow10_encode_with(
+    array: &PrimitiveArray,
+    exponents: &[u8],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Option<Pow10Array>> {
+    if exponents.iter().all(|&e| e == 0) {
+        return Ok(None);
+    }
     let valid = array.validity()?.execute_mask(array.len(), ctx)?;
     let patch_validity = match array.dtype().is_nullable() {
         true => Validity::AllValid,
@@ -25,31 +40,24 @@ pub fn pow10_encode(
     };
     match_each_integer_ptype!(array.ptype(), |T| {
         let values = array.as_slice::<T>();
-        let exponents = exponents(values, &valid);
-        if exponents.iter().all(|&e| e == 0) {
-            return Ok(None);
-        }
-        let divided = divide(values, &valid, &exponents);
+        let divided = divide(values, &valid, exponents);
         let patches = match divided.patch_rows.is_empty() {
             true => None,
             false => {
-                let rows = divided.patch_rows;
-                let indices = match u32::try_from(values.len()) {
-                    Ok(_) => Buffer::from_iter(rows.iter().map(|&r| r as u32)).into_array(),
-                    Err(_) => Buffer::from(rows).into_array(),
-                };
+                let rows =
+                    PrimitiveArray::new(Buffer::from(divided.patch_rows), Validity::NonNullable);
                 let patched = PrimitiveArray::new(divided.patch_values, patch_validity);
                 Some(Patches::new(
                     values.len(),
                     0,
-                    indices,
+                    rows.narrow(ctx)?.into_array(),
                     patched.into_array(),
                     None,
                 )?)
             }
         };
         let quotients = PrimitiveArray::new(divided.quotients, array.validity()?);
-        let exponents = Buffer::from(exponents).into_array();
+        let exponents = Buffer::copy_from(exponents).into_array();
         Ok(Some(Pow10::try_new(
             quotients.into_array(),
             exponents,
@@ -58,13 +66,14 @@ pub fn pow10_encode(
     })
 }
 
-/// Whether some block of `array` is worth an exponent.
-pub(super) fn any_exponent(array: &PrimitiveArray, ctx: &mut ExecutionCtx) -> VortexResult<bool> {
+/// Each block's exponent in `array`: see [`exponents`].
+pub(super) fn block_exponents(
+    array: &PrimitiveArray,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Vec<u8>> {
     let valid = array.validity()?.execute_mask(array.len(), ctx)?;
     Ok(match_each_integer_ptype!(array.ptype(), |T| {
         exponents(array.as_slice::<T>(), &valid)
-            .iter()
-            .any(|&e| e != 0)
     }))
 }
 
