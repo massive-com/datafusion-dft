@@ -67,8 +67,8 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
     let table = PrunedTable::over(&listing, &state, pruner)?;
     ctx.register_table("bars", Arc::new(table))?;
 
-    // The source's types and values: the bars layout rebuilds the prices from their parts, and
-    // stores the rest as it is.
+    // The source's types and values: the bars layout rebuilds the prices from their parts and the
+    // dollar volume from its residual, and stores the rest as it is.
     let read = ctx.sql("SELECT * FROM bars").await?.collect().await?;
     let schema = read[0].schema();
     let types: Vec<(&str, &DataType)> = schema
@@ -86,6 +86,7 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
             ("low", &price),
             ("close", &price),
             ("volume", &DataType::Decimal128(38, 6)),
+            ("dollar_volume", &DataType::Decimal128(38, 12)),
             ("transactions", &DataType::Int64),
         ]
     );
@@ -93,9 +94,15 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
     assert_eq!(read.columns(), source.columns());
 
     // Only the last ticker's highs are this high and only the first's lows this low, so each
-    // scan reads the one zone of three holding them, pruned on the bounds of the parts the prices
-    // are rebuilt from. Only the last ticker's volumes are wider than an i64.
-    for filter in ["high > 360", "low < 20", "volume > 9223372036854775807"] {
+    // scan reads the one zone of three holding them, pruned on the zones the bars layout keeps.
+    // Only the last ticker's volumes are wider than an i64, and so its dollar volumes this big.
+    let filters = [
+        "high > 360",
+        "low < 20",
+        "volume > 9223372036854775807",
+        "dollar_volume > 10000000000000",
+    ];
+    for filter in filters {
         let query = ctx
             .sql(&format!("SELECT * FROM bars WHERE {filter}"))
             .await?;

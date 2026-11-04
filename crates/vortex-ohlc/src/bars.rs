@@ -22,7 +22,9 @@ use vortex::array::builtins::ArrayBuiltins;
 use vortex::array::expr::stats::Stat;
 use vortex::array::stats::bind::{bind_stats, StatBinder};
 use vortex::array::validity::Validity;
-use vortex::array::{ArrayRef, IntoArray, MaskFuture, RawMetadata, VortexSessionExecute};
+use vortex::array::{
+    ArrayRef, ExecutionCtx, IntoArray, MaskFuture, RawMetadata, VortexSessionExecute,
+};
 use vortex::buffer::BufferMut;
 use vortex::dtype::{
     DType, DecimalDType, FieldMask, FieldName, FieldPath, Nullability, StructFields,
@@ -45,6 +47,7 @@ use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
+use crate::dollar_volume::{dollar_volume, residual, shift, Residual};
 use crate::ohlc::{ohlc_to_parts, Part, Price};
 use crate::price_fn::{ohlc_price, OhlcPriceFn};
 
@@ -55,7 +58,19 @@ pub const OHLC: &str = "ohlc";
 /// The most digits a part may have: an `i128`'s.
 const MAX_PART_PRECISION: u8 = 38;
 
-/// Register the layout and [`OhlcPriceFn`], so files that use them can be read back.
+/// The source's dollar volume, which the stored table has as [`DOLLAR_VOLUME_RESIDUAL`] when it
+/// also has a [`VOLUME`] (see [`crate::dollar_volume`]).
+pub const DOLLAR_VOLUME: &str = "dollar_volume";
+
+/// The source's volume.
+pub const VOLUME: &str = "volume";
+
+/// The stored table's column for the source's dollar volume, less its volume times its open. A
+/// name no source column has, so that its zone map is never taken for the dollar volume's.
+pub const DOLLAR_VOLUME_RESIDUAL: &str = "dollar_volume_residual";
+
+/// Register the layout, [`OhlcPriceFn`] and [`DollarVolumeFn`](crate::dollar_volume::DollarVolumeFn),
+/// so files that use them can be read back.
 pub fn register(session: &VortexSession) {
     use vortex::layout::session::LayoutSessionExt;
     use vortex::layout::LayoutEncoding;
@@ -64,6 +79,9 @@ pub fn register(session: &VortexSession) {
         .layouts()
         .register(&BarsLayout as &dyn LayoutEncoding);
     session.scalar_fns().register(OhlcPriceFn);
+    session
+        .scalar_fns()
+        .register(crate::dollar_volume::DollarVolumeFn);
 }
 
 #[derive(Clone, Debug)]
@@ -173,8 +191,8 @@ pub fn bound_name(column: &str, max: bool) -> String {
 }
 
 /// The dtype of the source's zones for a table of `source`'s dtype: a row per zone, and the min
-/// and max there ([`bound_name`]) of each price (see [`zoned_columns`]), at its type, null where a
-/// zone has none.
+/// and max there ([`bound_name`]) of each column the stored table doesn't have as it is (see
+/// [`zoned_columns`]), at its type, null where a zone has none.
 pub fn zones_dtype(source: &DType) -> VortexResult<DType> {
     let mut names: Vec<FieldName> = Vec::new();
     let mut dtypes = Vec::new();
@@ -191,19 +209,40 @@ pub fn zones_dtype(source: &DType) -> VortexResult<DType> {
 }
 
 /// The columns of a table of `source`'s dtype that the stored table doesn't have as they are,
-/// with their decimal types: the four prices.
+/// with their decimal types: the four prices, and the dollar volume if it's stored as a residual
+/// (see [`dollar_volume_residual`]).
 fn zoned_columns(source: &DType) -> VortexResult<Vec<(&'static str, DecimalDType)>> {
-    let fields = source
-        .as_struct_fields_opt()
-        .ok_or_else(|| vortex_err!("a table of bars is a struct, not {source}"))?;
     let mut columns = Vec::new();
     for price in Price::ALL {
-        let Some(DType::Decimal(decimal, _)) = fields.field(price.name()) else {
+        let Some(DType::Decimal(decimal, _)) = field(source, price.name()) else {
             vortex_bail!("{} is not a decimal", price.name());
         };
         columns.push((price.name(), decimal));
     }
+    if let Some(decimal) = dollar_volume_residual(source) {
+        columns.push((DOLLAR_VOLUME, decimal));
+    }
     Ok(columns)
+}
+
+/// `source`'s field `name`, if it has one.
+fn field(source: &DType, name: &str) -> Option<DType> {
+    source.as_struct_fields_opt()?.field(name)
+}
+
+/// The dollar volume's decimal type, if a table of `source`'s dtype stores it as a residual: if
+/// it has a decimal [`DOLLAR_VOLUME`] and [`VOLUME`] whose product with the open fits its scale.
+fn dollar_volume_residual(source: &DType) -> Option<DecimalDType> {
+    let (Some(DType::Decimal(dollar_volume, _)), Some(DType::Decimal(volume, _))) =
+        (field(source, DOLLAR_VOLUME), field(source, VOLUME))
+    else {
+        return None;
+    };
+    let Some(DType::Decimal(open, _)) = field(source, Price::Open.name()) else {
+        return None;
+    };
+    shift(dollar_volume.scale(), volume.scale(), open.scale())?;
+    Some(dollar_volume)
 }
 
 /// Each zone's min and max of some of a table's columns, from the chunks written so far.
@@ -275,13 +314,20 @@ impl ZoneBounds {
 }
 
 /// The stored table's dtype, given the source's and the parts' decimal type: the [`OHLC`] struct
-/// where open is, and no other price.
+/// where open is, no other price, and [`DOLLAR_VOLUME_RESIDUAL`] where the dollar volume is, if
+/// it's stored as one (see [`dollar_volume_residual`]).
 fn stored_dtype(source: &DType, parts: DecimalDType) -> VortexResult<DType> {
     let fields = source
         .as_struct_fields_opt()
         .ok_or_else(|| vortex_err!("a table of bars is a struct, not {source}"))?;
+    let residual = dollar_volume_residual(source).is_some();
     let (mut names, mut dtypes): (Vec<FieldName>, Vec<DType>) = (Vec::new(), Vec::new());
     for (name, dtype) in fields.names().iter().zip(fields.fields()) {
+        if residual && name.as_ref() == DOLLAR_VOLUME {
+            names.push(DOLLAR_VOLUME_RESIDUAL.into());
+            dtypes.push(dtype);
+            continue;
+        }
         match Price::from_name(name.as_ref()) {
             Some(Price::Open) => {
                 let part = DType::Decimal(parts, Nullability::NonNullable);
@@ -303,8 +349,8 @@ fn stored_dtype(source: &DType, parts: DecimalDType) -> VortexResult<DType> {
 }
 
 /// A chunk of a table of bars as stored, with `parts` (see [`parts_dtype`]): the four prices as
-/// the [`OHLC`] struct's parts, where open is in the source (see [`stored_dtype`]). Its prices go
-/// into `zones`.
+/// the [`OHLC`] struct's parts, where open is in the source, and the dollar volume as its residual
+/// if it's stored as one (see [`stored_dtype`]). Its prices and dollar volume go into `zones`.
 fn stored_chunk(
     chunk: ArrayRef,
     parts: DecimalDType,
@@ -328,12 +374,20 @@ fn stored_chunk(
     }
     let [open, high, low, close] = [&prices[0], &prices[1], &prices[2], &prices[3]];
     let valid = Mask::new_true(len);
-    zones.lock().unwrap().add(&[
+    let residual = match dollar_volume_residual(table.dtype()) {
+        Some(_) => Some(residual_column(&table, open, &mut ctx)?),
+        None => None,
+    };
+    let mut zoned: Vec<(&[i128], &Mask)> = vec![
         (open, &valid),
         (high, &valid),
         (low, &valid),
         (close, &valid),
-    ]);
+    ];
+    if let Some(residual) = &residual {
+        zoned.push((&residual.dollar_volume, &residual.valid));
+    }
+    zones.lock().unwrap().add(&zoned);
     let limit = 10i128.pow(u32::from(parts.precision()));
     let mut columns: [BufferMut<i128>; 4] = std::array::from_fn(|_| BufferMut::with_capacity(len));
     for i in 0..len {
@@ -364,6 +418,11 @@ fn stored_chunk(
     )?;
     let (mut names, mut fields): (Vec<FieldName>, Vec<ArrayRef>) = (Vec::new(), Vec::new());
     for (name, field) in table.names().iter().zip(table.iter_unmasked_fields()) {
+        if let Some(residual) = residual.as_ref().filter(|_| name.as_ref() == DOLLAR_VOLUME) {
+            names.push(DOLLAR_VOLUME_RESIDUAL.into());
+            fields.push(residual.residual.clone());
+            continue;
+        }
         match Price::from_name(name.as_ref()) {
             Some(Price::Open) => {
                 names.push(OHLC.into());
@@ -377,6 +436,24 @@ fn stored_chunk(
         }
     }
     Ok(StructArray::try_new(names.into(), fields, len, table.struct_validity())?.into_array())
+}
+
+/// The [`Residual`] of `table`'s dollar volume, a chunk of a table of bars that stores it as one,
+/// given its unscaled `open` prices.
+fn residual_column(
+    table: &StructArray,
+    open: &[i128],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<Residual> {
+    let decimal = |name: &str, ctx: &mut ExecutionCtx| {
+        (table.unmasked_field_by_name(name)?.clone()).execute::<DecimalArray>(ctx)
+    };
+    let open_scale = match field(table.dtype(), Price::Open.name()) {
+        Some(DType::Decimal(decimal, _)) => decimal.scale(),
+        _ => vortex_bail!("open is not a decimal"),
+    };
+    let (dollar_volume, volume) = (decimal(DOLLAR_VOLUME, ctx)?, decimal(VOLUME, ctx)?);
+    residual(&dollar_volume, &volume, open, open_scale, ctx)
 }
 
 /// The parts' decimal type for a table of `source`'s dtype, if it is a table of bars: one with
@@ -481,6 +558,8 @@ struct BarsReader {
     inner: LayoutReaderRef,
     /// Each price's decimal type, in [`Price::ALL`] order.
     prices: [DecimalDType; 4],
+    /// The dollar volume's decimal type, if it's stored as a residual.
+    dollar_volume: Option<DecimalDType>,
     /// Expressions over the source's columns, rewritten over the stored table and bound.
     rewritten: Mutex<HashMap<ExactBoundExpr, BoundExpression>>,
     /// The source's zones and the rows per zone.
@@ -510,11 +589,13 @@ impl BarsReader {
             _ => Err(vortex_err!("{} is not a decimal", price.name())),
         });
         let [open, high, low, close] = prices;
+        let dollar_volume = dollar_volume_residual(&dtype);
         Ok(Self {
             name,
             dtype,
             inner,
             prices: [open?, high?, low?, close?],
+            dollar_volume,
             rewritten: Mutex::new(HashMap::new()),
             zones,
             segment_source,
@@ -556,6 +637,14 @@ impl BarsReader {
 
     /// The source's column `name`, over the stored table.
     fn column(&self, name: &str) -> Expression {
+        if let Some(decimal) = self.dollar_volume.filter(|_| name == DOLLAR_VOLUME) {
+            return dollar_volume(
+                decimal,
+                get_item(DOLLAR_VOLUME_RESIDUAL, root()),
+                get_item(VOLUME, root()),
+                get_item(Part::Open.name(), get_item(OHLC, root())),
+            );
+        }
         match Price::from_name(name) {
             Some(price) => ohlc_price(price, self.price_decimal(price), get_item(OHLC, root())),
             None => get_item(name, root()),
@@ -672,18 +761,23 @@ impl LayoutReader for BarsReader {
         split_range: &SplitRange,
         splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        // A price is read from the struct.
+        // A price is read from the struct, and the dollar volume from its residual, the volume and
+        // the struct.
         let masks: Vec<FieldMask> = field_mask
             .iter()
-            .map(|mask| match mask {
+            .flat_map(|mask| match mask {
                 FieldMask::Prefix(path) | FieldMask::Exact(path) => {
                     let first = path.parts().first().and_then(|field| field.as_name());
-                    match first.and_then(Price::from_name) {
-                        Some(_) => FieldMask::Prefix(FieldPath::from_name(OHLC)),
-                        None => mask.clone(),
+                    let prefix = |name: &str| FieldMask::Prefix(FieldPath::from_name(name));
+                    match first {
+                        Some(name) if self.dollar_volume.is_some() && name == DOLLAR_VOLUME => {
+                            vec![prefix(DOLLAR_VOLUME_RESIDUAL), prefix(VOLUME), prefix(OHLC)]
+                        }
+                        Some(name) if Price::from_name(name).is_some() => vec![prefix(OHLC)],
+                        _ => vec![mask.clone()],
                     }
                 }
-                FieldMask::All => FieldMask::All,
+                FieldMask::All => vec![FieldMask::All],
             })
             .collect();
         self.inner.register_splits(&masks, split_range, splits)
@@ -744,8 +838,8 @@ impl LayoutReader for BarsReader {
     }
 }
 
-/// Binds the min and max of a column in the source's zones (a price) to its field there, and no
-/// other statistic.
+/// Binds the min and max of a column in the source's zones (a price, the dollar volume) to its
+/// field there, and no other statistic.
 struct PriceStats {
     /// The table's dtype.
     table: DType,

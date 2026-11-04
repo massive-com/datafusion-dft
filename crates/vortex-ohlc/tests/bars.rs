@@ -1,5 +1,6 @@
 //! A table of bars written under the bars layout reads back with the source's prices, through
-//! Vortex's own scan: the whole row, one price, a price filter, and pruning on prices.
+//! Vortex's own scan: the whole row, one price, a price filter, and pruning on prices and the
+//! dollar volume.
 
 use std::sync::Arc;
 
@@ -164,6 +165,20 @@ fn the_root_prunes_on_a_price() {
     let both: Vec<bool> = (high_zones.iter().zip(&low_zones))
         .map(|(h, l)| h & l)
         .collect();
+    // Only the last zone has volumes wider than an i64, and dollar volumes above 10^13.
+    let dollar_volume = source.column_by_name("dollar_volume").unwrap();
+    let dollar_volume = dollar_volume
+        .as_primitive::<Decimal128Type>()
+        .values()
+        .to_vec();
+    let big = 10i128.pow(25);
+    let big_zones = zones(&dollar_volume, |dv| dv > 10i128.pow(25));
+    assert!(big_zones.iter().any(|k| !k), "nothing to prune");
+    let big_dv = lit(Scalar::decimal(
+        DecimalValue::I128(big),
+        DecimalDType::new(38, 12),
+        Nullability::NonNullable,
+    ));
     let high_gt = || gt(get_item("high", root()), cents(36_000));
     let low_lt = || lt(get_item("low", root()), cents(2_000));
     // A filter on prices alone, or on prices and other columns: the prices' part prunes.
@@ -173,6 +188,7 @@ fn the_root_prunes_on_a_price() {
         (or(high_gt(), low_lt()), &either),
         (and(high_gt(), low_lt()), &both),
         (and(high_gt(), some_transactions), &high_zones),
+        (gt(get_item("dollar_volume", root()), big_dv), &big_zones),
     ];
     let reader = file.layout_reader().unwrap();
     for (expr, kept) in cases {
