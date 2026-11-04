@@ -102,6 +102,10 @@ impl ExecuteParentKernel<BitPacked> for BlockedBitPackedFilter {
 /// decoder checks them (`vortex-fastlanes` 0.89 `validate_primitive_offsets`): within the packed
 /// buffer, in order, and each block a whole number of 128-byte rows, one per bit of its width,
 /// at most the type's width.
+///
+/// *Upstream*: fastlanes 0.89 has this and [`PackedBlocks`] as `execute_block_offsets` and
+/// `for_each_packed_block` (`bitpacking/array/bitpack_decompress/blocked.rs:112,145`), both
+/// `pub(crate)`. If Vortex made them public, both could go.
 fn block_offsets(
     array: ArrayView<'_, BitPacked>,
     offsets: &ArrayRef,
