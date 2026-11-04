@@ -9890,6 +9890,7 @@ name = "vortex-ohlc"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "fastlanes 0.7.2",
  "num-traits",
  "test-util",
  "vortex",
