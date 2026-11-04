@@ -10,13 +10,22 @@
 //!   within a scan.
 //! - [`write`](mod@write): writing a table with a plan.
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
+//! - [`kernels`]: filters on those blocked encodings that unpack only the blocks they keep.
 //!
 //! Reading the files from DataFusion, the prices rebuilt, is datafusion-vortex-ohlc's, and
 //! pruning scans on the zone maps (the prices on their parts') is datafusion-vortex-prune's.
 
+use vortex::session::VortexSession;
+
 pub mod edition;
+pub mod kernels;
 pub mod ohlc;
 pub mod plan;
 pub mod prices;
 pub mod profile;
 pub mod write;
+
+/// Register what a session needs to read vortex-ohlc's files well: the filter [`kernels`].
+pub fn register(session: &VortexSession) {
+    kernels::register(session);
+}

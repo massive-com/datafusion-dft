@@ -65,10 +65,12 @@ use vortex_ohlc::prices::{compare_price, decimal_literal};
 mod source;
 pub use source::source_table;
 
-/// A [`VortexFormatFactory`] on `session` whose formats hand Vortex what
-/// [`BarsExpressionConverter`] converts; their options are the DataFusion session's `vortex` ones,
-/// and [`default`](datafusion::datasource::file_format::FileFormatFactory::default)'s Vortex's.
+/// A [`VortexFormatFactory`] on `session`, with vortex-ohlc registered on it
+/// ([`vortex_ohlc::register`]), whose formats hand Vortex what [`BarsExpressionConverter`]
+/// converts; their options are the DataFusion session's `vortex` ones, and
+/// [`default`](datafusion::datasource::file_format::FileFormatFactory::default)'s Vortex's.
 pub fn vortex_format_factory(session: VortexSession) -> VortexFormatFactory {
+    vortex_ohlc::register(&session);
     let converter = BarsExpressionConverter::new(session.clone());
     VortexFormatFactory::new_with_session(session).with_expression_converter(Arc::new(converter))
 }
