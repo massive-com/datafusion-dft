@@ -373,6 +373,11 @@ fn flat_strategy() -> Arc<dyn LayoutStrategy> {
 /// The serialized array IDs a write with `session` accepts: registered in the session and
 /// permitted by its enabled editions. `VortexWriteOptions::write` rejects any other ID while
 /// serializing, after the query has run and part of the file is written.
+///
+/// *Upstream*: Vortex computes this set twice, privately: for the writer's array context
+/// (vortex-file 0.89 `new_array_context`, `writer.rs:389`) and for the compressor
+/// (vortex-btrblocks 0.89 `AllowedIds::from_session`, `allowed_ids.rs:40`, `pub(crate)`). If
+/// Vortex made `AllowedIds` public, this could be it.
 fn writable_array_ids(session: &VortexSession) -> HashSet<ArrayId> {
     let editions: HashSet<ArrayId> = session
         .enabled_component_ids(ComponentKind::Array)
@@ -391,6 +396,10 @@ fn writable_array_ids(session: &VortexSession) -> HashSet<ArrayId> {
 ///
 /// This is the check `BtrBlocksCompressorBuilder::build` uses to drop such a scheme, which would
 /// otherwise turn the override into a silent no-op.
+///
+/// *Upstream*: that check is the builder's private `allowed_schemes` (vortex-btrblocks 0.89
+/// `builder.rs:234`). If Vortex made it public, or had the builder report the schemes it drops,
+/// this could use it.
 fn check_writable(
     scheme: &'static dyn Scheme,
     column: &str,
@@ -450,6 +459,10 @@ fn override_compressor(
 }
 
 /// Whether `BtrBlocksCompressorBuilder::from_session`'s default preset leaves `scheme` out.
+///
+/// *Upstream*: a copy of the default preset's list, which is the private
+/// `CompressionMode::excluded_schemes` (vortex-btrblocks 0.89 `builder.rs:46`). If Vortex made it
+/// public, this would follow Vortex's preset instead of repeating it.
 fn default_preset_excludes(scheme: &dyn Scheme) -> bool {
     [
         string::ZstdScheme.id(),
