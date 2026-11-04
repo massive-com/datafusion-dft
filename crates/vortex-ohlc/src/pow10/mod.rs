@@ -38,6 +38,7 @@ use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
 mod encode;
+mod filter;
 mod scheme;
 
 pub use encode::pow10_encode;
@@ -47,10 +48,19 @@ pub use scheme::Pow10Scheme;
 /// Values per exponent: one FastLanes block, as Vortex's blocked FoR and bit-packing use.
 pub const BLOCK: usize = 1024;
 
-/// Register the encoding on `session`, and its [`Pow10Scheme`] for the compressor (once).
+/// Register the encoding and its filter kernel on `session`, and its [`Pow10Scheme`] for the
+/// compressor (once).
 pub fn register(session: &VortexSession) {
+    use vortex::array::arrays::filter::FilterExecuteAdaptor;
+    use vortex::array::arrays::Filter;
+    use vortex::array::optimizer::kernels::ArrayKernelsExt;
     use vortex::array::session::ArraySessionExt;
     session.arrays().register(Pow10);
+    session.kernels().register_execute_parent_kernel(
+        Filter.id(),
+        Pow10,
+        FilterExecuteAdaptor(Pow10),
+    );
     crate::register_scheme(session, &Pow10Scheme);
 }
 
