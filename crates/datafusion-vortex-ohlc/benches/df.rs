@@ -66,22 +66,17 @@ enum Reader {
     ParquetPushdown,
     /// The Vortex file, its scans pruned by a `ZonePruner` before they start.
     Vortex,
-    /// The Vortex file, pruned on Vortex's own zone maps as the scan runs.
+    /// The Vortex file, pruned on Vortex's own zone maps and by the bars layout as the scan runs:
+    /// vortex-ohlc alone.
     VortexUnpruned,
-    /// The bars-layout file (spike), its scans pruned by a `ZonePruner`.
-    Bars,
-    /// The bars-layout file, pruned by its reader as the scan runs: vortex-ohlc alone.
-    BarsUnpruned,
 }
 
 impl Reader {
-    const ALL: [Reader; 6] = [
+    const ALL: [Reader; 4] = [
         Reader::Parquet,
         Reader::ParquetPushdown,
         Reader::Vortex,
         Reader::VortexUnpruned,
-        Reader::Bars,
-        Reader::BarsUnpruned,
     ];
 
     fn name(self) -> &'static str {
@@ -90,8 +85,6 @@ impl Reader {
             Reader::ParquetPushdown => "parquet pushdown",
             Reader::Vortex => "vortex",
             Reader::VortexUnpruned => "vortex unpruned",
-            Reader::Bars => "bars",
-            Reader::BarsUnpruned => "bars unpruned",
         }
     }
 }
@@ -100,7 +93,6 @@ impl Reader {
 struct Tables {
     parquet: String,
     vortex: String,
-    bars: String,
     schema: SchemaRef,
 }
 
@@ -109,7 +101,6 @@ impl Tables {
         let files = data::files();
         let parquet = files.parquet.to_str().unwrap().to_string();
         let vortex = files.vortex.to_str().unwrap().to_string();
-        let bars = files.bars.to_str().unwrap().to_string();
         let ctx = SessionContext::new();
         runtime
             .block_on(ctx.register_parquet(TABLE, &parquet, ParquetReadOptions::default()))
@@ -118,7 +109,6 @@ impl Tables {
         Self {
             parquet,
             vortex,
-            bars,
             schema,
         }
     }
@@ -140,16 +130,9 @@ impl Tables {
         // Vortex does its I/O on the runtime it finds when the session is made.
         let _runtime = runtime.enter();
         let session = VortexSession::default();
-        let file = match reader {
-            Reader::Bars | Reader::BarsUnpruned => {
-                vortex_ohlc::bars::register(&session);
-                &self.bars
-            }
-            _ => &self.vortex,
-        };
         let options = ListingOptions::new(vortex_format_factory(session.clone()).default())
             .with_file_extension(".vortex");
-        let config = ListingTableConfig::new(ListingTableUrl::parse(file).unwrap())
+        let config = ListingTableConfig::new(ListingTableUrl::parse(&self.vortex).unwrap())
             .with_listing_options(options)
             .with_schema(Arc::clone(&self.schema))
             .with_expr_adapter_factory(Arc::new(BarsAdapterFactory));
@@ -158,7 +141,7 @@ impl Tables {
         let url = ObjectStoreUrl::local_filesystem();
         let store = ctx.runtime_env().object_store(&url).unwrap();
         let mut factory = VortexExecFactory::new(reader_factory(&url, store));
-        if matches!(reader, Reader::Vortex | Reader::Bars) {
+        if reader == Reader::Vortex {
             factory = factory.with_pruner(Arc::new(ZonePruner::new(session)));
         }
         ctx.register_table(TABLE, Arc::new(PrunedTable::new(listing, factory)))

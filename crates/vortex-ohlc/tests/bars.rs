@@ -1,5 +1,5 @@
-//! Spike: a table of bars written under the bars layout reads back with the source's prices,
-//! through Vortex's own scan: the whole row, one price, a price filter, and pruning on a price.
+//! A table of bars written under the bars layout reads back with the source's prices, through
+//! Vortex's own scan: the whole row, one price, a price filter, and pruning on a price.
 
 use std::sync::Arc;
 
@@ -11,9 +11,7 @@ use vortex::array::{ArrayRef, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::{DType, DecimalDType, Nullability};
 use vortex::expr::{and, get_item, gt, lit, lt_eq, root, Expression};
-use vortex::file::{
-    OpenOptionsSessionExt, VortexFile, WriteOptionsSessionExt, WriteStrategyBuilder,
-};
+use vortex::file::{OpenOptionsSessionExt, VortexFile};
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
@@ -21,9 +19,7 @@ use vortex::mask::Mask;
 use vortex::scalar::{DecimalValue, Scalar};
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::bars::{register, BarsStrategy};
 use vortex_ohlc::ohlc::Price;
-use vortex_ohlc::write::stored_arrays;
 
 use test_util::{source, source_plan, ROWS, ROW_BLOCK};
 
@@ -35,33 +31,13 @@ fn price_dtype() -> DecimalDType {
 fn session(runtime: &CurrentThreadRuntime) -> VortexSession {
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
-    register(&session);
+    vortex_ohlc::register(&session);
     session
 }
 
-/// test-util's source, planned as usual, written under the bars layout.
-fn write(runtime: &CurrentThreadRuntime, source: &RecordBatch) -> Vec<u8> {
-    let session = session(runtime);
-    let plan = source_plan(source);
-    let batches: Vec<RecordBatch> = (0..ROWS)
-        .step_by(1_000)
-        .map(|start| source.slice(start, 1_000.min(ROWS - start)))
-        .collect();
-    let arrays = stored_arrays(&session, &source.schema(), &plan, batches).unwrap();
-    let inner = WriteStrategyBuilder::from_session(&session)
-        .with_row_block_size(ROW_BLOCK)
-        .with_data_block_target_bytes(None)
-        .build();
-    let mut bytes = Vec::new();
-    session
-        .write_options()
-        .with_strategy(Arc::new(BarsStrategy::new(inner, price_dtype())))
-        // The file statistics would be the stored table's, by its columns, not the source's.
-        .with_file_statistics(vec![])
-        .blocking(runtime)
-        .write(&mut bytes, arrays)
-        .unwrap();
-    bytes
+/// test-util's source, planned as usual and written, so under the bars layout.
+fn write(source: &RecordBatch) -> Vec<u8> {
+    test_util::write(source, &source_plan(source))
 }
 
 /// `value` cents as a literal of the prices' type.
@@ -119,10 +95,7 @@ fn the_file_has_the_source_prices() {
     let runtime = CurrentThreadRuntime::new();
     let session = session(&runtime);
     let source = source();
-    let file = session
-        .open_options()
-        .open_buffer(write(&runtime, &source))
-        .unwrap();
+    let file = session.open_options().open_buffer(write(&source)).unwrap();
     let fields = file.dtype().as_struct_fields_opt().unwrap();
     for price in Price::ALL {
         assert_eq!(
@@ -155,10 +128,7 @@ fn price_filters_keep_the_source_rows() {
     let runtime = CurrentThreadRuntime::new();
     let session = session(&runtime);
     let source = source();
-    let file = session
-        .open_options()
-        .open_buffer(write(&runtime, &source))
-        .unwrap();
+    let file = session.open_options().open_buffer(write(&source)).unwrap();
     let high = source_prices(&source, Price::High);
     let low = source_prices(&source, Price::Low);
     let expected: Vec<i128> = high
@@ -181,10 +151,7 @@ fn the_root_prunes_on_a_price() {
     let runtime = CurrentThreadRuntime::new();
     let session = session(&runtime);
     let source = source();
-    let file = session
-        .open_options()
-        .open_buffer(write(&runtime, &source))
-        .unwrap();
+    let file = session.open_options().open_buffer(write(&source)).unwrap();
     let high = source_prices(&source, Price::High);
     // The zones with a high above $360.
     let kept: Vec<bool> = high

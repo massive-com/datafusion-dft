@@ -100,18 +100,21 @@ pub fn source_plan(source: &RecordBatch) -> Plan {
     plan(&profiler.finish())
 }
 
-/// `source` written with `plan`, in 1,000-row batches and `ROW_BLOCK`-row chunks.
+/// `source` written with `plan`, in 1,000-row batches and `ROW_BLOCK`-row chunks: under the bars
+/// layout if the plan stores the prices as parts (see [`write_options`]).
 pub fn write(source: &RecordBatch, plan: &Plan) -> Vec<u8> {
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
+    vortex_ohlc::register(&session);
     let batches: Vec<RecordBatch> = (0..ROWS)
         .step_by(1_000)
         .map(|start| source.slice(start, 1_000.min(ROWS - start)))
         .collect();
     let arrays = stored_arrays(&session, &source.schema(), plan, batches).unwrap();
     let mut bytes = Vec::new();
-    write_options(&session, ROW_BLOCK)
+    write_options(&session, &source.schema(), plan, ROW_BLOCK)
+        .unwrap()
         .blocking(&runtime)
         .write(&mut bytes, arrays)
         .unwrap();
