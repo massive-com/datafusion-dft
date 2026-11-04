@@ -5,6 +5,7 @@
 //! prunes a comparison of a price with a literal on the parts' zone maps itself: Vortex's struct
 //! reader only prunes an expression that reads one field, and a price reads two or three.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,9 +17,14 @@ use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
+use vortex::array::aggregate_fn::AggregateFnRef;
 use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::arrays::StructArray;
-use vortex::array::{MaskFuture, RawMetadata, VortexSessionExecute};
+use vortex::array::arrays::{DecimalArray, StructArray};
+use vortex::array::builtins::ArrayBuiltins;
+use vortex::array::expr::stats::Stat;
+use vortex::array::stats::bind::{bind_stats, StatBinder};
+use vortex::array::validity::Validity;
+use vortex::array::{ArrayRef, IntoArray, MaskFuture, RawMetadata, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::{
     DType, DecimalDType, FieldMask, FieldName, FieldPath, Nullability, StructFields,
@@ -34,11 +40,7 @@ use vortex::layout::{
     LayoutWriterContext, RowSplits, SplitRange, VTable,
 };
 use vortex::mask::Mask;
-use vortex::scalar_fn::fns::between::{Between, StrictComparison};
-use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::get_item::GetItem;
-use vortex::scalar_fn::fns::literal::Literal;
-use vortex::scalar_fn::fns::operators::Operator;
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
@@ -248,8 +250,10 @@ struct BarsReader {
     zones: Option<PartZones>,
     segment_source: Arc<dyn SegmentSource>,
     session: VortexSession,
-    /// Read once per reader, on the first price comparison.
+    /// The prices' bounds per zone, read once per reader, on the first filter on a price.
     bounds: OnceLock<SharedBounds>,
+    /// Per filter, the zones the prices' bounds rule out (see [`Self::ruled_out`]).
+    ruled_out: Mutex<HashMap<ExactBoundExpr, Option<SharedRuledOut>>>,
 }
 
 impl BarsReader {
@@ -279,6 +283,7 @@ impl BarsReader {
             segment_source,
             session,
             bounds: OnceLock::new(),
+            ruled_out: Mutex::new(HashMap::new()),
         })
     }
 
@@ -335,9 +340,54 @@ impl BarsReader {
         self.bounds
             .get_or_init(|| match &self.zones {
                 None => futures::future::ready(None).boxed().shared(),
-                Some(zones) => zones.read(&self.name, &self.segment_source, &self.session),
+                Some(zones) => {
+                    zones.read(&self.name, &self.segment_source, &self.session, self.prices)
+                }
             })
             .clone()
+    }
+
+    /// The zones the prices' bounds rule out for `expr`, once per filter: Vortex's own rules
+    /// for proving a filter false from statistics ([`BoundExpression::falsify`]), with each
+    /// price's min and max taken from [`PriceBounds`]. `None` if `expr` has no proof that uses a
+    /// price's.
+    fn ruled_out(&self, expr: &BoundExpression) -> VortexResult<Option<SharedRuledOut>> {
+        let key = ExactBoundExpr(expr.clone());
+        if let Some(ruled_out) = self.ruled_out.lock().unwrap().get(&key) {
+            return Ok(ruled_out.clone());
+        }
+        let binder = PriceStats {
+            table: price_bounds_dtype(self.prices),
+            bound: Cell::new(false),
+        };
+        let proof = match expr.falsify(&self.session)? {
+            Some(proof) => {
+                let proof = bind_stats(proof, &binder)?;
+                binder.bound.get().then_some(proof)
+            }
+            None => None,
+        };
+        let ruled_out = proof.map(|proof| {
+            let (bounds, session) = (self.bounds(), self.session.clone());
+            async move {
+                let bounds = bounds.await?;
+                let mut ctx = session.create_execution_ctx();
+                let proven = bounds.table.clone().apply_bound(&proof).ok()?;
+                let zones = proven
+                    .fill_null(false)
+                    .ok()?
+                    .execute::<Mask>(&mut ctx)
+                    .ok()?;
+                Some(Arc::new(RuledOut { bounds, zones }))
+            }
+            .boxed()
+            .shared()
+        });
+        self.ruled_out
+            .lock()
+            .unwrap()
+            .insert(key, ruled_out.clone());
+        Ok(ruled_out)
     }
 }
 
@@ -387,29 +437,21 @@ impl LayoutReader for BarsReader {
         expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
-        let Some(comparisons) = parse_price_comparisons(expr) else {
+        let Some(ruled_out) = self.ruled_out(expr)? else {
             return self
                 .inner
                 .pruning_evaluation(row_range, &self.stored(expr)?, mask);
         };
-        let comparisons: Vec<(Comparison, i8)> = comparisons
-            .into_iter()
-            .map(|c| (c, self.price_decimal(c.price).scale()))
-            .collect();
-        let bounds = self.bounds();
         let row_range = row_range.clone();
         Ok(MaskFuture::new(mask.len(), async move {
-            let Some(bounds) = bounds.await else {
+            let Some(ruled_out) = ruled_out.await else {
                 return Ok(mask);
             };
-            let zone_len = bounds.zone_len;
-            let end = row_range.end.min(bounds.row_count);
+            let zone_len = ruled_out.bounds.zone_len;
+            let end = row_range.end.min(ruled_out.bounds.row_count);
             let mut keep: Vec<(usize, usize)> = Vec::new();
             for zone in row_range.start / zone_len..end.div_ceil(zone_len) {
-                let ruled_out = comparisons
-                    .iter()
-                    .any(|(c, scale)| c.rules_out(&bounds, zone as usize, *scale));
-                if ruled_out {
+                if ruled_out.zones.value(zone as usize) {
                     continue;
                 }
                 let start = ((zone * zone_len).max(row_range.start) - row_range.start) as usize;
@@ -444,103 +486,47 @@ impl LayoutReader for BarsReader {
     }
 }
 
-/// `price op value`, with `value` unscaled at the price's scale.
-#[derive(Clone, Copy, Debug)]
-struct Comparison {
-    price: Price,
-    op: Operator,
-    value: i128,
+/// Binds a price's min and max to its field in the [`PriceBounds`] table, and no other statistic.
+struct PriceStats {
+    /// The table's dtype.
+    table: DType,
+    /// Whether a price's min or max was bound.
+    bound: Cell<bool>,
 }
 
-impl Comparison {
-    /// `lhs op rhs` as a comparison of a price (`lhs`) with a literal (`rhs`) at its scale.
-    fn parse(op: Operator, lhs: &BoundExpression, rhs: &BoundExpression) -> Option<Self> {
-        let name = lhs.as_opt::<GetItem>()?;
-        if !lhs.child(0).is_root() {
-            return None;
-        }
-        let price = Price::from_name(name.as_ref())?;
-        let (DType::Decimal(column, _), DType::Decimal(literal, _)) = (lhs.dtype(), rhs.dtype())
+impl StatBinder for PriceStats {
+    fn bind_aggregate(
+        &self,
+        input: &BoundExpression,
+        aggregate_fn: &AggregateFnRef,
+        _stat_dtype: &DType,
+    ) -> VortexResult<Option<BoundExpression>> {
+        let Some(name) = input.as_opt::<GetItem>() else {
+            return Ok(None);
+        };
+        let Some(price) = Price::from_name(name.as_ref()).filter(|_| input.child(0).is_root())
         else {
-            return None;
+            return Ok(None);
         };
-        if column.scale() != literal.scale() {
-            return None;
-        }
-        let value = rhs
-            .as_opt::<Literal>()?
-            .as_decimal()
-            .decimal_value()?
-            .cast::<i128>()?;
-        Some(Self { price, op, value })
-    }
-
-    /// Whether the parts' bounds in `zone` rule out every price there, the price at `scale`.
-    fn rules_out(&self, bounds: &Bounds, zone: usize, scale: i8) -> bool {
-        // A price grows with every part but the lower wick (see `Price::from_parts`).
-        let mut lo = [0i128; 4];
-        let mut hi = [0i128; 4];
-        for (i, part) in Part::ALL.into_iter().enumerate() {
-            if !self.price.uses(part) {
-                continue;
-            }
-            let (min, max) = &bounds.parts[i];
-            let (Some(min), Some(max)) = (min[zone], max[zone]) else {
-                return false;
-            };
-            (lo[i], hi[i]) = match part {
-                Part::Lower => (max, min),
-                _ => (min, max),
-            };
-        }
-        let Some(factor) = 10i128.checked_pow((scale - bounds.scale) as u32) else {
-            return false;
+        let max = match Stat::from_aggregate_fn(aggregate_fn) {
+            Some(Stat::Min) => false,
+            Some(Stat::Max) => true,
+            _ => return Ok(None),
         };
-        let lo = self.price.from_parts(lo).saturating_mul(factor);
-        let hi = self.price.from_parts(hi).saturating_mul(factor);
-        let v = self.value;
-        match self.op {
-            Operator::Gt => hi <= v,
-            Operator::Gte => hi < v,
-            Operator::Lt => lo >= v,
-            Operator::Lte => lo > v,
-            Operator::Eq => v < lo || hi < v,
-            Operator::NotEq => lo == hi && hi == v,
-            _ => false,
-        }
+        self.bound.set(true);
+        Ok(Some(
+            get_item(bound_name(price, max), root()).bind(&self.table)?,
+        ))
     }
 }
 
-/// `expr` as comparisons of prices with literals, all of which hold: one, or two for a
-/// `between`. `None` for anything else.
-fn parse_price_comparisons(expr: &BoundExpression) -> Option<Vec<Comparison>> {
-    if let Some(options) = expr.as_opt::<Between>() {
-        let lower = match options.lower_strict {
-            StrictComparison::Strict => Operator::Gt,
-            StrictComparison::NonStrict => Operator::Gte,
-        };
-        let upper = match options.upper_strict {
-            StrictComparison::Strict => Operator::Lt,
-            StrictComparison::NonStrict => Operator::Lte,
-        };
-        return Some(vec![
-            Comparison::parse(lower, expr.child(0), expr.child(1))?,
-            Comparison::parse(upper, expr.child(0), expr.child(2))?,
-        ]);
-    }
-    let op = *expr.as_opt::<Binary>()?;
-    let swapped = match op {
-        Operator::Gt => Operator::Lt,
-        Operator::Gte => Operator::Lte,
-        Operator::Lt => Operator::Gt,
-        Operator::Lte => Operator::Gte,
-        Operator::Eq | Operator::NotEq => op,
-        _ => return None,
-    };
-    let comparison = Comparison::parse(op, expr.child(0), expr.child(1))
-        .or_else(|| Comparison::parse(swapped, expr.child(1), expr.child(0)))?;
-    Some(vec![comparison])
+/// The zones a filter's proof rules out (`true`), one per zone of `bounds`.
+struct RuledOut {
+    bounds: Arc<PriceBounds>,
+    zones: Mask,
 }
+
+type SharedRuledOut = Shared<BoxFuture<'static, Option<Arc<RuledOut>>>>;
 
 /// Where the [`OHLC`] struct's parts keep their zone maps, in [`Part::ALL`] order, all with the
 /// same zones.
@@ -555,15 +541,79 @@ struct PartZones {
 /// has no bound.
 type ZoneBounds = (Vec<Option<i128>>, Vec<Option<i128>>);
 
-struct Bounds {
+/// Each price's bounds per zone, from its parts' (see [`price_bound`]): a table with a row per
+/// zone and two fields per price, its min and max ([`bound_name`]) at its own type, null where a
+/// part's zone map has no bound.
+struct PriceBounds {
     zone_len: u64,
     row_count: u64,
-    /// The parts' scale.
-    scale: i8,
-    parts: Vec<ZoneBounds>,
+    table: ArrayRef,
 }
 
-type SharedBounds = Shared<BoxFuture<'static, Option<Arc<Bounds>>>>;
+type SharedBounds = Shared<BoxFuture<'static, Option<Arc<PriceBounds>>>>;
+
+/// The [`PriceBounds`] table's field for `price`'s min, or its max.
+fn bound_name(price: Price, max: bool) -> String {
+    let bound = if max { "max" } else { "min" };
+    format!("{}.{bound}", price.name())
+}
+
+/// The [`PriceBounds`] table's dtype, for prices of the types `prices`.
+fn price_bounds_dtype(prices: [DecimalDType; 4]) -> DType {
+    let (names, dtypes): (Vec<FieldName>, Vec<DType>) = (Price::ALL.iter())
+        .flat_map(|&price| [false, true].map(|max| (price, max)))
+        .map(|(price, max)| {
+            let dtype = DType::Decimal(prices[price as usize], Nullability::Nullable);
+            (bound_name(price, max).into(), dtype)
+        })
+        .unzip();
+    DType::Struct(
+        StructFields::new(names.into(), dtypes),
+        Nullability::NonNullable,
+    )
+}
+
+/// The [`PriceBounds`] table from the parts' bounds `parts`, at the parts' `scale`.
+fn price_bounds_table(parts: &[ZoneBounds], scale: i8, prices: [DecimalDType; 4]) -> ArrayRef {
+    let nzones = parts[0].0.len();
+    let fields = (Price::ALL.iter()).flat_map(|&price| {
+        let decimal = prices[price as usize];
+        let factor = 10i128.checked_pow((decimal.scale() - scale) as u32);
+        [false, true].map(|max| {
+            let bounds = (0..nzones).map(|zone| price_bound(parts, zone, price, max, factor));
+            DecimalArray::from_option_iter(bounds, decimal).into_array()
+        })
+    });
+    let names = (Price::ALL.iter())
+        .flat_map(|&price| [false, true].map(|max| FieldName::from(bound_name(price, max))));
+    StructArray::try_new(names.collect(), fields, nzones, Validity::NonNullable)
+        .expect("a field per bound, a row per zone")
+        .into_array()
+}
+
+/// `price`'s least value in `zone`, or its greatest (`max`), from its parts' bounds there and
+/// `factor` (from the parts' scale to the price's): a price grows with every part but the lower
+/// wick (see [`Price::from_parts`]). `None` where a part has no bound.
+fn price_bound(
+    parts: &[ZoneBounds],
+    zone: usize,
+    price: Price,
+    max: bool,
+    factor: Option<i128>,
+) -> Option<i128> {
+    let mut at = [0i128; 4];
+    for (i, part) in Part::ALL.into_iter().enumerate() {
+        if !price.uses(part) {
+            continue;
+        }
+        let (min_bounds, max_bounds) = &parts[i];
+        at[i] = match (part == Part::Lower) == max {
+            true => min_bounds[zone]?,
+            false => max_bounds[zone]?,
+        };
+    }
+    Some(price.from_parts(at).saturating_mul(factor?))
+}
 
 impl PartZones {
     /// `None` unless the stored table `data` has an [`OHLC`] struct, every part of which has a
@@ -596,6 +646,7 @@ impl PartZones {
         name: &Arc<str>,
         segment_source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
+        prices: [DecimalDType; 4],
     ) -> SharedBounds {
         let n = self.nzones;
         let reads: Vec<_> = Part::ALL
@@ -644,11 +695,10 @@ impl PartZones {
                 };
                 parts.push((stat("min")?, stat("max")?));
             }
-            Some(Arc::new(Bounds {
+            Some(Arc::new(PriceBounds {
                 zone_len,
                 row_count,
-                scale: scale?,
-                parts,
+                table: price_bounds_table(&parts, scale?, prices),
             }))
         }
         .boxed()
