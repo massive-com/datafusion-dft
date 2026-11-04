@@ -18,19 +18,23 @@ use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::LayoutReader;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::bars::{data_child, OHLC};
+use vortex_ohlc::bars::{data_child, DOLLAR_VOLUME, DOLLAR_VOLUME_RESIDUAL, OHLC};
 use vortex_ohlc::ohlc::Part;
 
-use test_util::{source, write, ROWS, ROW_BLOCK};
+use test_util::{source, write_with_residual, ROWS, ROW_BLOCK};
 
-/// Write `source`, and read it back: its chunks as stored, under the bars layout, as Vortex
-/// arrays, and its rows through the layout, with `source`'s schema, as one Arrow batch.
-fn write_and_read(source: &RecordBatch) -> (Vec<ArrayRef>, RecordBatch) {
+/// Write `source`, its dollar volume as a `residual` or not, and read it back: its chunks as
+/// stored, under the bars layout, as Vortex arrays, and its rows through the layout, with
+/// `source`'s schema, as one Arrow batch.
+fn write_and_read(source: &RecordBatch, residual: bool) -> (Vec<ArrayRef>, RecordBatch) {
     let schema = source.schema();
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::register(&session);
-    let file = session.open_options().open_buffer(write(source)).unwrap();
+    let file = session
+        .open_options()
+        .open_buffer(write_with_residual(source, residual))
+        .unwrap();
     let scan = |reader: Arc<dyn LayoutReader>| -> Vec<ArrayRef> {
         ScanBuilder::new(session.clone(), reader)
             .into_array_iter(&runtime)
@@ -72,6 +76,12 @@ fn child(array: &ArrayRef, name: &str) -> ArrayRef {
         .unwrap_or_else(|| panic!("{} has no child {name}", array.encoding_id()))
 }
 
+/// The names of a stored chunk's columns.
+fn names(chunk: &ArrayRef) -> Vec<String> {
+    let fields = chunk.dtype().as_struct_fields_opt().unwrap();
+    fields.names().iter().map(|name| name.to_string()).collect()
+}
+
 /// The encoding IDs of `array` and everything under it.
 fn encoding_ids(array: &ArrayRef) -> Vec<String> {
     let mut ids = vec![array.encoding_id().to_string()];
@@ -84,9 +94,11 @@ fn encoding_ids(array: &ArrayRef) -> Vec<String> {
 #[test]
 fn round_trip() {
     let source = source();
-    let (chunks, read) = write_and_read(&source);
+    let (chunks, read) = write_and_read(&source, true);
     assert_eq!(chunks.len(), ROWS.div_ceil(ROW_BLOCK));
     assert_eq!(read, source);
+    assert!(names(&chunks[0]).contains(&DOLLAR_VOLUME_RESIDUAL.to_string()));
+    assert!(!names(&chunks[0]).contains(&DOLLAR_VOLUME.to_string()));
 
     // The parts and transactions are bit-packed, in the encodings the edition allows.
     let mut v2 = false;
@@ -122,4 +134,14 @@ fn round_trip() {
     };
     let last = chunks.last().unwrap();
     assert!(volume_children(last) > volume_children(&chunks[0]));
+}
+
+/// Written without the residual, the dollar volume is stored as it is, and reads back the same.
+#[test]
+fn round_trip_without_residual() {
+    let source = source();
+    let (chunks, read) = write_and_read(&source, false);
+    assert_eq!(read, source);
+    assert!(names(&chunks[0]).contains(&DOLLAR_VOLUME.to_string()));
+    assert!(!names(&chunks[0]).contains(&DOLLAR_VOLUME_RESIDUAL.to_string()));
 }

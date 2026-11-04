@@ -1,7 +1,7 @@
 //! Writing a table, under the [`bars`](crate::bars) layout if it is a table of bars:
 //!
 //! ```ignore
-//! write_options(&session, DEFAULT_ROW_BLOCK)
+//! write_options(&session, DEFAULT_ROW_BLOCK, true)
 //!     .blocking(&runtime)
 //!     .write(file, arrays(&session, &schema, batches)?)?;
 //! ```
@@ -27,7 +27,8 @@ use crate::scaled::DecimalPow10Scheme;
 pub const DEFAULT_ROW_BLOCK: usize = 65_536;
 
 /// The options to write a table in `row_block`-row chunks, a table of bars under the bars layout
-/// ([`BarsStrategy`]).
+/// ([`BarsStrategy`]), with its dollar volume stored as a residual if `dollar_volume_residual`
+/// and the table can (see [`BarsStrategy::with_dollar_volume_residual`] for the trade).
 ///
 /// The strategy is Vortex's default on `session`, which must enable [`crate::edition`]: its
 /// compressor may then use our encodings, blocked FoR, blocked bit-packing and DecimalByteParts
@@ -36,7 +37,11 @@ pub const DEFAULT_ROW_BLOCK: usize = 65_536;
 /// into bigger chunks, so that is turned off: every chunk is one row block. Its decimal scheme
 /// gives way to [`DecimalPow10Scheme`], which stores decimals as it does, but without the
 /// trailing zeros a chunk's values all have.
-pub fn write_options(session: &VortexSession, row_block: usize) -> VortexWriteOptions {
+pub fn write_options(
+    session: &VortexSession,
+    row_block: usize,
+    dollar_volume_residual: bool,
+) -> VortexWriteOptions {
     let compressor = BtrBlocksCompressorBuilder::from_session(session)
         .exclude_schemes([DecimalScheme::v1().id()])
         .with_new_scheme(&DecimalPow10Scheme);
@@ -45,9 +50,9 @@ pub fn write_options(session: &VortexSession, row_block: usize) -> VortexWriteOp
         .with_row_block_size(row_block)
         .with_data_block_target_bytes(None)
         .build();
-    session
-        .write_options()
-        .with_strategy(Arc::new(BarsStrategy::new(strategy, row_block as u64)))
+    let bars = BarsStrategy::new(strategy, row_block as u64)
+        .with_dollar_volume_residual(dollar_volume_residual);
+    session.write_options().with_strategy(Arc::new(bars))
 }
 
 /// `batches` with `schema`, as the arrays to write with [`write_options`].

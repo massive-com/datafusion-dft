@@ -98,8 +98,13 @@ pub fn source() -> RecordBatch {
 }
 
 /// `source` written in 1,000-row batches and `ROW_BLOCK`-row chunks, under the bars layout (see
-/// [`write_options`]).
+/// [`write_options`]), with its dollar volume stored as a residual.
 pub fn write(source: &RecordBatch) -> Vec<u8> {
+    write_with_residual(source, true)
+}
+
+/// [`write`], with the dollar volume stored as a residual or not.
+pub fn write_with_residual(source: &RecordBatch, dollar_volume_residual: bool) -> Vec<u8> {
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
@@ -110,7 +115,7 @@ pub fn write(source: &RecordBatch) -> Vec<u8> {
         .collect();
     let arrays = arrays(&session, &source.schema(), batches).unwrap();
     let mut bytes = Vec::new();
-    write_options(&session, ROW_BLOCK)
+    write_options(&session, ROW_BLOCK, dollar_volume_residual)
         .blocking(&runtime)
         .write(&mut bytes, arrays)
         .unwrap();
