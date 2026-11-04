@@ -41,6 +41,7 @@ mod encode;
 mod scheme;
 
 pub use encode::pow10_encode;
+pub(crate) use scheme::is_decimal_values;
 pub use scheme::Pow10Scheme;
 
 /// Values per exponent: one FastLanes block, as Vortex's blocked FoR and bit-packing use.
