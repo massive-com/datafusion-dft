@@ -118,6 +118,9 @@ fn pow10(k: i32) -> Option<i128> {
 
 /// Run `$body` with `$values` bound to `$array`'s unscaled values at their width if it's an i32,
 /// i64 or i128's, and widened to i128s otherwise.
+///
+/// *Upstream*: after vortex#10701 a decoded decimal always has its precision's width, and the
+/// stored width is a `Widen`'s child, which [`decoded`] should return (see there).
 macro_rules! with_values {
     ($array:expr, |$values:ident| $body:expr) => {
         match $array.values_type() {

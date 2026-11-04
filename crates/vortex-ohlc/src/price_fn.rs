@@ -158,6 +158,9 @@ fn pow10<W: PrimInt + WrappingMul>(exponent: u8) -> W {
 }
 
 /// A decimal array's unscaled values times `factor`, as `W`s, whatever width they're stored at.
+///
+/// *Upstream*: after vortex#10701 a decoded decimal always has its precision's width, and the
+/// stored width is a `Widen`'s child, which [`decoded`] should return (see there).
 fn widened<W>(array: &DecimalArray, factor: W) -> VortexResult<Buffer<W>>
 where
     W: PrimInt + NativeDecimalType + 'static,
