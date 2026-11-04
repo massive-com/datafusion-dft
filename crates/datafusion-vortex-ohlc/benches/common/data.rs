@@ -45,9 +45,9 @@ const DATA_DIR: &str = concat!(
 /// bit-packing picks, 22 since that encoding is `vortex_ohlc.scaled` (`vortex_ohlc.pow10` before),
 /// 23 since its metadata has a base, 24 since every decimal is rescaled a chunk at a time
 /// (`vortex_ohlc::scaled::DecimalPow10Scheme`), 25 since the dollar volume is stored as a residual
-/// against volume × open (`vortex_ohlc::dollar_volume`). 9 to 16 were these steps in an earlier
-/// order.
-const VORTEX_VERSION: u32 = 25;
+/// against volume × open (`vortex_ohlc::dollar_volume`), 26 since the layout's metadata says
+/// whether it is. 9 to 16 were these steps in an earlier order.
+const VORTEX_VERSION: u32 = 26;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;
@@ -118,7 +118,7 @@ fn write_vortex(source: &Path, dest: &Path) {
         .unwrap();
     let schema = batches.schema();
     let arrays = arrays(&session, &schema, batches.map(|batch| batch.unwrap())).unwrap();
-    write_options(&session, DEFAULT_ROW_BLOCK)
+    write_options(&session, DEFAULT_ROW_BLOCK, true)
         .blocking(&runtime)
         .write(BufWriter::new(File::create(dest).unwrap()), arrays)
         .unwrap();
