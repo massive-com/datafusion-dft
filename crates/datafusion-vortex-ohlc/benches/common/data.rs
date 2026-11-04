@@ -36,9 +36,9 @@ const DATA_DIR: &str = concat!(
 /// since the bars layout at the root, 4 since it's gone, 5 since Vortex's compressor packs the
 /// planned columns, 6 since Vortex's default strategy writes every column, 8 since the bars
 /// layout is back at the root (7 was a trial of a patched compressor), 17 since the layout
-/// computes the parts itself and nothing is planned or rescaled before writing. 9 to 16 were
-/// these steps in an earlier order.
-const VORTEX_VERSION: u32 = 17;
+/// computes the parts itself and nothing is planned or rescaled before writing, 18 since it keeps
+/// the prices' own zones. 9 to 16 were these steps in an earlier order.
+const VORTEX_VERSION: u32 = 18;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;

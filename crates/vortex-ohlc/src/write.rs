@@ -37,7 +37,7 @@ pub fn write_options(session: &VortexSession, row_block: usize) -> VortexWriteOp
         .build();
     session
         .write_options()
-        .with_strategy(Arc::new(BarsStrategy::new(strategy)))
+        .with_strategy(Arc::new(BarsStrategy::new(strategy, row_block as u64)))
 }
 
 /// `batches` with `schema`, as the arrays to write with [`write_options`].

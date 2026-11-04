@@ -32,8 +32,8 @@
 //!
 //! - a column the file stores as it is has its zone maps' min and max, in the table's type;
 //! - a decimal stored at a smaller scale than the table's has them scaled up to the table's;
-//! - a price has bounds from those of the [`OHLC`] parts it is rebuilt from (see
-//!   [`price_bounds`]).
+//! - a price has the min and max the bars layout keeps for it (`vortex_ohlc::bars`'s
+//!   `source_zones`), the source's own.
 //!
 //! [`ZonePruner::prune`] reads the zone maps it doesn't have yet and waits for them, so every
 //! query is pruned. It reads them through a [`VortexReaderFactory`], the one the scans read their
@@ -45,10 +45,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::cast::AsArray;
-use arrow::array::types::Decimal128Type;
-use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, StructArray};
 use arrow::compute::{cast, nullif};
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::Schema;
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, Result, ScalarValue};
 use datafusion::datasource::listing::PartitionedFile;
@@ -72,9 +71,7 @@ use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::VortexAccessPlan;
-use vortex_ohlc::bars::OHLC;
-use vortex_ohlc::bars::{data_child, BarsLayout};
-use vortex_ohlc::ohlc::{Part, Price};
+use vortex_ohlc::bars::{bound_name, data_child, source_zones};
 
 /// How many bytes of zone maps a [`ZonePruner`] keeps by default: tens of KB a file, so some
 /// thousands of files.
@@ -265,7 +262,7 @@ fn selection(
 
 /// A file's zone maps, as of its size and modification time (in `meta`): every zoned column's
 /// min and max per zone, as Arrow arrays of its stored type, null where the zone map has no
-/// bound. A column is named by its path, `ohlc.open` for a part.
+/// bound. A column is named by its path, `ohlc.open` for a part, and a price by its name.
 struct FileZones {
     meta: ObjectMeta,
     /// What the min and max arrays take in memory, as the cache weighs them.
@@ -283,9 +280,27 @@ impl FileZones {
         file: &VortexFile,
         meta: ObjectMeta,
     ) -> VortexResult<Self> {
-        // Under a bars layout, the zone maps are the stored table's, by its columns.
+        // Under a bars layout, the zone maps are the stored table's, by its columns, and the
+        // prices' are the layout's own.
         let mut root_layout = Arc::clone(file.footer().layout());
-        if root_layout.is::<BarsLayout>() {
+        let mut columns = HashMap::new();
+        let mut shape = None;
+        if let Some((zones, zone_len)) = source_zones(&root_layout) {
+            shape = Some((zone_len, zones.row_count() as usize));
+            let table = read_table(session, file, "zones", &zones).await?;
+            // A min and a max per column the layout keeps them for.
+            let names: Vec<String> = (table.column_names().iter())
+                .filter_map(|name| name.strip_suffix(".min").map(str::to_string))
+                .collect();
+            for name in names {
+                let bound = |max| {
+                    let bound = bound_name(&name, max);
+                    (table.column_by_name(&bound).map(Arc::clone))
+                        .ok_or_else(|| vortex_err!("the bars layout has no {bound}"))
+                };
+                let bounds = (bound(false)?, bound(true)?);
+                columns.insert(name, bounds);
+            }
             root_layout = data_child(&root_layout)?;
         }
         let root_layout = &root_layout;
@@ -316,8 +331,6 @@ impl FileZones {
                 }
             }
         }
-        let mut shape = None;
-        let mut columns = HashMap::new();
         for (path, layout) in zoned {
             let typed = layout
                 .as_opt::<Zoned>()
@@ -357,20 +370,7 @@ async fn read_zone_map(
     path: &str,
     zones: &LayoutRef,
 ) -> VortexResult<(ArrayRef, ArrayRef)> {
-    let n = zones.row_count();
-    let reader = zones.new_reader(
-        format!("{path}.zones").into(),
-        file.segment_source(),
-        session,
-        &LayoutReaderContext::new(),
-    )?;
-    let all = root().bind(zones.dtype())?;
-    let table = reader
-        .projection_evaluation(&(0..n), &all, MaskFuture::new_true(n as usize))?
-        .await?;
-    let mut ctx = session.create_execution_ctx();
-    let table = session.arrow().execute_arrow(table, None, &mut ctx)?;
-    let table = table.as_struct();
+    let table = read_table(session, file, &format!("{path}.zones"), zones).await?;
     let named = |prefix: &str| {
         table
             .column_names()
@@ -406,6 +406,29 @@ async fn read_zone_map(
     Ok((Arc::clone(min), max))
 }
 
+/// The whole of the table `layout` in `file` (a zone map, or a bars layout's zones), as Arrow.
+async fn read_table(
+    session: &VortexSession,
+    file: &VortexFile,
+    name: &str,
+    layout: &LayoutRef,
+) -> VortexResult<StructArray> {
+    let n = layout.row_count();
+    let reader = layout.new_reader(
+        name.into(),
+        file.segment_source(),
+        session,
+        &LayoutReaderContext::new(),
+    )?;
+    let all = root().bind(layout.dtype())?;
+    let table = reader
+        .projection_evaluation(&(0..n), &all, MaskFuture::new_true(n as usize))?
+        .await?;
+    let mut ctx = session.create_execution_ctx();
+    let table = session.arrow().execute_arrow(table, None, &mut ctx)?;
+    Ok(table.as_struct().clone())
+}
+
 /// A file's zone maps as DataFusion's statistics over the table's columns, a zone a container.
 struct ZoneStatistics<'a> {
     zones: &'a FileZones,
@@ -416,12 +439,9 @@ impl ZoneStatistics<'_> {
     /// The zones' min (`max` false) or max of the table's `column`, in the table's type.
     fn bound(&self, column: &Column, max: bool) -> Option<ArrayRef> {
         let field = self.table.field_with_name(&column.name).ok()?;
-        if let Some((min_values, max_values)) = self.zones.columns.get(&column.name) {
-            let stored = if max { max_values } else { min_values };
-            return cast(stored, field.data_type()).ok();
-        }
-        let price = Price::from_name(&column.name)?;
-        price_bounds(&self.zones.columns, price, max, field.data_type())
+        let (min_values, max_values) = self.zones.columns.get(&column.name)?;
+        let stored = if max { max_values } else { min_values };
+        cast(stored, field.data_type()).ok()
     }
 }
 
@@ -448,184 +468,5 @@ impl PruningStatistics for ZoneStatistics<'_> {
 
     fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
         None
-    }
-}
-
-/// The zones' min (`max` false) or max of `price` as a `Decimal128` of `data_type`, from the
-/// bounds of the [`OHLC`] parts it is rebuilt from. A price grows with every part but the lower
-/// wick, which it shrinks with (see [`Price::from_parts`]): so its min is at least what the parts'
-/// mins give with the lower wick's max, and its max at most what their maxes give with the lower
-/// wick's min. The parts' bounds are `columns`' (see [`FileZones`]). `None` unless `columns` has
-/// the parts the price [uses](Price::uses), and `data_type` is a `Decimal128` at a scale at least
-/// theirs.
-fn price_bounds(
-    columns: &HashMap<String, (ArrayRef, ArrayRef)>,
-    price: Price,
-    max: bool,
-    data_type: &DataType,
-) -> Option<ArrayRef> {
-    let DataType::Decimal128(precision, scale) = *data_type else {
-        return None;
-    };
-    // Each part's bound that bounds the price's: the other one, for the lower wick.
-    let mut parts: [Option<&Decimal128Array>; 4] = [None; 4];
-    for (part, bounds) in Part::ALL.into_iter().zip(&mut parts) {
-        if price.uses(part) {
-            let (min_values, max_values) = columns.get(&format!("{OHLC}.{}", part.name()))?;
-            let values = if max != (part == Part::Lower) {
-                max_values
-            } else {
-                min_values
-            };
-            *bounds = Some(values.as_primitive_opt::<Decimal128Type>()?);
-        }
-    }
-    let open = parts[0].expect("every price uses open");
-    let shift = scale.checked_sub(open.scale()).filter(|s| *s >= 0)?;
-    let factor = 10i128.pow(shift as u32);
-    // A part the price doesn't use is 0, and a zone without a bound bounds nothing.
-    let at = |part: Option<&Decimal128Array>, i: usize| match part {
-        None => Some(0),
-        Some(values) => values.is_valid(i).then(|| values.value(i)),
-    };
-    let bound: Decimal128Array = (0..open.len())
-        .map(|i| {
-            let [o, b, u, l] = parts.map(|part| at(part, i));
-            Some(price.from_parts([o?, b?, u?, l?]) * factor)
-        })
-        .collect();
-    let bound = bound.with_precision_and_scale(precision, scale).ok()?;
-    Some(Arc::new(bound))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use vortex_ohlc::ohlc::ohlc_to_parts;
-
-    /// The parts' type in these tests: test-util's prices' scale (see [`zones_of_bars`]), and the
-    /// table's two digits more, as if the parts had been stored rescaled.
-    const PART_PRECISION: u8 = 16;
-    const PART_SCALE: i8 = 4;
-    const TABLE: DataType = DataType::Decimal128(18, 6);
-
-    /// The bars of test-util's table, `[open, high, low, close]` unscaled at [`PART_SCALE`], in
-    /// zones of its row block: rising and falling bodies, flat bars, and wicks on either side or
-    /// none.
-    fn zones_of_bars() -> Vec<Vec<[i128; 4]>> {
-        let source = test_util::source();
-        let [open, high, low, close] = Price::ALL.map(|price| {
-            let column = source.column_by_name(price.name()).unwrap();
-            column.as_primitive::<Decimal128Type>().values().to_vec()
-        });
-        let bars: Vec<[i128; 4]> = (0..source.num_rows())
-            .map(|i| [open[i], high[i], low[i], close[i]])
-            .collect();
-        bars.chunks(test_util::ROW_BLOCK)
-            .map(<[_]>::to_vec)
-            .collect()
-    }
-
-    /// The parts' zone maps of `zones`, as [`FileZones::columns`] has them, with a fourth zone
-    /// that has no bounds.
-    fn part_zone_maps(zones: &[Vec<[i128; 4]>]) -> HashMap<String, (ArrayRef, ArrayRef)> {
-        let parts: Vec<Vec<[i128; 4]>> = zones
-            .iter()
-            .map(|bars| {
-                bars.iter()
-                    .map(|&[o, h, l, c]| ohlc_to_parts(o, h, l, c).unwrap())
-                    .collect()
-            })
-            .collect();
-        Part::ALL
-            .iter()
-            .enumerate()
-            .map(|(i, part)| {
-                let bound = |pick: fn(i128, i128) -> i128| -> ArrayRef {
-                    let values = parts
-                        .iter()
-                        .map(|bars| bars.iter().map(|p| p[i]).reduce(pick))
-                        .chain([None]);
-                    let array = Decimal128Array::from_iter(values)
-                        .with_precision_and_scale(PART_PRECISION, PART_SCALE)
-                        .unwrap();
-                    Arc::new(array)
-                };
-                (
-                    format!("{OHLC}.{}", part.name()),
-                    (bound(i128::min), bound(i128::max)),
-                )
-            })
-            .collect()
-    }
-
-    fn bounds(
-        columns: &HashMap<String, (ArrayRef, ArrayRef)>,
-        price: Price,
-        max: bool,
-    ) -> Vec<Option<i128>> {
-        let array = price_bounds(columns, price, max, &TABLE).unwrap();
-        assert_eq!(array.data_type(), &TABLE);
-        array.as_primitive::<Decimal128Type>().iter().collect()
-    }
-
-    #[test]
-    fn bounds_contain_every_price() {
-        let zones = zones_of_bars();
-        let columns = part_zone_maps(&zones);
-        for (index, price) in Price::ALL.into_iter().enumerate() {
-            let (min, max) = (
-                bounds(&columns, price, false),
-                bounds(&columns, price, true),
-            );
-            for (zone, bars) in zones.iter().enumerate() {
-                // At the table's scale.
-                let values = bars.iter().map(|bar| bar[index] * 100);
-                let (lo, hi) = (values.clone().min().unwrap(), values.max().unwrap());
-                let (min, max) = (min[zone].unwrap(), max[zone].unwrap());
-                assert!(
-                    min <= lo && hi <= max,
-                    "{price:?} in zone {zone}: {lo}..{hi} not in {min}..{max}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn open_bounds_are_its_own() {
-        let zones = zones_of_bars();
-        let columns = part_zone_maps(&zones);
-        let (min, max) = (
-            bounds(&columns, Price::Open, false),
-            bounds(&columns, Price::Open, true),
-        );
-        for (zone, bars) in zones.iter().enumerate() {
-            let opens = bars.iter().map(|bar| bar[0] * 100);
-            assert_eq!(min[zone], opens.clone().min());
-            assert_eq!(max[zone], opens.max());
-        }
-    }
-
-    #[test]
-    fn a_zone_without_bounds_bounds_nothing() {
-        let columns = part_zone_maps(&zones_of_bars());
-        for price in Price::ALL {
-            for max in [false, true] {
-                assert_eq!(bounds(&columns, price, max)[3], None, "{price:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn no_bounds_it_cant_give() {
-        let columns = part_zone_maps(&zones_of_bars());
-        // A table type below the parts' scale or not a decimal, no parts.
-        let high = |columns, data_type| price_bounds(columns, Price::High, false, data_type);
-        assert!(high(&columns, &DataType::Decimal128(18, 2)).is_none());
-        assert!(high(&columns, &DataType::Int64).is_none());
-        let mut no_upper = columns.clone();
-        no_upper.remove(&format!("{OHLC}.{}", Part::Upper.name()));
-        assert!(high(&no_upper, &TABLE).is_none());
-        assert!(price_bounds(&no_upper, Price::Low, false, &TABLE).is_some());
     }
 }

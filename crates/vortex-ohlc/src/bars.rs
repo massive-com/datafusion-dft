@@ -1,19 +1,16 @@
 //! `vortex_ohlc.bars`, the layout at the root of a table of bars, with the source's dtype:
-//! four decimal prices where the stored table has the [`OHLC`] struct. Its one child is the table
-//! as stored. Its reader rewrites every expression over the source's columns into one over the
-//! stored table (a price into [`ohlc_price`] over the struct, the whole row into a `pack`), and
-//! prunes a comparison of a price with a literal on the parts' zone maps itself: Vortex's struct
-//! reader only prunes an expression that reads one field, and a price reads two or three.
+//! four decimal prices where the stored table has the [`OHLC`] struct. Its children are the table
+//! as stored and the source's zones: each price's min and max per zone of its rows, as the source
+//! has them, which the stored table's zone maps (of the parts) can't give. Its reader rewrites
+//! every expression over the source's columns into one over the stored table (a price into
+//! [`ohlc_price`] over the struct, the whole row into a `pack`), and prunes a filter on prices on
+//! the source's zones itself.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::cast::AsArray;
-use arrow::array::types::Decimal128Type;
-use arrow::array::Array;
-use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
@@ -26,17 +23,17 @@ use vortex::array::expr::stats::Stat;
 use vortex::array::stats::bind::{bind_stats, StatBinder};
 use vortex::array::validity::Validity;
 use vortex::array::{ArrayRef, IntoArray, MaskFuture, RawMetadata, VortexSessionExecute};
-use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::BufferMut;
 use vortex::dtype::{
     DType, DecimalDType, FieldMask, FieldName, FieldPath, Nullability, StructFields,
 };
 use vortex::error::{vortex_bail, vortex_ensure, vortex_err, VortexResult};
 use vortex::expr::{get_item, pack, root, BoundExpression, ExactBoundExpr, Expression};
-use vortex::layout::layouts::zoned::Zoned;
+use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex::layout::segments::{SegmentSinkRef, SegmentSource};
 use vortex::layout::sequence::{
-    SendableSequentialStream, SequencePointer, SequentialStreamAdapter, SequentialStreamExt,
+    SendableSequentialStream, SequencePointer, SequentialArrayStreamExt, SequentialStreamAdapter,
+    SequentialStreamExt,
 };
 use vortex::layout::{
     layout_children, ArrayFuture, Layout, LayoutChildType, LayoutDeserializeArgs, LayoutId,
@@ -72,10 +69,12 @@ pub fn register(session: &VortexSession) {
 #[derive(Clone, Debug)]
 pub struct BarsLayout;
 
-/// The parts' decimal type, which with the layout's dtype gives the stored table's.
+/// The parts' decimal type, which with the layout's dtype gives the stored table's, and the rows
+/// per zone of the source's zones.
 #[derive(Clone, Debug)]
 pub struct BarsData {
     parts: DecimalDType,
+    zone_len: u64,
 }
 
 impl VTable for BarsLayout {
@@ -87,8 +86,11 @@ impl VTable for BarsLayout {
         *ID
     }
 
+    /// The parts' precision and scale, then the zone length as a little-endian `u64`.
     fn metadata(layout: &Layout<Self>) -> RawMetadata {
-        RawMetadata(vec![layout.parts.precision(), layout.parts.scale() as u8])
+        let mut metadata = vec![layout.parts.precision(), layout.parts.scale() as u8];
+        metadata.extend(layout.zone_len.to_le_bytes());
+        RawMetadata(metadata)
     }
 
     fn deserialize(
@@ -96,31 +98,38 @@ impl VTable for BarsLayout {
         args: &LayoutDeserializeArgs<'_>,
         metadata: &Vec<u8>,
     ) -> VortexResult<BarsData> {
-        let &[precision, scale] = metadata.as_slice() else {
-            vortex_bail!(
-                "a bars layout's metadata is 2 bytes, not {}",
-                metadata.len()
-            );
+        let (&[precision, scale], zone_len) = metadata.split_at(2.min(metadata.len())) else {
+            vortex_bail!("a bars layout's metadata is too short");
         };
+        let zone_len = <[u8; 8]>::try_from(zone_len)
+            .map(u64::from_le_bytes)
+            .map_err(|_| vortex_err!("a bars layout's metadata is 10 bytes"))?;
+        vortex_ensure!(zone_len > 0, "a bars layout's zones have rows");
         let parts = DecimalDType::new(precision, scale as i8);
         vortex_ensure!(
-            args.children.nchildren() == 1,
-            "a bars layout has exactly one child, its table"
+            args.children.nchildren() == 2,
+            "a bars layout has two children, its table and the source's zones"
         );
         vortex_ensure!(args.children.child_row_count(0) == args.row_count);
+        vortex_ensure!(args.children.child_row_count(1) == args.row_count.div_ceil(zone_len));
         args.children.child(0, &stored_dtype(args.dtype, parts)?)?;
-        Ok(BarsData { parts })
+        args.children.child(1, &zones_dtype(args.dtype)?)?;
+        Ok(BarsData { parts, zone_len })
     }
 
     fn child_dtype(layout: &Layout<Self>, slot: usize) -> VortexResult<DType> {
         match slot {
             0 => stored_dtype(layout.dtype(), layout.parts),
+            1 => zones_dtype(layout.dtype()),
             _ => vortex_bail!("a bars layout has no child {slot}"),
         }
     }
 
-    fn child_type(_layout: &Layout<Self>, _slot: usize) -> LayoutChildType {
-        LayoutChildType::Transparent("data".into())
+    fn child_type(_layout: &Layout<Self>, slot: usize) -> LayoutChildType {
+        match slot {
+            0 => LayoutChildType::Transparent("data".into()),
+            _ => LayoutChildType::Auxiliary("zones".into()),
+        }
     }
 
     fn new_reader(
@@ -133,11 +142,12 @@ impl VTable for BarsLayout {
         let data = data_child(&layout.to_layout())?;
         let inner =
             data.new_reader(Arc::clone(&name), Arc::clone(&segment_source), session, ctx)?;
+        let zones = Arc::clone(&layout.to_layout().children()?[1]);
         Ok(Arc::new(BarsReader::new(
             name,
             layout.dtype().clone(),
             inner,
-            PartZones::find(&data),
+            (zones, layout.zone_len),
             segment_source,
             session.clone(),
         )?))
@@ -147,6 +157,121 @@ impl VTable for BarsLayout {
 /// The table a bars layout wraps.
 pub fn data_child(layout: &LayoutRef) -> VortexResult<LayoutRef> {
     Ok(Arc::clone(&layout.children()?[0]))
+}
+
+/// A bars layout's source zones (see [`zones_dtype`]) and the rows per zone; `None` for any other
+/// layout.
+pub fn source_zones(layout: &LayoutRef) -> Option<(LayoutRef, u64)> {
+    let bars = layout.as_opt::<BarsLayout>()?;
+    Some((Arc::clone(&layout.children().ok()?[1]), bars.zone_len))
+}
+
+/// The field of the source's zones (see [`zones_dtype`]) with `column`'s min, or its max.
+pub fn bound_name(column: &str, max: bool) -> String {
+    let bound = if max { "max" } else { "min" };
+    format!("{column}.{bound}")
+}
+
+/// The dtype of the source's zones for a table of `source`'s dtype: a row per zone, and the min
+/// and max there ([`bound_name`]) of each price (see [`zoned_columns`]), at its type, null where a
+/// zone has none.
+pub fn zones_dtype(source: &DType) -> VortexResult<DType> {
+    let mut names: Vec<FieldName> = Vec::new();
+    let mut dtypes = Vec::new();
+    for (name, decimal) in zoned_columns(source)? {
+        for max in [false, true] {
+            names.push(bound_name(name, max).into());
+            dtypes.push(DType::Decimal(decimal, Nullability::Nullable));
+        }
+    }
+    Ok(DType::Struct(
+        StructFields::new(names.into(), dtypes),
+        Nullability::NonNullable,
+    ))
+}
+
+/// The columns of a table of `source`'s dtype that the stored table doesn't have as they are,
+/// with their decimal types: the four prices.
+fn zoned_columns(source: &DType) -> VortexResult<Vec<(&'static str, DecimalDType)>> {
+    let fields = source
+        .as_struct_fields_opt()
+        .ok_or_else(|| vortex_err!("a table of bars is a struct, not {source}"))?;
+    let mut columns = Vec::new();
+    for price in Price::ALL {
+        let Some(DType::Decimal(decimal, _)) = fields.field(price.name()) else {
+            vortex_bail!("{} is not a decimal", price.name());
+        };
+        columns.push((price.name(), decimal));
+    }
+    Ok(columns)
+}
+
+/// Each zone's min and max of some of a table's columns, from the chunks written so far.
+struct ZoneBounds {
+    zone_len: u64,
+    rows: u64,
+    /// Per column, per zone: the least and the greatest valid value.
+    bounds: Vec<Vec<(Option<i128>, Option<i128>)>>,
+}
+
+impl ZoneBounds {
+    fn new(zone_len: u64, columns: usize) -> Self {
+        Self {
+            zone_len,
+            rows: 0,
+            bounds: vec![Vec::new(); columns],
+        }
+    }
+
+    /// Add the next chunk's columns: each one's unscaled values and which are valid.
+    fn add(&mut self, columns: &[(&[i128], &Mask)]) {
+        let len = columns.first().map_or(0, |(values, _)| values.len());
+        let nzones = (self.rows + len as u64).div_ceil(self.zone_len) as usize;
+        let mut start = 0;
+        while start < len {
+            let row = self.rows + start as u64;
+            let zone = (row / self.zone_len) as usize;
+            let end = len.min(start + (self.zone_len - row % self.zone_len) as usize);
+            for ((values, valid), bounds) in columns.iter().zip(&mut self.bounds) {
+                bounds.resize(nzones, (None, None));
+                let (lo, hi) = &mut bounds[zone];
+                for (i, &value) in values[start..end].iter().enumerate() {
+                    if valid.value(start + i) {
+                        *lo = Some(lo.map_or(value, |lo| lo.min(value)));
+                        *hi = Some(hi.map_or(value, |hi| hi.max(value)));
+                    }
+                }
+            }
+            start = end;
+        }
+        self.rows += len as u64;
+    }
+
+    /// The bounds as the source's zones (see [`zones_dtype`]) of the columns `columns` (see
+    /// [`zoned_columns`]).
+    fn table(&self, columns: &[(&str, DecimalDType)]) -> VortexResult<ArrayRef> {
+        let nzones = self.rows.div_ceil(self.zone_len) as usize;
+        let mut fields = Vec::new();
+        for (bounds, &(_, decimal)) in self.bounds.iter().zip(columns) {
+            for max in [false, true] {
+                let values = (0..nzones).map(|zone| {
+                    let (lo, hi) = bounds.get(zone).copied().unwrap_or_default();
+                    if max {
+                        hi
+                    } else {
+                        lo
+                    }
+                });
+                fields.push(DecimalArray::from_option_iter(values, decimal).into_array());
+            }
+        }
+        let names = (columns.iter())
+            .flat_map(|&(name, _)| [false, true].map(|max| FieldName::from(bound_name(name, max))));
+        Ok(
+            StructArray::try_new(names.collect(), fields, nzones, Validity::NonNullable)?
+                .into_array(),
+        )
+    }
 }
 
 /// The stored table's dtype, given the source's and the parts' decimal type: the [`OHLC`] struct
@@ -178,10 +303,12 @@ fn stored_dtype(source: &DType, parts: DecimalDType) -> VortexResult<DType> {
 }
 
 /// A chunk of a table of bars as stored, with `parts` (see [`parts_dtype`]): the four prices as
-/// the [`OHLC`] struct's parts, where open is in the source (see [`stored_dtype`]).
+/// the [`OHLC`] struct's parts, where open is in the source (see [`stored_dtype`]). Its prices go
+/// into `zones`.
 fn stored_chunk(
     chunk: ArrayRef,
     parts: DecimalDType,
+    zones: &Mutex<ZoneBounds>,
     session: &VortexSession,
 ) -> VortexResult<ArrayRef> {
     let mut ctx = session.create_execution_ctx();
@@ -200,6 +327,13 @@ fn stored_chunk(
         prices.push(converted_buffer::<i128>(&column, &valid)?);
     }
     let [open, high, low, close] = [&prices[0], &prices[1], &prices[2], &prices[3]];
+    let valid = Mask::new_true(len);
+    zones.lock().unwrap().add(&[
+        (open, &valid),
+        (high, &valid),
+        (low, &valid),
+        (close, &valid),
+    ]);
     let limit = 10i128.pow(u32::from(parts.precision()));
     let mut columns: [BufferMut<i128>; 4] = std::array::from_fn(|_| BufferMut::with_capacity(len));
     for i in 0..len {
@@ -264,15 +398,17 @@ fn parts_dtype(source: &DType) -> Option<DecimalDType> {
 }
 
 /// Writes a table of bars (see [`parts_dtype`]) with `inner`, its four prices as the [`OHLC`]
-/// struct's parts, and wraps it in a [`BarsLayout`] with the source's dtype. Writes any other
-/// table with `inner` as it is.
+/// struct's parts, and wraps it in a [`BarsLayout`] with the source's dtype and the source's
+/// zones of `zone_len` rows (see [`zones_dtype`]). Writes any other table with `inner` as it is.
 pub struct BarsStrategy {
     inner: Arc<dyn LayoutStrategy>,
+    zone_len: u64,
 }
 
 impl BarsStrategy {
-    pub fn new(inner: Arc<dyn LayoutStrategy>) -> Self {
-        Self { inner }
+    pub fn new(inner: Arc<dyn LayoutStrategy>, zone_len: u64) -> Self {
+        assert!(zone_len > 0, "a zone has rows");
+        Self { inner, zone_len }
     }
 }
 
@@ -283,7 +419,7 @@ impl LayoutStrategy for BarsStrategy {
         ctx: LayoutWriterContext,
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
-        eof: SequencePointer,
+        mut eof: SequencePointer,
         session: &VortexSession,
     ) -> VortexResult<LayoutRef> {
         let source = stream.dtype().clone();
@@ -293,26 +429,45 @@ impl LayoutStrategy for BarsStrategy {
                 .await;
         };
         let stored = stored_dtype(&source, parts)?;
-        let chunk_session = session.clone();
+        let zoned = zoned_columns(&source)?;
+        let zone_bounds = Arc::new(Mutex::new(ZoneBounds::new(self.zone_len, zoned.len())));
+        let (chunk_zones, chunk_session) = (Arc::clone(&zone_bounds), session.clone());
         let stream = SequentialStreamAdapter::new(
             stored,
             stream.map(move |chunk| {
                 let (sequence, chunk) = chunk?;
-                Ok((sequence, stored_chunk(chunk, parts, &chunk_session)?))
+                let chunk = stored_chunk(chunk, parts, &chunk_zones, &chunk_session)?;
+                Ok((sequence, chunk))
             }),
         )
         .sendable();
+        // The data's segments come before the zones', as a zoned layout's do.
+        let data_eof = eof.split_off();
         let data = self
             .inner
-            .write_stream(ctx, segment_sink, stream, eof, session)
+            .write_stream(
+                ctx.clone(),
+                Arc::clone(&segment_sink),
+                stream,
+                data_eof,
+                session,
+            )
+            .await?;
+        let table = zone_bounds.lock().unwrap().table(&zoned)?;
+        let table = table.to_array_stream().sequenced(eof.split_off());
+        let zones = FlatLayoutStrategy::default()
+            .write_stream(ctx, segment_sink, table, eof, session)
             .await?;
         Ok(LayoutParts::new(
             BarsLayout,
             source,
             data.row_count(),
             Vec::new(),
-            layout_children(vec![data]),
-            BarsData { parts },
+            layout_children(vec![data, zones]),
+            BarsData {
+                parts,
+                zone_len: self.zone_len,
+            },
         )
         .into_layout())
     }
@@ -328,7 +483,8 @@ struct BarsReader {
     prices: [DecimalDType; 4],
     /// Expressions over the source's columns, rewritten over the stored table and bound.
     rewritten: Mutex<HashMap<ExactBoundExpr, BoundExpression>>,
-    zones: Option<PartZones>,
+    /// The source's zones and the rows per zone.
+    zones: (LayoutRef, u64),
     segment_source: Arc<dyn SegmentSource>,
     session: VortexSession,
     /// The prices' bounds per zone, read once per reader, on the first filter on a price.
@@ -342,7 +498,7 @@ impl BarsReader {
         name: Arc<str>,
         dtype: DType,
         inner: LayoutReaderRef,
-        zones: Option<PartZones>,
+        zones: (LayoutRef, u64),
         segment_source: Arc<dyn SegmentSource>,
         session: VortexSession,
     ) -> VortexResult<Self> {
@@ -418,27 +574,48 @@ impl BarsReader {
     }
 
     fn bounds(&self) -> SharedBounds {
-        self.bounds
-            .get_or_init(|| match &self.zones {
-                None => futures::future::ready(None).boxed().shared(),
-                Some(zones) => {
-                    zones.read(&self.name, &self.segment_source, &self.session, self.prices)
-                }
-            })
-            .clone()
+        self.bounds.get_or_init(|| self.read_bounds()).clone()
+    }
+
+    /// Read the source's zones.
+    fn read_bounds(&self) -> SharedBounds {
+        let (zones, zone_len) = (Arc::clone(&self.zones.0), self.zones.1);
+        let row_count = self.inner.row_count();
+        let n = zones.row_count();
+        let read = zones
+            .new_reader(
+                format!("{}.zones", self.name).into(),
+                Arc::clone(&self.segment_source),
+                &self.session,
+                &LayoutReaderContext::new(),
+            )
+            .and_then(|reader| {
+                let all = root().bind(zones.dtype())?;
+                reader.projection_evaluation(&(0..n), &all, MaskFuture::new_true(n as usize))
+            });
+        async move {
+            let table = read.ok()?.await.ok()?;
+            Some(Arc::new(PriceBounds {
+                zone_len,
+                row_count,
+                table,
+            }))
+        }
+        .boxed()
+        .shared()
     }
 
     /// The zones the prices' bounds rule out for `expr`, once per filter: Vortex's own rules
     /// for proving a filter false from statistics ([`BoundExpression::falsify`]), with each
-    /// price's min and max taken from [`PriceBounds`]. `None` if `expr` has no proof that uses a
-    /// price's.
+    /// price's min and max taken from the source's zones. `None` if `expr` has no proof that uses
+    /// a price's.
     fn ruled_out(&self, expr: &BoundExpression) -> VortexResult<Option<SharedRuledOut>> {
         let key = ExactBoundExpr(expr.clone());
         if let Some(ruled_out) = self.ruled_out.lock().unwrap().get(&key) {
             return Ok(ruled_out.clone());
         }
         let binder = PriceStats {
-            table: price_bounds_dtype(self.prices),
+            table: self.zones.0.dtype().clone(),
             bound: Cell::new(false),
         };
         let proof = match expr.falsify(&self.session)? {
@@ -567,7 +744,8 @@ impl LayoutReader for BarsReader {
     }
 }
 
-/// Binds a price's min and max to its field in the [`PriceBounds`] table, and no other statistic.
+/// Binds the min and max of a column in the source's zones (a price) to its field there, and no
+/// other statistic.
 struct PriceStats {
     /// The table's dtype.
     table: DType,
@@ -585,19 +763,21 @@ impl StatBinder for PriceStats {
         let Some(name) = input.as_opt::<GetItem>() else {
             return Ok(None);
         };
-        let Some(price) = Price::from_name(name.as_ref()).filter(|_| input.child(0).is_root())
-        else {
+        if !input.child(0).is_root() {
             return Ok(None);
-        };
+        }
         let max = match Stat::from_aggregate_fn(aggregate_fn) {
             Some(Stat::Min) => false,
             Some(Stat::Max) => true,
             _ => return Ok(None),
         };
+        let bound = bound_name(name.as_ref(), max);
+        let fields = self.table.as_struct_fields_opt();
+        if fields.and_then(|fields| fields.field(&bound)).is_none() {
+            return Ok(None);
+        }
         self.bound.set(true);
-        Ok(Some(
-            get_item(bound_name(price, max), root()).bind(&self.table)?,
-        ))
+        Ok(Some(get_item(bound, root()).bind(&self.table)?))
     }
 }
 
@@ -609,22 +789,7 @@ struct RuledOut {
 
 type SharedRuledOut = Shared<BoxFuture<'static, Option<Arc<RuledOut>>>>;
 
-/// Where the [`OHLC`] struct's parts keep their zone maps, in [`Part::ALL`] order, all with the
-/// same zones.
-struct PartZones {
-    zone_len: u64,
-    row_count: u64,
-    nzones: usize,
-    parts: Vec<LayoutRef>,
-}
-
-/// One part's min and max per zone, unscaled at the parts' scale, `None` where the zone map
-/// has no bound.
-type ZoneBounds = (Vec<Option<i128>>, Vec<Option<i128>>);
-
-/// Each price's bounds per zone, from its parts' (see [`price_bound`]): a table with a row per
-/// zone and two fields per price, its min and max ([`bound_name`]) at its own type, null where a
-/// part's zone map has no bound.
+/// The source's zones (see [`zones_dtype`]) as read, with their rows per zone.
 struct PriceBounds {
     zone_len: u64,
     row_count: u64,
@@ -633,179 +798,30 @@ struct PriceBounds {
 
 type SharedBounds = Shared<BoxFuture<'static, Option<Arc<PriceBounds>>>>;
 
-/// The [`PriceBounds`] table's field for `price`'s min, or its max.
-fn bound_name(price: Price, max: bool) -> String {
-    let bound = if max { "max" } else { "min" };
-    format!("{}.{bound}", price.name())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// The [`PriceBounds`] table's dtype, for prices of the types `prices`.
-fn price_bounds_dtype(prices: [DecimalDType; 4]) -> DType {
-    let (names, dtypes): (Vec<FieldName>, Vec<DType>) = (Price::ALL.iter())
-        .flat_map(|&price| [false, true].map(|max| (price, max)))
-        .map(|(price, max)| {
-            let dtype = DType::Decimal(prices[price as usize], Nullability::Nullable);
-            (bound_name(price, max).into(), dtype)
-        })
-        .unzip();
-    DType::Struct(
-        StructFields::new(names.into(), dtypes),
-        Nullability::NonNullable,
-    )
-}
-
-/// The [`PriceBounds`] table from the parts' bounds `parts`, at the parts' `scale`.
-fn price_bounds_table(parts: &[ZoneBounds], scale: i8, prices: [DecimalDType; 4]) -> ArrayRef {
-    let nzones = parts[0].0.len();
-    let fields = (Price::ALL.iter()).flat_map(|&price| {
-        let decimal = prices[price as usize];
-        let factor = 10i128.checked_pow((decimal.scale() - scale) as u32);
-        [false, true].map(|max| {
-            let bounds = (0..nzones).map(|zone| price_bound(parts, zone, price, max, factor));
-            DecimalArray::from_option_iter(bounds, decimal).into_array()
-        })
-    });
-    let names = (Price::ALL.iter())
-        .flat_map(|&price| [false, true].map(|max| FieldName::from(bound_name(price, max))));
-    StructArray::try_new(names.collect(), fields, nzones, Validity::NonNullable)
-        .expect("a field per bound, a row per zone")
-        .into_array()
-}
-
-/// `price`'s least value in `zone`, or its greatest (`max`), from its parts' bounds there and
-/// `factor` (from the parts' scale to the price's): a price grows with every part but the lower
-/// wick (see [`Price::from_parts`]). `None` where a part has no bound.
-fn price_bound(
-    parts: &[ZoneBounds],
-    zone: usize,
-    price: Price,
-    max: bool,
-    factor: Option<i128>,
-) -> Option<i128> {
-    let mut at = [0i128; 4];
-    for (i, part) in Part::ALL.into_iter().enumerate() {
-        if !price.uses(part) {
-            continue;
+    /// Chunks that don't line up with the zones (3, 4 and 1 rows, zones of 3) give each zone
+    /// its own rows' bounds, without the nulls, and a zone of nulls none.
+    #[test]
+    fn zone_bounds_follow_rows_not_chunks() {
+        let mut zones = ZoneBounds::new(3, 1);
+        let chunks: [(&[i128], Mask); 3] = [
+            (&[5, 1, 9], Mask::new_true(3)),
+            (&[4, 8, 7, 100], Mask::from_iter([true, true, true, false])),
+            (&[2], Mask::new_true(1)),
+        ];
+        for (values, valid) in &chunks {
+            zones.add(&[(values, valid)]);
         }
-        let (min_bounds, max_bounds) = &parts[i];
-        at[i] = match (part == Part::Lower) == max {
-            true => min_bounds[zone]?,
-            false => max_bounds[zone]?,
-        };
+        assert_eq!(zones.rows, 8);
+        assert_eq!(
+            zones.bounds[0],
+            vec![(Some(1), Some(9)), (Some(4), Some(8)), (Some(2), Some(2))]
+        );
+        let mut nulls = ZoneBounds::new(2, 1);
+        nulls.add(&[(&[1, 2, 3], &Mask::from_iter([false, false, true]))]);
+        assert_eq!(nulls.bounds[0], vec![(None, None), (Some(3), Some(3))]);
     }
-    Some(price.from_parts(at).saturating_mul(factor?))
-}
-
-impl PartZones {
-    /// `None` unless the stored table `data` has an [`OHLC`] struct, every part of which has a
-    /// zone map, all with the same zones.
-    fn find(data: &LayoutRef) -> Option<Self> {
-        let ohlc = find_child(data, OHLC)?;
-        let mut parts = Vec::new();
-        let mut shape = None;
-        for part in Part::ALL {
-            let zoned = find_zoned(&find_child(&ohlc, part.name())?)?;
-            let typed = zoned.as_opt::<Zoned>()?;
-            let this = (typed.zone_len() as u64, typed.nzones());
-            if *shape.get_or_insert(this) != this {
-                return None;
-            }
-            parts.push(Arc::clone(&zoned.children().ok()?[1]));
-        }
-        let (zone_len, nzones) = shape?;
-        Some(Self {
-            zone_len,
-            row_count: data.row_count(),
-            nzones,
-            parts,
-        })
-    }
-
-    /// Read every part's zone map.
-    ///
-    /// *Upstream*: Vortex's own `ZoneMap` reads a zone map, bounded statistics included, and
-    /// prunes with it (vortex-layout 0.89 `zoned/zone_map.rs:74,144`). Building one needs the
-    /// zoned layout's aggregate functions, which are `pub(crate)` (`ZonedData::aggregate_fns`,
-    /// `zoned/mod.rs:380`), as is the zone map `ZonedReader` keeps (`zoned/pruning.rs:156`). If
-    /// Vortex made either public, this and the pruner's `read_zone_map` could use it.
-    fn read(
-        &self,
-        name: &Arc<str>,
-        segment_source: &Arc<dyn SegmentSource>,
-        session: &VortexSession,
-        prices: [DecimalDType; 4],
-    ) -> SharedBounds {
-        let n = self.nzones;
-        let reads: Vec<_> = Part::ALL
-            .iter()
-            .zip(&self.parts)
-            .map(|(part, zones)| {
-                let reader = zones.new_reader(
-                    format!("{name}.{}.zones", part.name()).into(),
-                    Arc::clone(segment_source),
-                    session,
-                    &LayoutReaderContext::new(),
-                )?;
-                let all = root().bind(zones.dtype())?;
-                reader.projection_evaluation(&(0..n as u64), &all, MaskFuture::new_true(n))
-            })
-            .collect();
-        let session = session.clone();
-        let (zone_len, row_count) = (self.zone_len, self.row_count);
-        async move {
-            let mut parts = Vec::new();
-            let mut scale = None;
-            for read in reads {
-                let table = read.ok()?.await.ok()?;
-                let mut ctx = session.create_execution_ctx();
-                let table = table.execute::<StructArray>(&mut ctx).ok()?;
-                let mut stat = |want: &str| -> Option<Vec<Option<i128>>> {
-                    let array = table
-                        .unmasked_field_by_name(format!("vortex.{want}()"))
-                        .ok()?
-                        .clone();
-                    let array = session.arrow().execute_arrow(array, None, &mut ctx).ok()?;
-                    let s = match array.data_type() {
-                        DataType::Decimal32(_, s)
-                        | DataType::Decimal64(_, s)
-                        | DataType::Decimal128(_, s) => *s,
-                        _ => return None,
-                    };
-                    scale = Some(s);
-                    let wide = arrow::compute::cast(&array, &DataType::Decimal128(38, s)).ok()?;
-                    let wide = wide.as_primitive::<Decimal128Type>();
-                    Some(
-                        (0..wide.len())
-                            .map(|i| wide.is_valid(i).then(|| wide.value(i)))
-                            .collect(),
-                    )
-                };
-                parts.push((stat("min")?, stat("max")?));
-            }
-            Some(Arc::new(PriceBounds {
-                zone_len,
-                row_count,
-                table: price_bounds_table(&parts, scale?, prices),
-            }))
-        }
-        .boxed()
-        .shared()
-    }
-}
-
-/// The child named `name` of the first layout at or under `layout` that has one, depth first.
-fn find_child(layout: &LayoutRef, name: &str) -> Option<LayoutRef> {
-    let children = layout.children().ok()?;
-    if let Some(index) = layout.child_names().position(|n| n.as_ref() == name) {
-        return children.get(index).map(Arc::clone);
-    }
-    children.iter().find_map(|child| find_child(child, name))
-}
-
-/// The first zoned layout at or under `layout`, depth first.
-fn find_zoned(layout: &LayoutRef) -> Option<LayoutRef> {
-    if layout.is::<Zoned>() {
-        return Some(Arc::clone(layout));
-    }
-    layout.children().ok()?.iter().find_map(find_zoned)
 }
