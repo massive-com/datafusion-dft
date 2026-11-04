@@ -215,25 +215,22 @@ pub struct VortexScanStats {
 }
 
 impl VortexScanStats {
+    /// Adds a scan's counts from `metrics`, its plan's and Vortex's, as Vortex's
+    /// `VortexMetricsFinder` gathers them.
     #[cfg(feature = "vortex")]
-    fn add_scan(&mut self, source: &vortex_datafusion::VortexSource) {
-        use vortex::metrics::MetricValue;
-
-        for metric in source.metrics_registry().snapshot() {
-            let MetricValue::Counter(counter) = metric.value() else {
-                continue;
-            };
-            match metric.name().as_ref() {
-                "vortex.file.segments.cache.hits" | "vortex.file.segments.cache.misses" => {
-                    self.segment_requests += counter.value()
-                }
-                "io.requests.individual" | "io.requests.coalesced" => {
-                    self.io_requests += counter.value()
-                }
-                "vortex.io.read.total_size" => self.bytes_read += counter.value(),
-                _ => {}
-            }
-        }
+    fn add_scan(&mut self, metrics: &datafusion::physical_plan::metrics::MetricsSet) {
+        let sum = |names: &[&str]| -> u64 {
+            (names.iter())
+                .filter_map(|name| metrics.sum_by_name(name))
+                .map(|count| count.as_usize() as u64)
+                .sum()
+        };
+        self.segment_requests += sum(&[
+            "vortex.file.segments.cache.hits",
+            "vortex.file.segments.cache.misses",
+        ]);
+        self.io_requests += sum(&["io.requests.individual", "io.requests.coalesced"]);
+        self.bytes_read += sum(&["vortex.io.read.total_size"]);
     }
 }
 
@@ -430,19 +427,15 @@ impl PlanIOVisitor {
                     self.parquet_rg_matched_stats =
                         metrics.sum_by_name("row_groups_matched_statistics");
                 }
+                // Vortex counts its reads in its own metrics, not the plan's; its finder adds
+                // them to the plan's. A scan has them once it has opened a Vortex file.
                 #[cfg(feature = "vortex")]
-                if let Some(source) = data_source_exec
-                    .data_source()
-                    .downcast_ref::<FileScanConfig>()
-                    .and_then(|config| {
-                        config
-                            .file_source()
-                            .downcast_ref::<vortex_datafusion::VortexSource>()
-                    })
+                for metrics in vortex_datafusion::metrics::VortexMetricsFinder::find_all(plan)
+                    .iter()
+                    .filter(|metrics| metrics.sum_by_name("vortex.io.read.total_size").is_some())
                 {
                     let vortex = self.vortex.get_or_insert_with(VortexScanStats::default);
-                    vortex.add_scan(source);
-                    // Vortex counts its reads in its own metrics, not the plan's.
+                    vortex.add_scan(metrics);
                     let bytes = datafusion::physical_plan::metrics::Count::new();
                     bytes.add(vortex.bytes_read as usize);
                     self.bytes_scanned = Some(MetricValue::Count {
