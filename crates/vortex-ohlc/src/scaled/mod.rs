@@ -698,8 +698,6 @@ impl CompareKernel for Scaled {
             return Ok(None);
         };
         let quotient = ConstantArray::new(quotient, rhs.len()).into_array();
-        #[cfg(test)]
-        tests::COMPARED.with(|compared| compared.set(compared.get() + 1));
         lhs.values()
             .binary(quotient, Operator::from(operator))
             .map(Some)
@@ -708,19 +706,12 @@ impl CompareKernel for Scaled {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::cell::Cell;
-
     use vortex::array::validity::Validity;
     use vortex::array::{Canonical, VortexSessionExecute};
     use vortex::dtype::DecimalDType;
 
     use super::*;
     use crate::testing::session;
-
-    thread_local! {
-        /// Comparisons the kernel answered on this thread, so a test can tell it did.
-        pub(crate) static COMPARED: Cell<usize> = const { Cell::new(0) };
-    }
 
     /// What a comparison is on numbers.
     pub(crate) type Holds = fn(i128, i128) -> bool;
@@ -752,20 +743,31 @@ pub(crate) mod tests {
         whole
     }
 
+    /// `array`, a Scaled array, against `constant` through Scaled's compare kernel, called
+    /// directly: where it holds, or `None` if the kernel leaves it to the decoded values.
+    pub(crate) fn kernel_compare(
+        array: &ArrayRef,
+        constant: i128,
+        operator: Operator,
+        ctx: &mut ExecutionCtx,
+    ) -> Option<Vec<bool>> {
+        let literal = from_i128(constant, &array.dtype().as_nonnullable()).unwrap();
+        let literal = ConstantArray::new(literal, array.len()).into_array();
+        let operator = CompareOperator::try_from(operator).unwrap();
+        let scaled = array.as_opt::<Scaled>().expect("a Scaled array");
+        let result =
+            <Scaled as CompareKernel>::compare(scaled, &literal, operator, ctx).unwrap()?;
+        let result = result.execute::<Mask>(ctx).unwrap();
+        Some((0..array.len()).map(|i| result.value(i)).collect())
+    }
+
     /// Compared with each of `constants`, filtered, sliced and taken, `array` (six values) gives
     /// what its decoded values do. With one divisor for every row, the kernel answers every
     /// comparison with a multiple of it, and all but = and != with another.
     fn operations_match_decoded(array: &ArrayRef, constants: &[i128], ctx: &mut ExecutionCtx) {
         let divisor = array.as_opt::<Scaled>().unwrap().divisor();
         let values = decoded(array, ctx);
-        let compared = COMPARED.with(Cell::get);
-        let mut answerable = 0;
         for &constant in constants {
-            answerable += match divisor.map(|divisor| constant % divisor == 0) {
-                Some(true) => 6,
-                Some(false) => 4,
-                None => 0,
-            };
             let literal = from_i128(constant, &array.dtype().as_nonnullable()).unwrap();
             for (operator, expected) in OPERATORS {
                 let literal = ConstantArray::new(literal.clone(), array.len()).into_array();
@@ -774,13 +776,15 @@ pub(crate) mod tests {
                 let expected: Vec<bool> = values.iter().map(|&v| expected(v, constant)).collect();
                 let result: Vec<bool> = (0..array.len()).map(|i| result.value(i)).collect();
                 assert_eq!(result, expected, "{operator:?} {constant}");
+                let answerable = divisor.is_some_and(|divisor| {
+                    constant % divisor == 0 || !matches!(operator, Operator::Eq | Operator::NotEq)
+                });
+                match kernel_compare(array, constant, operator, ctx) {
+                    Some(kernel) => assert_eq!(kernel, expected, "kernel: {operator:?} {constant}"),
+                    None => assert!(!answerable, "the kernel left {operator:?} {constant}"),
+                }
             }
         }
-        let compared = COMPARED.with(Cell::get) - compared;
-        assert!(
-            compared >= answerable,
-            "the kernel answered {compared} of {answerable}"
-        );
         let rows = |indices: &[usize]| indices.iter().map(|&i| values[i]).collect::<Vec<_>>();
         let mask = Mask::from_iter([true, false, true, true, false, true]);
         let filtered = array.filter(mask).unwrap();
