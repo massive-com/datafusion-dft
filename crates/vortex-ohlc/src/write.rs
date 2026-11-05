@@ -42,6 +42,18 @@ pub fn write_options(
     row_block: usize,
     dollar_volume_residual: bool,
 ) -> VortexWriteOptions {
+    write_options_zoned(session, row_block, row_block as u64, dollar_volume_residual)
+}
+
+/// [`write_options`], with the bars layout's zones (the prices' min and max, and the dollar
+/// volume's if it's a residual) every `zone_len` rows instead of once a chunk; the other columns'
+/// zone maps stay once a chunk.
+pub fn write_options_zoned(
+    session: &VortexSession,
+    row_block: usize,
+    zone_len: u64,
+    dollar_volume_residual: bool,
+) -> VortexWriteOptions {
     let compressor = BtrBlocksCompressorBuilder::from_session(session)
         .exclude_schemes([DecimalScheme::v1().id()])
         .with_new_scheme(&DecimalPow10Scheme);
@@ -50,8 +62,8 @@ pub fn write_options(
         .with_row_block_size(row_block)
         .with_data_block_target_bytes(None)
         .build();
-    let bars = BarsStrategy::new(strategy, row_block as u64)
-        .with_dollar_volume_residual(dollar_volume_residual);
+    let bars =
+        BarsStrategy::new(strategy, zone_len).with_dollar_volume_residual(dollar_volume_residual);
     session.write_options().with_strategy(Arc::new(bars))
 }
 
