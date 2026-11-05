@@ -33,16 +33,6 @@ use vortex::session::VortexSession;
 
 const _: () = assert!(FL_CHUNK_SIZE == FILTER_CHUNK_LEN);
 
-/// How often each kernel filtered an array, so tests can tell they ran.
-#[cfg(test)]
-static FILTERED: [std::sync::atomic::AtomicUsize; 2] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
-
-#[cfg(test)]
-fn count(kernel: usize) {
-    FILTERED[kernel].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Register the kernels on `session`, after Vortex's own.
 pub fn register(session: &VortexSession) {
     let kernels = session.kernels();
@@ -85,8 +75,6 @@ impl ExecuteParentKernel<BitPacked> for BlockedBitPackedFilter {
         });
         let validity = array.validity()?.filter(mask)?;
         let primitive = PrimitiveArray::from_byte_buffer(buffer, ptype, validity);
-        #[cfg(test)]
-        count(0);
         let patches = (array.patches())
             .map(|patches| patches.filter(mask, ctx))
             .transpose()?
@@ -220,8 +208,6 @@ impl ExecuteParentKernel<FoR> for BlockedForFilter {
             );
             PrimitiveArray::new(buffer, validity)
         });
-        #[cfg(test)]
-        count(1);
         Ok(Some(filtered.into_array()))
     }
 }
@@ -242,8 +228,10 @@ fn add_references<T: NativePType + WrappingAdd>(
 
 #[cfg(test)]
 mod tests {
-    use vortex::array::arrays::PrimitiveArray;
+    use vortex::array::arrays::{Filter, FilterArray, PrimitiveArray};
+    use vortex::array::kernel::ExecuteParentKernel;
     use vortex::array::validity::Validity;
+    use vortex::array::vtable::VTable;
     use vortex::array::{ArrayRef, IntoArray, VortexSessionExecute};
     use vortex::buffer::Buffer;
     use vortex::encodings::fastlanes::bitpack_compress::bitpack_blocked_to_best_bit_widths;
@@ -299,8 +287,27 @@ mod tests {
         }
     }
 
-    fn filtered(kernel: usize) -> usize {
-        super::FILTERED[kernel].load(std::sync::atomic::Ordering::Relaxed)
+    /// What `kernel` gives for `array` (of its encoding) filtered by each of [`masks`], called
+    /// directly: `None` if it leaves any of them to Vortex.
+    fn kernel_filters<V: VTable>(
+        kernel: &impl ExecuteParentKernel<V, Parent = Filter>,
+        array: &ArrayRef,
+        session: &VortexSession,
+    ) -> Option<Vec<ArrayRef>> {
+        let mut ctx = session.create_execution_ctx();
+        let child = array
+            .as_opt::<V>()
+            .expect("an array of the kernel's encoding");
+        (masks(array.len()).into_iter())
+            .map(|mask| {
+                // Unoptimized, as Vortex hands a kernel the filter of an array.
+                let parent = FilterArray::try_new(array.clone(), mask)
+                    .unwrap()
+                    .into_array();
+                let filter = parent.as_opt::<Filter>().unwrap();
+                kernel.execute_parent(child, filter, 0, &mut ctx).unwrap()
+            })
+            .collect()
     }
 
     fn session() -> VortexSession {
@@ -319,11 +326,11 @@ mod tests {
         let packed = bitpack_blocked_to_best_bit_widths(&array, &mut ctx).unwrap();
         assert!(!packed.bit_widths().is_global() && packed.patches().is_some());
         let packed = packed.into_array();
-        let before = filtered(0);
+        let filtered = kernel_filters(&super::BlockedBitPackedFilter, &packed, &session);
+        assert!(filtered.is_some(), "the kernel left a filter to Vortex");
         check(&session, &packed);
         // Sliced off a block boundary, so the array starts within its first block.
         check(&session, &packed.slice(700..4321).unwrap());
-        assert!(filtered(0) > before, "the kernel never ran");
     }
 
     #[test]
@@ -341,16 +348,20 @@ mod tests {
             .execute::<PrimitiveArray>(&mut ctx);
         let values = bitpack_blocked_to_best_bit_widths(&values.unwrap(), &mut ctx).unwrap();
         let references = chunked.blocked_references().unwrap().clone();
-        let packed = FoR::try_new_chunked(values.into_array(), references, 0).unwrap();
-        let before = [filtered(0), filtered(1)];
-        for array in [chunked.into_array(), packed.into_array()] {
+        let values = values.into_array();
+        let packed = FoR::try_new_chunked(values.clone(), references, 0)
+            .unwrap()
+            .into_array();
+        let filtered = kernel_filters(&super::BlockedForFilter, &packed, &session);
+        assert!(filtered.is_some(), "the FoR kernel left a filter to Vortex");
+        let below = kernel_filters(&super::BlockedBitPackedFilter, &values, &session);
+        assert!(
+            below.is_some(),
+            "the bit-packing kernel left a filter to Vortex"
+        );
+        for array in [chunked.into_array(), packed] {
             check(&session, &array);
             check(&session, &array.slice(700..4321).unwrap());
         }
-        assert!(filtered(1) > before[1], "the FoR kernel never ran");
-        assert!(
-            filtered(0) > before[0],
-            "the bit-packing kernel never ran below it"
-        );
     }
 }

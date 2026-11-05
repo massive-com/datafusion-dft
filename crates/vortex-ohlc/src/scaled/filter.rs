@@ -12,10 +12,6 @@ use vortex::mask::Mask;
 
 use super::{divisors, Divisors, Scaled, ScaledArrayExt, ScaledArraySlotsExt, BLOCK};
 
-/// Rows of a filter that ran this kernel, so tests can tell it did.
-#[cfg(test)]
-pub(super) static FILTERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 impl FilterKernel for Scaled {
     fn filter(
         array: ArrayView<'_, Self>,
@@ -47,8 +43,6 @@ impl FilterKernel for Scaled {
             }
             PrimitiveArray::new(values.freeze(), validity)
         });
-        #[cfg(test)]
-        FILTERED.fetch_add(selected.true_count(), std::sync::atomic::Ordering::Relaxed);
         let patches = (array.patches())
             .map(|patches| patches.filter(mask, ctx))
             .transpose()?
@@ -62,9 +56,8 @@ impl FilterKernel for Scaled {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-
-    use vortex::array::arrays::DecimalArray;
+    use vortex::array::arrays::filter::FilterKernel;
+    use vortex::array::arrays::{DecimalArray, PrimitiveArray};
     use vortex::array::validity::Validity;
     use vortex::array::{IntoArray, VortexSessionExecute};
     use vortex::buffer::Buffer;
@@ -72,7 +65,7 @@ mod tests {
     use vortex::dtype::DecimalDType;
     use vortex::mask::Mask;
 
-    use super::FILTERED;
+    use crate::scaled::Scaled;
 
     /// Prices in cents at a scale of 4, block by block around very different levels, with a
     /// sub-cent price now and then (Scaled's patches) and a few far outliers (the bit-packing's).
@@ -89,9 +82,9 @@ mod tests {
             .collect()
     }
 
-    /// A filter on a compressed decimal column reaches Scaled's kernel through its integer part,
-    /// and keeps what the values do: a few rows of some blocks, whole blocks, and the short last
-    /// block.
+    /// A compressed decimal column's integer part is Scaled, whose kernel filters it, and a filter
+    /// of the column keeps what the values do: a few rows of some blocks, whole blocks, and the
+    /// short last block.
     #[test]
     fn filter_matches_values() {
         let session = crate::testing::session();
@@ -112,15 +105,21 @@ mod tests {
             .chain([4999])
             .collect();
         let mask = Mask::from_indices(values.len(), rows.iter().copied());
-        let before = FILTERED.load(Ordering::Relaxed);
-        // As a scan filters: optimized, so that DecimalByteParts hands it to its integer part.
+        let want: Vec<i64> = rows.iter().map(|&row| values[row]).collect();
+        let part = (compressed.depth_first_traversal())
+            .find(|array| array.as_opt::<Scaled>().is_some())
+            .expect("a Scaled integer part");
+        let kept =
+            <Scaled as FilterKernel>::filter(part.as_opt::<Scaled>().unwrap(), &mask, &mut ctx)
+                .unwrap()
+                .expect("the kernel filters it");
+        let kept = kept.execute::<PrimitiveArray>(&mut ctx).unwrap();
+        assert_eq!(kept.as_slice::<i64>(), want);
         let filtered = compressed
             .filter(mask)
             .unwrap()
             .execute::<DecimalArray>(&mut ctx)
             .unwrap();
-        assert!(FILTERED.load(Ordering::Relaxed) > before, "the kernel ran");
-        let want: Vec<i64> = rows.iter().map(|&row| values[row]).collect();
         assert_eq!(filtered.buffer::<i64>().to_vec(), want);
     }
 }
