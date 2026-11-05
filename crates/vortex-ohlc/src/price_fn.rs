@@ -199,8 +199,6 @@ mod tests {
     use vortex::buffer::Buffer;
     use vortex::dtype::DecimalDType;
     use vortex::expr::root;
-    use vortex::session::VortexSession;
-    use vortex::VortexSessionDefault;
 
     use vortex::dtype::DecimalType;
 
@@ -213,8 +211,7 @@ mod tests {
     /// 0.5 higher, with a high 0.06 above that, in a `Decimal(18, 4)` source.
     #[test]
     fn scaled_parts_rebuild_in_i64() {
-        let session = VortexSession::default();
-        crate::register(&session);
+        let session = crate::testing::session();
         let mut ctx = session.create_execution_ctx();
         let part = |value: i32, scale: i8, k: u8| {
             let values = Buffer::from(vec![value]);
@@ -246,8 +243,7 @@ mod tests {
     /// parts rescaled by 17, takes 23 digits at the source's scale.
     #[test]
     fn wide_prices_rebuild_at_the_source_scale() {
-        let session = VortexSession::default();
-        crate::register(&session);
+        let session = crate::testing::session();
         let mut ctx = session.create_execution_ctx();
         let parts = DecimalDType::new(16, 1);
         let fields = Part::ALL.map(|part| {
