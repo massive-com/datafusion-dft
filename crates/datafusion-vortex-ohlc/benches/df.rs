@@ -2,7 +2,10 @@
 //! the Parquet v2 file (DataFusion's Parquet reader with its defaults, and with
 //! `pushdown_filters`), and against one over the Vortex file with the Parquet table's schema,
 //! read through Vortex's own format with vortex-ohlc registered (see `datafusion_vortex_ohlc`),
-//! with and without a `ZonePruner`. Each runs on one partition and on one per core.
+//! with and without a `ZonePruner`. Each runs on one partition on one thread, and on one
+//! partition per core with a thread per core. Vortex's scan spreads even one partition's splits
+//! over every worker of the runtime it runs on, where Parquet's reader keeps a partition on one
+//! thread, so one partition gets a runtime of its own with one worker.
 //!
 //! A needle selects every column of the rows it matches; each of its terms compares a column
 //! with a literal of the column's own type, so no format's filter is held back by a cast. The
@@ -289,7 +292,8 @@ fn sql_literal(value: Value, data_type: &DataType) -> String {
 
 /// What the benches run, and how: each reader that runs, at each number of partitions.
 struct Setup {
-    runtime: Runtime,
+    /// The runtime for each number of `partitions`: as many worker threads as partitions.
+    runtimes: [Runtime; 2],
     tables: Tables,
     partitions: [usize; 2],
     selection: Selection,
@@ -297,18 +301,28 @@ struct Setup {
 
 impl Setup {
     fn new() -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let tables = Tables::new(&runtime);
         let cores = std::thread::available_parallelism().unwrap().get();
+        let partitions = [1, cores];
+        let runtimes = partitions.map(|workers| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        let tables = Tables::new(&runtimes[1]);
         Self {
-            runtime,
+            runtimes,
             tables,
-            partitions: [1, cores],
+            partitions,
             selection: Selection::from_args(),
         }
+    }
+
+    /// The runtime to run `partitions` partitions on.
+    fn runtime(&self, partitions: usize) -> &Runtime {
+        let index = self.partitions.iter().position(|&p| p == partitions);
+        &self.runtimes[index.expect("a number of partitions the benches run")]
     }
 
     /// Check every reader of `sql` that runs (under `id/<reader>/<partitions>`) against Parquet
@@ -326,7 +340,7 @@ impl Setup {
         if runs.is_empty() {
             return;
         }
-        let rt = &self.runtime;
+        let rt = self.runtime(1);
         let baseline = self.tables.context(rt, Reader::Parquet, 1);
         let (expected, metrics) = rt.block_on(check(&baseline, sql));
         println!("{label}: {} rows; {sql}", expected.rows);
@@ -334,13 +348,14 @@ impl Setup {
         let mut contexts = Vec::new();
         for (reader, partitions) in runs {
             let name = format!("{}/{partitions}", reader.name());
+            let rt = self.runtime(partitions);
             let ctx = self.tables.context(rt, reader, partitions);
             let (actual, metrics) = rt.block_on(check(&ctx, sql));
             assert_eq!(actual, expected, "{label}: {name}");
             if (reader, partitions) != (Reader::Parquet, 1) {
                 println!("  {name}: {}", metrics.join(" "));
             }
-            contexts.push((name, ctx));
+            contexts.push((name, ctx, rt));
         }
 
         let mut group = c.benchmark_group(id);
@@ -352,7 +367,7 @@ impl Setup {
                 .warm_up_time(Duration::from_secs(1))
                 .measurement_time(Duration::from_secs(3));
         }
-        for (name, ctx) in contexts {
+        for (name, ctx, rt) in contexts {
             group.bench_function(name, |b| b.iter(|| rt.block_on(run(&ctx, sql))));
         }
         group.finish();
