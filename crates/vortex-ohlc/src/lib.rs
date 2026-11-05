@@ -25,6 +25,7 @@ use vortex::session::VortexSession;
 
 pub mod bars;
 pub mod blocked_for;
+mod decimal;
 pub mod edition;
 pub mod gcd;
 pub mod kernels;

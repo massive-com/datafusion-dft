@@ -26,6 +26,7 @@ use vortex::scalar_fn::{
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
+use crate::decimal::{checked_pow10, unscaled};
 use crate::scaled::decoded;
 
 /// The scalar function: its children are the residual, `a` and `b`, all decimals, with the
@@ -58,8 +59,7 @@ pub fn product_residual(
 /// `10^k`, for the `k` that brings `a × b`, at scales `a` and `b`, to the column's `scale`;
 /// `None` if it can't: the residual is only exact at a scale at least theirs.
 pub fn shift(scale: i8, a: i8, b: i8) -> Option<i128> {
-    let k = i32::from(scale) - i32::from(a) - i32::from(b);
-    10i128.checked_pow(u32::try_from(k).ok()?)
+    checked_pow10(i32::from(scale) - i32::from(a) - i32::from(b))
 }
 
 /// A chunk of a column and what the [`bars`](crate::bars) layout stores for it (see
@@ -79,10 +79,6 @@ pub(crate) fn residual(
     b: &DecimalArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Residual> {
-    let unscaled = |column: &DecimalArray, ctx: &mut ExecutionCtx| -> VortexResult<_> {
-        let valid = column.validity()?.execute_mask(column.len(), ctx)?;
-        Ok((converted_buffer::<i128>(column, &valid)?, valid))
-    };
     let (values, valid) = unscaled(column, ctx)?;
     let (a_values, a_valid) = unscaled(a, ctx)?;
     let (b_values, b_valid) = unscaled(b, ctx)?;
@@ -109,11 +105,6 @@ pub(crate) fn residual(
         valid,
         residual: residual.into_array(),
     })
-}
-
-/// `10^k`; `None` for a negative `k`, or one too big for an i128.
-fn pow10(k: i32) -> Option<i128> {
-    10i128.checked_pow(u32::try_from(k).ok()?)
 }
 
 /// Run `$body` with `$values` bound to `$array`'s unscaled values at their width if it's an i32,
@@ -259,9 +250,9 @@ impl ScalarFnVTable for ProductResidualFn {
         let b = decoded(args.get(2)?, ctx)?;
         let scale = i32::from(options.decimal.scale());
         let below = || vortex_err!("the column's scale is below its residual's or a × b's");
-        let r_factor = pow10(scale - i32::from(residual.scale())).ok_or_else(below)?;
+        let r_factor = checked_pow10(scale - i32::from(residual.scale())).ok_or_else(below)?;
         let product_factor =
-            pow10(scale - i32::from(a.scale()) - i32::from(b.scale())).ok_or_else(below)?;
+            checked_pow10(scale - i32::from(a.scale()) - i32::from(b.scale())).ok_or_else(below)?;
         let validity = residual.validity()?;
         let a_valid = a.validity()?.execute_mask(a.len(), ctx)?;
         let both_valid = &a_valid & &b.validity()?.execute_mask(b.len(), ctx)?;

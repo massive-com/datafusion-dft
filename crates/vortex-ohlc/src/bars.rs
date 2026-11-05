@@ -15,7 +15,6 @@ use async_trait::async_trait;
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
 use vortex::array::aggregate_fn::AggregateFnRef;
-use vortex::array::arrays::decimal::converted_buffer;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{DecimalArray, StructArray};
 use vortex::array::builtins::ArrayBuiltins;
@@ -47,6 +46,7 @@ use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
+use crate::decimal::unscaled;
 use crate::ohlc::{ohlc_to_parts, Part, Price};
 use crate::price_fn::{ohlc_price, OhlcPriceFn};
 use crate::product_residual::{product_residual, residual, shift};
@@ -466,14 +466,13 @@ fn stored_chunk(
     let len = table.len();
     let mut prices = Vec::with_capacity(Price::ALL.len());
     for price in Price::ALL {
-        let column = decimal_column(&table, price.name(), &mut ctx)?;
-        let valid = column.validity()?.execute_mask(len, &mut ctx)?;
+        let (values, valid) = unscaled(&decimal_column(&table, price.name(), &mut ctx)?, &mut ctx)?;
         vortex_ensure!(
             valid.all_true(),
             "{} has nulls, which the bars layout can't store yet",
             price.name()
         );
-        prices.push(converted_buffer::<i128>(&column, &valid)?);
+        prices.push(values);
     }
     let [open, high, low, close] = [&prices[0], &prices[1], &prices[2], &prices[3]];
     let valid = Mask::new_true(len);
