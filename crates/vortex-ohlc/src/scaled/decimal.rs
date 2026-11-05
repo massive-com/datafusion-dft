@@ -10,7 +10,7 @@
 //! scale), a chunk's quotients fit DecimalByteParts' integer part, and Pow10Scheme divides out
 //! what more a block shares.
 
-use vortex::array::arrays::decimal::{converted_buffer, narrowed_decimal};
+use vortex::array::arrays::decimal::narrowed_decimal;
 use vortex::array::arrays::DecimalArray;
 use vortex::array::vtable::VTable;
 use vortex::array::{ArrayId, ArrayRef, Canonical, ExecutionCtx, IntoArray};
@@ -28,6 +28,7 @@ use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 #[cfg(doc)]
 use super::Pow10Scheme;
 use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
+use crate::decimal::unscaled;
 
 /// `array` decoded, through a [`Scaled`] decimal divided by one `10^k` for every row to its
 /// values: the same numbers at `k` less scale, at the width they're stored at rather than an
@@ -69,8 +70,7 @@ pub fn chunk_exponent(decimal: &DecimalArray, ctx: &mut ExecutionCtx) -> VortexR
     let Ok(max) = u8::try_from(decimal.decimal_dtype().scale().clamp(0, 38)) else {
         return Ok(0);
     };
-    let valid = decimal.validity()?.execute_mask(decimal.len(), ctx)?;
-    let values = converted_buffer::<i128>(decimal, &valid)?;
+    let (values, valid) = unscaled(decimal, ctx)?;
     let mut k = max;
     for (i, &value) in values.iter().enumerate() {
         if !valid.value(i) {
@@ -89,9 +89,8 @@ pub fn chunk_exponent(decimal: &DecimalArray, ctx: &mut ExecutionCtx) -> VortexR
 /// `decimal`'s values divided by `10^k`, which they are all multiples of, at its dtype: the
 /// values of a [`Scaled`] decimal of the exponent `k`.
 fn divide(decimal: &DecimalArray, k: u8, ctx: &mut ExecutionCtx) -> VortexResult<DecimalArray> {
-    let valid = decimal.validity()?.execute_mask(decimal.len(), ctx)?;
     let factor = factor(k);
-    let values: Buffer<i128> = (converted_buffer::<i128>(decimal, &valid)?.iter())
+    let values: Buffer<i128> = (unscaled(decimal, ctx)?.0.iter())
         .map(|v| v / factor)
         .collect();
     Ok(DecimalArray::new(
