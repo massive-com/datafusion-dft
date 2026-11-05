@@ -16,6 +16,8 @@ datafusion-net = { optional = true, workspace = true }
 datafusion-udfs-wasm = { features = [
   "serde",
 ], optional = true, workspace = true }
+datafusion-vortex-ohlc = { optional = true, workspace = true }
+datafusion-vortex-prune = { optional = true, workspace = true }
 ###
 
 arrow-flight = { features = [
@@ -27,8 +29,6 @@ bytes.workspace = true
 color-eyre.workspace = true
 datafusion.workspace = true
 datafusion-functions-json = { optional = true, workspace = true }
-datafusion-vortex-ohlc = { optional = true, path = "../datafusion-vortex-ohlc" }
-datafusion-vortex-prune = { optional = true, path = "../datafusion-vortex-prune" }
 deltalake = { features = [
   "datafusion",
   "s3",

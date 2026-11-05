@@ -13,6 +13,10 @@ datafusion-functions-parquet = { path = "crates/datafusion-functions-parquet" }
 datafusion-functions-rocksdb = { path = "crates/datafusion-functions-rocksdb" }
 datafusion-net = { path = "crates/datafusion-net" }
 datafusion-udfs-wasm = { path = "crates/datafusion-udfs-wasm" }
+datafusion-vortex-ohlc = { path = "crates/datafusion-vortex-ohlc" }
+datafusion-vortex-prune = { path = "crates/datafusion-vortex-prune" }
+test-util = { path = "crates/test-util" }
+vortex-ohlc = { path = "crates/vortex-ohlc" }
 ###
 
 arrow = "59"
@@ -27,8 +31,8 @@ color-eyre = "0.6.3"
 criterion = "0.5.1"
 crossterm = "0.29"
 datafusion = "55"
-datafusion-session = "55"
 datafusion-functions-json = "0.55"
+datafusion-session = "55"
 deltalake = "1.1"
 directories = "5.0.1"
 dns-lookup = "3"
@@ -55,6 +59,7 @@ num-traits = "0.2"
 num_cpus = "1.16.0"
 opendal = "0.58.0"
 parquet = { default-features = false, features = ["arrow"], version = "59.2" }
+roaring = "0.11"
 # object_store_opendal 0.59 requires object_store 0.14; DataFusion 55 is still on
 # object_store 0.13, so stay on 0.58 until DataFusion moves to object_store 0.14.
 object_store = "0.13"

@@ -5,20 +5,22 @@ name = "datafusion-vortex-ohlc"
 version = "0.1.0"
 
 [dependencies]
+vortex-ohlc.workspace = true
+
 arrow.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 vortex.workspace = true
 vortex-datafusion.workspace = true
-vortex-ohlc = { path = "../vortex-ohlc" }
 
 [dev-dependencies]
+datafusion-vortex-prune.workspace = true
+test-util.workspace = true
+
 criterion.workspace = true
-datafusion-vortex-prune = { path = "../datafusion-vortex-prune" }
 parquet = { features = ["snap", "zstd"], workspace = true }
 regex.workspace = true
 tempfile.workspace = true
-test-util = { path = "../test-util" }
 tokio = { features = ["macros", "rt-multi-thread"], workspace = true }
 
 [lints]
