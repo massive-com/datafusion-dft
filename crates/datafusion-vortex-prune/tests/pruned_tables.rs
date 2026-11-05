@@ -23,6 +23,7 @@ use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexAccessPlan, VortexFormatFactory};
+use vortex_ohlc::bars::ProductResidual;
 
 use test_util::{source, write, write_zoned};
 
@@ -150,7 +151,11 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
 async fn coarse_and_fine_zones_prune_together() -> Result<()> {
     let source = source();
     let dir = tempfile::tempdir()?;
-    let ctx = bars_context(&write_zoned(&source, 1_024, true), &dir).await?;
+    let ctx = bars_context(
+        &write_zoned(&source, 1_024, vec![ProductResidual::dollar_volume()]),
+        &dir,
+    )
+    .await?;
     let cases = [
         // The first fine zone, where chunk zones would keep 2,048 rows.
         ("low < 20", Some(1_024), 500),

@@ -21,6 +21,7 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
+use vortex_ohlc::bars::ProductResidual;
 use vortex_ohlc::write::{arrays, write_options, DEFAULT_ROW_BLOCK};
 
 /// The month of minute bars the benches read: August 2006, every ticker from A to ZZ,
@@ -47,8 +48,9 @@ const DATA_DIR: &str = concat!(
 /// (`vortex_ohlc::scaled::DecimalPow10Scheme`), 25 since the dollar volume is stored as a residual
 /// against volume × open (`vortex_ohlc::product_residual`), 26 since the layout's metadata says
 /// whether it is, 27 since timestamps' seconds into the day are divided by their chunk's common
-/// divisor (`vortex_ohlc::gcd`). 9 to 16 were these steps in an earlier order.
-const VORTEX_VERSION: u32 = 27;
+/// divisor (`vortex_ohlc::gcd`), 28 since the layout's metadata names the columns stored as
+/// residuals and their factors. 9 to 16 were these steps in an earlier order.
+const VORTEX_VERSION: u32 = 28;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;
@@ -119,8 +121,12 @@ fn write_vortex(source: &Path, dest: &Path) {
         .unwrap();
     let schema = batches.schema();
     let arrays = arrays(&session, &schema, batches.map(|batch| batch.unwrap())).unwrap();
-    write_options(&session, DEFAULT_ROW_BLOCK, true)
-        .blocking(&runtime)
-        .write(BufWriter::new(File::create(dest).unwrap()), arrays)
-        .unwrap();
+    write_options(
+        &session,
+        DEFAULT_ROW_BLOCK,
+        vec![ProductResidual::dollar_volume()],
+    )
+    .blocking(&runtime)
+    .write(BufWriter::new(File::create(dest).unwrap()), arrays)
+    .unwrap();
 }

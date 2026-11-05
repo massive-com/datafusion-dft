@@ -12,6 +12,7 @@ use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
+use vortex_ohlc::bars::ProductResidual;
 use vortex_ohlc::write::{arrays, write_options_zoned};
 
 pub const ROWS: usize = 5_000;
@@ -100,17 +101,21 @@ pub fn source() -> RecordBatch {
 /// `source` written in 1,000-row batches and `ROW_BLOCK`-row chunks, under the bars layout (see
 /// [`write_options`]), with its dollar volume stored as a residual.
 pub fn write(source: &RecordBatch) -> Vec<u8> {
-    write_with_residual(source, true)
+    write_with_residuals(source, vec![ProductResidual::dollar_volume()])
 }
 
-/// [`write`], with the dollar volume stored as a residual or not.
-pub fn write_with_residual(source: &RecordBatch, dollar_volume_residual: bool) -> Vec<u8> {
-    write_zoned(source, ROW_BLOCK as u64, dollar_volume_residual)
+/// [`write`], with the columns of `residuals` stored as residuals instead.
+pub fn write_with_residuals(source: &RecordBatch, residuals: Vec<ProductResidual>) -> Vec<u8> {
+    write_zoned(source, ROW_BLOCK as u64, residuals)
 }
 
-/// [`write_with_residual`], with the bars layout's zones every `zone_len` rows (see
+/// [`write_with_residuals`], with the bars layout's zones every `zone_len` rows (see
 /// [`write_options_zoned`]).
-pub fn write_zoned(source: &RecordBatch, zone_len: u64, dollar_volume_residual: bool) -> Vec<u8> {
+pub fn write_zoned(
+    source: &RecordBatch,
+    zone_len: u64,
+    residuals: Vec<ProductResidual>,
+) -> Vec<u8> {
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::edition::enable(&session).unwrap();
@@ -121,7 +126,7 @@ pub fn write_zoned(source: &RecordBatch, zone_len: u64, dollar_volume_residual: 
         .collect();
     let arrays = arrays(&session, &source.schema(), batches).unwrap();
     let mut bytes = Vec::new();
-    write_options_zoned(&session, ROW_BLOCK, zone_len, dollar_volume_residual)
+    write_options_zoned(&session, ROW_BLOCK, zone_len, residuals)
         .blocking(&runtime)
         .write(&mut bytes, arrays)
         .unwrap();
