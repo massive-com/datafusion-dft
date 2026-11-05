@@ -13,7 +13,7 @@ use std::mem::MaybeUninit;
 use fastlanes::BitPacking;
 use num_traits::{AsPrimitive, WrappingAdd};
 use vortex::array::arrays::filter::{filter_chunked, ChunkDecoder, FILTER_CHUNK_LEN};
-use vortex::array::arrays::{Filter, PrimitiveArray};
+use vortex::array::arrays::{Filter, PrimitiveArray, Slice};
 use vortex::array::kernel::ExecuteParentKernel;
 use vortex::array::matcher::Matcher;
 use vortex::array::optimizer::kernels::ArrayKernelsExt;
@@ -38,6 +38,7 @@ pub fn register(session: &VortexSession) {
     let kernels = session.kernels();
     kernels.register_execute_parent_kernel(Filter.id(), BitPacked, BlockedBitPackedFilter);
     kernels.register_execute_parent_kernel(Filter.id(), FoR, BlockedForFilter);
+    kernels.register_execute_parent_kernel(Slice.id(), BitPacked, BlockedBitPackedSlice);
 }
 
 /// Filters a bit-packed array with a bit width per block, unpacking only the blocks that hold
@@ -83,6 +84,62 @@ impl ExecuteParentKernel<BitPacked> for BlockedBitPackedFilter {
             Some(patches) => primitive.patch(&patches, ctx)?.into_array(),
             None => primitive.into_array(),
         }))
+    }
+}
+
+/// Slices a bit-packed array with a bit width per block without decoding it, as Vortex slices
+/// one with a single width: the blocks the range covers, by their byte boundaries, with the
+/// range's start in its first block as the offset, and the patches and validity sliced alike.
+/// Executing the slice then unpacks only those blocks. A slice of more than half the blocks is
+/// left to Vortex, which decodes the whole array and slices that: under blocked FoR, a whole array
+/// takes FoR's fused decode, and scans, which slice chunks at their splits, ran 2% to 5% slower
+/// single-threaded without that (measured on the bench, 2026-11-05).
+///
+/// *Upstream*: drafted as `site/upstream/fastlanes-blocked-slice/ISSUE.md`; once fastlanes slices
+/// blocked widths itself, this can go.
+#[derive(Debug)]
+pub struct BlockedBitPackedSlice;
+
+impl ExecuteParentKernel<BitPacked> for BlockedBitPackedSlice {
+    type Parent = Slice;
+
+    fn execute_parent(
+        &self,
+        array: ArrayView<'_, BitPacked>,
+        parent: <Self::Parent as Matcher>::Match<'_>,
+        _child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        let BitWidthsView::Blocked(offsets_array) = array.bit_widths() else {
+            return Ok(None);
+        };
+        let range = parent.slice_range().clone();
+        let start = range.start + usize::from(array.offset());
+        let end = range.end + usize::from(array.offset());
+        let blocks = start / FL_CHUNK_SIZE..end.div_ceil(FL_CHUNK_SIZE);
+        let all = (array.len() + usize::from(array.offset())).div_ceil(FL_CHUNK_SIZE);
+        if 2 * blocks.len() > all {
+            return Ok(None);
+        }
+        let offsets = block_offsets(array, offsets_array, ctx)?;
+        let bytes = (offsets[blocks.start] - offsets[0]) as usize
+            ..(offsets[blocks.end] - offsets[0]) as usize;
+        let patches = (array.patches())
+            .map(|patches| patches.slice(range.clone()))
+            .transpose()?
+            .flatten();
+        Ok(Some(
+            BitPacked::try_new_with_block_offsets(
+                array.packed().slice(bytes),
+                array.dtype().as_ptype(),
+                array.validity()?.slice(range.clone())?,
+                patches,
+                offsets_array.slice(blocks.start..blocks.end + 1)?,
+                range.len(),
+                (start % FL_CHUNK_SIZE) as u16,
+            )?
+            .into_array(),
+        ))
     }
 }
 
@@ -228,14 +285,18 @@ fn add_references<T: NativePType + WrappingAdd>(
 
 #[cfg(test)]
 mod tests {
-    use vortex::array::arrays::{Filter, FilterArray, PrimitiveArray};
+    use std::ops::Range;
+
+    use vortex::array::arrays::{Filter, FilterArray, PrimitiveArray, Slice, SliceArray};
     use vortex::array::kernel::ExecuteParentKernel;
     use vortex::array::validity::Validity;
     use vortex::array::vtable::VTable;
     use vortex::array::{ArrayRef, IntoArray, VortexSessionExecute};
     use vortex::buffer::Buffer;
     use vortex::encodings::fastlanes::bitpack_compress::bitpack_blocked_to_best_bit_widths;
-    use vortex::encodings::fastlanes::{BitPackedArrayExt, FoR, FoRArrayExt, FoRArraySlotsExt};
+    use vortex::encodings::fastlanes::{
+        BitPacked, BitPackedArrayExt, FoR, FoRArrayExt, FoRArraySlotsExt,
+    };
     use vortex::mask::Mask;
     use vortex::session::VortexSession;
     use vortex::VortexSessionDefault;
@@ -331,6 +392,94 @@ mod tests {
         check(&session, &packed);
         // Sliced off a block boundary, so the array starts within its first block.
         check(&session, &packed.slice(700..4321).unwrap());
+    }
+
+    /// What [`super::BlockedBitPackedSlice`] gives for `array`, bit-packed, sliced to `range`:
+    /// called directly on an unoptimized slice, as Vortex hands a kernel one.
+    fn kernel_slice(
+        array: &ArrayRef,
+        range: Range<usize>,
+        session: &VortexSession,
+    ) -> Option<ArrayRef> {
+        let mut ctx = session.create_execution_ctx();
+        let parent = SliceArray::try_new(array.clone(), range)
+            .unwrap()
+            .into_array();
+        let slice = parent.as_opt::<Slice>().unwrap();
+        let child = array.as_opt::<BitPacked>().expect("a bit-packed array");
+        (super::BlockedBitPackedSlice)
+            .execute_parent(child, slice, 0, &mut ctx)
+            .unwrap()
+    }
+
+    /// Slices of blocked bit-packing, with nulls and patches, alone and under blocked FoR, give
+    /// what slicing the decoded values does: on block boundaries, within one block, across
+    /// several off their boundaries, to the end, and a slice of a slice. The kernel takes the
+    /// slices of at most half the blocks and leaves the others to Vortex.
+    #[test]
+    fn blocked_bit_packing_slices_as_decoded() {
+        let session = session();
+        let mut ctx = session.create_execution_ctx();
+        let len = 5000;
+        let validity = Validity::from_iter((0..len).map(|i| i % 13 != 0));
+        let array = PrimitiveArray::new(Buffer::from_iter(values(len)), validity);
+        let packed = bitpack_blocked_to_best_bit_widths(&array, &mut ctx).unwrap();
+        assert!(!packed.bit_widths().is_global() && packed.patches().is_some());
+        let packed = packed.into_array();
+        let chunked = FoR::encode_chunked(
+            PrimitiveArray::new(Buffer::from_iter(values(len)), Validity::NonNullable),
+            &mut ctx,
+        )
+        .unwrap();
+        let residuals = chunked
+            .encoded()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .unwrap();
+        let residuals = bitpack_blocked_to_best_bit_widths(&residuals, &mut ctx).unwrap();
+        let references = chunked.blocked_references().unwrap().clone();
+        let for_ = FoR::try_new_chunked(residuals.into_array(), references, 0).unwrap();
+        let ranges = [
+            1024..3072,
+            100..900,
+            2100..2200,
+            700..4321,
+            3000..5000,
+            0..5000,
+        ];
+        let values = |array: ArrayRef, ctx: &mut _| {
+            let array = array.execute::<PrimitiveArray>(ctx).unwrap();
+            let validity = array.validity().unwrap();
+            let validity = validity.execute_mask(array.len(), ctx).unwrap();
+            (array.as_slice::<u32>().to_vec(), validity)
+        };
+        for array in [packed.clone(), for_.into_array()] {
+            let decoded = array.clone().execute::<PrimitiveArray>(&mut ctx).unwrap();
+            for range in ranges.clone() {
+                let sliced = array.slice(range.clone()).unwrap();
+                let expected = decoded.clone().into_array().slice(range.clone()).unwrap();
+                let within = range.len() / 5..range.len().min(2000);
+                let nested = sliced.slice(within.clone()).unwrap();
+                let nested_expected = expected.slice(within).unwrap();
+                for (actual, expected) in [(sliced, expected), (nested, nested_expected)] {
+                    let expected = values(expected, &mut ctx);
+                    assert_eq!(values(actual, &mut ctx), expected, "{range:?}");
+                }
+            }
+        }
+        let decoded = packed.clone().execute::<PrimitiveArray>(&mut ctx).unwrap();
+        for range in ranges {
+            let blocks = range.end.div_ceil(1024) - range.start / 1024;
+            match kernel_slice(&packed, range.clone(), &session) {
+                Some(sliced) => {
+                    assert!(2 * blocks <= 5, "the kernel sliced {range:?}");
+                    let expected = decoded.clone().into_array().slice(range.clone()).unwrap();
+                    let expected = values(expected, &mut ctx);
+                    assert_eq!(values(sliced, &mut ctx), expected, "{range:?}");
+                }
+                None => assert!(2 * blocks > 5, "the kernel left {range:?}"),
+            }
+        }
     }
 
     #[test]
