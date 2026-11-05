@@ -5,7 +5,9 @@
 //! with and without a `ZonePruner`. Each runs on one partition on one thread, and on one
 //! partition per core with a thread per core. Vortex's scan spreads even one partition's splits
 //! over every worker of the runtime it runs on, where Parquet's reader keeps a partition on one
-//! thread, so one partition gets a runtime of its own with one worker.
+//! thread, so one partition runs on a current-thread runtime: the scan's tasks and the operators
+//! above it on the bench's own thread. (A runtime with one
+//! worker still splits them over two threads: the worker, and the one that polls the plan.)
 //!
 //! A needle selects every column of the rows it matches; each of its terms compares a column
 //! with a literal of the column's own type, so no format's filter is held back by a cast. The
@@ -292,7 +294,7 @@ fn sql_literal(value: Value, data_type: &DataType) -> String {
 
 /// What the benches run, and how: each reader that runs, at each number of partitions.
 struct Setup {
-    /// The runtime for each number of `partitions`: as many worker threads as partitions.
+    /// The runtime for each number of `partitions`: as many threads as partitions.
     runtimes: [Runtime; 2],
     tables: Tables,
     partitions: [usize; 2],
@@ -303,9 +305,13 @@ impl Setup {
     fn new() -> Self {
         let cores = std::thread::available_parallelism().unwrap().get();
         let partitions = [1, cores];
-        let runtimes = partitions.map(|workers| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(workers)
+        let runtimes = partitions.map(|threads| {
+            let mut builder = match threads {
+                1 => tokio::runtime::Builder::new_current_thread(),
+                _ => tokio::runtime::Builder::new_multi_thread(),
+            };
+            builder
+                .worker_threads(threads)
                 .enable_all()
                 .build()
                 .unwrap()
