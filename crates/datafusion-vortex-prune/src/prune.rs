@@ -35,6 +35,12 @@
 //! - a price, and a dollar volume stored as a residual, have the min and max the bars layout keeps
 //!   for them (`vortex_ohlc::bars`'s `source_zones`), the source's own.
 //!
+//! Columns may have zones of different lengths, the bars layout's prices every 1024 rows, say,
+//! and the other columns once a chunk, as long as each length is a whole multiple of the
+//! shortest. A filter is pruned on the shortest zones: a column with longer ones has each of its
+//! zones' bounds for every short zone in it. So `ticker = 'AAPL' AND close > 67` rules out short
+//! zones by their close and long ones by their ticker.
+//!
 //! [`ZonePruner::prune`] reads the zone maps it doesn't have yet and waits for them, so every
 //! query is pruned. It reads them through a [`VortexReaderFactory`], the one the scans read their
 //! data with, so the reads go wherever the data's do (S3, a disk cache in front of it, or a local
@@ -46,8 +52,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::cast::AsArray;
-use arrow::array::{Array, ArrayRef, BooleanArray, StructArray};
-use arrow::compute::{cast, nullif};
+use arrow::array::{Array, ArrayRef, BooleanArray, StructArray, UInt32Array};
+use arrow::compute::{cast, nullif, take};
 use arrow::datatypes::Schema;
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::{Column, DataFusionError, Result, ScalarValue};
@@ -247,14 +253,15 @@ fn find_zoned(layout: &LayoutRef) -> VortexResult<Option<LayoutRef>> {
 }
 
 /// The rows in the zones of a file with the zone maps `zones` that `predicate` (over `table`,
-/// the table's schema) can match; `None` to scan it whole: it has no zone maps, the predicate
-/// can't rule any zone out, or it keeps too many to be worth it.
+/// the table's schema) can match, pruned on its shortest zones (see the module docs); `None` to
+/// scan it whole: it has no zone maps, the predicate can't rule any zone out, or it keeps too
+/// many to be worth it.
 fn selection(
     zones: &FileZones,
     predicate: &Arc<dyn PhysicalExpr>,
     table: &Arc<Schema>,
 ) -> Result<Option<Selection>> {
-    let Some((zone_len, nzones)) = zones.shape else {
+    let Some(zone_len) = zones.columns.values().map(|column| column.zone_len).min() else {
         return Ok(None);
     };
     let pruning = PruningPredicateBuilder::new()
@@ -266,7 +273,8 @@ fn selection(
     let stats = ZoneStatistics {
         zones,
         table,
-        nzones,
+        zone_len,
+        nzones: zones.row_count.div_ceil(zone_len) as usize,
         error: RefCell::new(None),
     };
     let keep = pruning.prune(&stats)?;
@@ -286,33 +294,49 @@ fn selection(
 }
 
 /// A file's zone maps, as of its size and modification time (in `meta`): every zoned column's
-/// min and max per zone, as Arrow arrays of its stored type, null where the zone map has no
-/// bound. A column is named by its path, `ohlc.open` for a part, and a price by its name.
+/// zones. A column is named by its path, `ohlc.open` for a part, and a price by its name. No
+/// columns if the file has no zone maps.
 struct FileZones {
     meta: ObjectMeta,
     /// What the min and max arrays take in memory, as the cache weighs them.
     bytes: u32,
-    /// The rows per zone and the zones every column has; `None` if the file has no zone maps.
-    shape: Option<(u64, usize)>,
     row_count: u64,
-    columns: HashMap<String, (ArrayRef, ArrayRef)>,
+    columns: HashMap<String, ColumnZones>,
+}
+
+/// A column's zones: their length in rows, and the min and max per zone, as Arrow arrays of its
+/// stored type, null where the zone map has no bound.
+struct ColumnZones {
+    zone_len: u64,
+    min: ArrayRef,
+    max: ArrayRef,
 }
 
 impl FileZones {
-    /// Every zoned column's zone map in `file`: an error if one can't be read, or unless they
-    /// all have the same zones.
+    /// Every zoned column's zone map in `file`: an error if one can't be read, or doesn't have
+    /// a zone for every `zone_len` rows of the file.
     async fn read(
         session: &VortexSession,
         file: &VortexFile,
         meta: ObjectMeta,
     ) -> VortexResult<Self> {
+        let row_count = file.row_count();
+        let mut columns = HashMap::new();
+        let mut add = |path: String, zone_len: u64, (min, max): (ArrayRef, ArrayRef)| {
+            let nzones = row_count.div_ceil(zone_len) as usize;
+            if zone_len == 0 || min.len() != nzones || max.len() != nzones {
+                return Err(vortex_err!(
+                    "{path} has {} zones of {zone_len} rows for {row_count} rows",
+                    min.len()
+                ));
+            }
+            columns.insert(path, ColumnZones { zone_len, min, max });
+            Ok(())
+        };
         // Under a bars layout, the zone maps are the stored table's, by its columns, and the
         // prices' are the layout's own.
         let mut root_layout = Arc::clone(file.footer().layout());
-        let mut columns = HashMap::new();
-        let mut shape = None;
         if let Some((zones, zone_len)) = source_zones(&root_layout)? {
-            shape = Some((zone_len, zones.row_count() as usize));
             let table = read_table(session, file, "zones", &zones).await?;
             // A min and a max per column: the prices, and the dollar volume if it's stored as a
             // residual.
@@ -326,7 +350,7 @@ impl FileZones {
                         .ok_or_else(|| vortex_err!("the bars layout has no {bound}"))
                 };
                 let bounds = (bound(false)?, bound(true)?);
-                columns.insert(name, bounds);
+                add(name, zone_len, bounds)?;
             }
             root_layout = data_child(&root_layout)?;
         }
@@ -363,23 +387,19 @@ impl FileZones {
             let typed = layout
                 .as_opt::<Zoned>()
                 .ok_or_else(|| vortex_err!("{path} is not zoned"))?;
-            let this = (typed.zone_len() as u64, typed.nzones());
-            if *shape.get_or_insert(this) != this {
-                return Err(vortex_err!("{path} has zones of its own"));
-            }
+            let zone_len = typed.zone_len() as u64;
             let zones = Arc::clone(&layout.children()?[1]);
             let bounds = read_zone_map(session, file, &path, &zones).await?;
-            columns.insert(path, bounds);
+            add(path, zone_len, bounds)?;
         }
         let bytes = (columns.values())
-            .map(|(min, max)| min.get_array_memory_size() + max.get_array_memory_size())
+            .map(|zones| zones.min.get_array_memory_size() + zones.max.get_array_memory_size())
             .sum::<usize>();
         Ok(Self {
             meta,
             // The cache's weight saturates; a file's zone maps never come near 4 GiB.
             bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
-            shape,
-            row_count: file.row_count(),
+            row_count,
             columns,
         })
     }
@@ -455,11 +475,13 @@ async fn read_table(
     Ok(table.as_struct().clone())
 }
 
-/// A file's zone maps as DataFusion's statistics over the table's columns, a zone a container.
-/// `PruningStatistics` can't return an error, so the first one is kept for [`selection`].
+/// A file's zone maps as DataFusion's statistics over the table's columns, a zone of `zone_len`
+/// rows a container: a column with longer zones has each zone's bounds for every one of these in
+/// it. `PruningStatistics` can't return an error, so the first one is kept for [`selection`].
 struct ZoneStatistics<'a> {
     zones: &'a FileZones,
     table: &'a Schema,
+    zone_len: u64,
     nzones: usize,
     error: RefCell<Option<DataFusionError>>,
 }
@@ -469,15 +491,36 @@ impl ZoneStatistics<'_> {
     /// if the table or the file's zone maps don't have the column.
     fn bound(&self, column: &Column, max: bool) -> Option<ArrayRef> {
         let (_, field) = self.table.column_with_name(&column.name)?;
-        let (min_values, max_values) = self.zones.columns.get(&column.name)?;
-        let stored = if max { max_values } else { min_values };
-        match cast(stored, field.data_type()) {
+        let zones = self.zones.columns.get(&column.name)?;
+        let stored = if max { &zones.max } else { &zones.min };
+        let bound = self
+            .on_zones(stored, zones.zone_len)
+            .and_then(|bound| Ok(cast(&bound, field.data_type())?));
+        match bound {
             Ok(bound) => Some(bound),
             Err(err) => {
-                (self.error.borrow_mut()).get_or_insert(DataFusionError::from(err));
+                self.error.borrow_mut().get_or_insert(err);
                 None
             }
         }
+    }
+
+    /// `bounds`, one per zone of `zone_len` rows, one per zone of [`Self::zone_len`] rows.
+    fn on_zones(&self, bounds: &ArrayRef, zone_len: u64) -> Result<ArrayRef> {
+        if !zone_len.is_multiple_of(self.zone_len) {
+            return Err(DataFusionError::Internal(format!(
+                "zones of {zone_len} rows aren't made of zones of {}",
+                self.zone_len
+            )));
+        }
+        let per = zone_len / self.zone_len;
+        if per == 1 {
+            return Ok(Arc::clone(bounds));
+        }
+        let indices: UInt32Array = (0..self.nzones as u64)
+            .map(|zone| (zone / per) as u32)
+            .collect();
+        Ok(take(bounds, &indices, None)?)
     }
 }
 

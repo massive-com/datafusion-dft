@@ -19,11 +19,12 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_vortex_prune::{enable_url_table, PrunedTable, PrunedTableFactory, ZonePruner};
+use vortex::scan::selection::Selection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 use vortex_datafusion::{VortexAccessPlan, VortexFormatFactory};
 
-use test_util::{source, write};
+use test_util::{source, write, write_zoned};
 
 /// For each file of each Vortex scan in `plan`, whether it was given a selection.
 fn selected(plan: &Arc<dyn ExecutionPlan>) -> Vec<bool> {
@@ -43,14 +44,34 @@ fn selected(plan: &Arc<dyn ExecutionPlan>) -> Vec<bool> {
     selected
 }
 
-#[tokio::test]
-async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
-    let source = source();
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("bars.vortex");
-    std::fs::write(&path, write(&source))?;
+/// For each file of each Vortex scan in `plan`, how many rows its selection keeps, if it was
+/// given one.
+fn selected_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<Option<u64>> {
+    let mut selected = Vec::new();
+    plan.apply(|node| {
+        let conf = node
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>());
+        let groups = conf.iter().flat_map(|conf| conf.file_groups.iter());
+        for file in groups.flat_map(|group| group.iter()) {
+            let plan = file.extensions.get::<VortexAccessPlan>();
+            selected.push(match plan.and_then(VortexAccessPlan::selection) {
+                Some(Selection::IncludeRoaring(rows)) => Some(rows.len()),
+                Some(other) => panic!("a selection of included rows, not {other:?}"),
+                None => None,
+            });
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    selected
+}
 
-    // One partition, so the rows come back in the file's order.
+/// A session on one partition, so the rows come back in the file's order, with `bars` the file
+/// `bytes` (written to `dir`) read through Vortex and pruned by a [`ZonePruner`].
+async fn bars_context(bytes: &[u8], dir: &tempfile::TempDir) -> Result<SessionContext> {
+    let path = dir.path().join("bars.vortex");
+    std::fs::write(&path, bytes)?;
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     let state = ctx.state();
     let session = VortexSession::default();
@@ -66,6 +87,14 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
     let pruner = Arc::new(ZonePruner::new(session));
     let table = PrunedTable::over(&listing, &state, pruner)?;
     ctx.register_table("bars", Arc::new(table))?;
+    Ok(ctx)
+}
+
+#[tokio::test]
+async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
+    let source = source();
+    let dir = tempfile::tempdir()?;
+    let ctx = bars_context(&write(&source), &dir).await?;
 
     // The source's types and values: the bars layout rebuilds the prices from their parts and the
     // dollar volume from its residual, and stores the rest as it is.
@@ -109,6 +138,35 @@ async fn a_vortex_ohlc_file_is_read_and_pruned() -> Result<()> {
         let plan = query.clone().create_physical_plan().await?;
         assert_eq!(selected(&plan), [true], "{filter}");
         assert_eq!(query.count().await?, 500, "{filter}");
+    }
+    Ok(())
+}
+
+/// With the prices' zones every 1,024 rows and the other columns' once a 2,048-row chunk, a
+/// filter is pruned on 1,024-row zones: the prices' own, and the ticker's repeated over each half
+/// of its chunk. Ticker `t` has rows `500t..500t + 500`, and only the first ticker's lows are
+/// this low.
+#[tokio::test]
+async fn coarse_and_fine_zones_prune_together() -> Result<()> {
+    let source = source();
+    let dir = tempfile::tempdir()?;
+    let ctx = bars_context(&write_zoned(&source, 1_024, true), &dir).await?;
+    let cases = [
+        // The first fine zone, where chunk zones would keep 2,048 rows.
+        ("low < 20", Some(1_024), 500),
+        ("ticker = 'T0' AND low < 20", Some(1_024), 500),
+        // T9's chunk (rows 4,096 to 5,000) holds no such low, the fine zone that does no T9.
+        ("ticker = 'T9' AND low < 20", Some(0), 0),
+        // Chunk zones alone: the last chunk.
+        ("ticker = 'T9'", Some(904), 500),
+    ];
+    for (filter, rows, count) in cases {
+        let query = ctx
+            .sql(&format!("SELECT * FROM bars WHERE {filter}"))
+            .await?;
+        let plan = query.clone().create_physical_plan().await?;
+        assert_eq!(selected_rows(&plan), [rows], "{filter}");
+        assert_eq!(query.count().await?, count, "{filter}");
     }
     Ok(())
 }
