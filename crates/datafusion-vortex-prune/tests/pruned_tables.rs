@@ -27,9 +27,9 @@ use vortex_ohlc::bars::ProductResidual;
 
 use test_util::{source, write, write_zoned};
 
-/// For each file of each Vortex scan in `plan`, whether it was given a selection.
-fn selected(plan: &Arc<dyn ExecutionPlan>) -> Vec<bool> {
-    let mut selected = Vec::new();
+/// For each file of each Vortex scan in `plan`, the selection it was given, if any.
+fn selections(plan: &Arc<dyn ExecutionPlan>) -> Vec<Option<Selection>> {
+    let mut selections = Vec::new();
     plan.apply(|node| {
         let conf = node
             .downcast_ref::<DataSourceExec>()
@@ -37,35 +37,29 @@ fn selected(plan: &Arc<dyn ExecutionPlan>) -> Vec<bool> {
         let groups = conf.iter().flat_map(|conf| conf.file_groups.iter());
         for file in groups.flat_map(|group| group.iter()) {
             let plan = file.extensions.get::<VortexAccessPlan>();
-            selected.push(plan.and_then(VortexAccessPlan::selection).is_some());
+            selections.push(plan.and_then(VortexAccessPlan::selection).cloned());
         }
         Ok(TreeNodeRecursion::Continue)
     })
     .unwrap();
-    selected
+    selections
+}
+
+/// For each file of each Vortex scan in `plan`, whether it was given a selection.
+fn selected(plan: &Arc<dyn ExecutionPlan>) -> Vec<bool> {
+    selections(plan).iter().map(Option::is_some).collect()
 }
 
 /// For each file of each Vortex scan in `plan`, how many rows its selection keeps, if it was
 /// given one.
 fn selected_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<Option<u64>> {
-    let mut selected = Vec::new();
-    plan.apply(|node| {
-        let conf = node
-            .downcast_ref::<DataSourceExec>()
-            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>());
-        let groups = conf.iter().flat_map(|conf| conf.file_groups.iter());
-        for file in groups.flat_map(|group| group.iter()) {
-            let plan = file.extensions.get::<VortexAccessPlan>();
-            selected.push(match plan.and_then(VortexAccessPlan::selection) {
-                Some(Selection::IncludeRoaring(rows)) => Some(rows.len()),
-                Some(other) => panic!("a selection of included rows, not {other:?}"),
-                None => None,
-            });
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })
-    .unwrap();
-    selected
+    (selections(plan).into_iter())
+        .map(|selection| match selection {
+            Some(Selection::IncludeRoaring(rows)) => Some(rows.len()),
+            Some(other) => panic!("a selection of included rows, not {other:?}"),
+            None => None,
+        })
+        .collect()
 }
 
 /// A session on one partition, so the rows come back in the file's order, with `bars` the file
