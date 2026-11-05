@@ -8,7 +8,8 @@
 //! - [`write`](mod@write): the options to write a table with.
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
 //! - [`kernels`]: filters on those blocked encodings that unpack only the blocks they keep.
-//! - [`scaled`]: integers divided, a block at a time, by a power of ten the block shares.
+//! - [`scaled`]: integers and decimals divided by powers of a base, a block or a whole array at a
+//!   time: by a power of ten each block of a decimal's integer part shares.
 //! - [`blocked_for`]: a reference and a bit width per block for decimals, where that pays.
 //!
 //! Reading the files from DataFusion is datafusion-vortex-ohlc's, and pruning scans on the zone
@@ -24,6 +25,9 @@ pub mod ohlc;
 pub mod price_fn;
 pub mod scaled;
 pub mod write;
+
+#[cfg(test)]
+mod testing;
 
 /// Register what a session needs to read vortex-ohlc's files, and to read them well: the
 /// [`bars`] layout and its price function, the [`scaled`] encoding, the filter [`kernels`], and

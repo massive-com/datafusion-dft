@@ -1,4 +1,5 @@
-//! Choosing each block's exponent, and dividing by it.
+//! Choosing each block's power of ten, and dividing by it: [`Scaled`] in base 10 with an exponent
+//! per block, as [`Pow10Scheme`](super::Pow10Scheme) writes it.
 
 use num_traits::{AsPrimitive, CheckedMul, PrimInt};
 use vortex::array::arrays::primitive::PrimitiveArrayExt;
@@ -57,11 +58,14 @@ pub(super) fn scaled_encode_with(
             }
         };
         let quotients = PrimitiveArray::new(divided.quotients, array.validity()?);
-        let exponents = Buffer::copy_from(exponents).into_array();
-        Ok(Some(Scaled::try_new(
-            quotients.into_array(),
-            exponents,
-            patches,
+        // One exponent for blocks that all have it, in the metadata.
+        let (exponents, exponent) = match exponents.split_first() {
+            Some((&first, rest)) if rest.iter().all(|&e| e == first) => (None, Some(first)),
+            _ => (Some(Buffer::copy_from(exponents).into_array()), None),
+        };
+        let quotients = quotients.into_array();
+        Ok(Some(Scaled::from_parts(
+            quotients, exponents, exponent, 10, patches,
         )?))
     })
 }
@@ -187,7 +191,7 @@ mod tests {
     use vortex::array::VortexSessionExecute;
 
     use super::*;
-    use crate::scaled::ScaledArraySlotsExt;
+    use crate::scaled::{ScaledArrayExt, ScaledArraySlotsExt};
 
     fn session() -> vortex::session::VortexSession {
         use vortex::VortexSessionDefault;
@@ -202,12 +206,13 @@ mod tests {
         let encoded = scaled_encode(&array, &mut ctx)
             .unwrap()
             .expect("a block divides");
-        let got = encoded
-            .exponents()
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .unwrap();
-        assert_eq!(got.as_slice::<u8>(), exponents);
+        let got: Vec<u8> = match encoded.exponents() {
+            Some(got) => (got.clone().execute::<PrimitiveArray>(&mut ctx).unwrap())
+                .as_slice::<u8>()
+                .to_vec(),
+            None => vec![encoded.exponent().expect("one exponent"); exponents.len()],
+        };
+        assert_eq!(got, exponents);
         let decoded = encoded
             .clone()
             .into_array()
