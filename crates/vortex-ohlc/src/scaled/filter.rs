@@ -1,4 +1,4 @@
-//! Filtering a [`Pow10`] array without decoding all of it: its quotients are filtered by their
+//! Filtering a [`Scaled`] array without decoding all of it: its quotients are filtered by their
 //! own encoding's kernels (blocked FoR and bit-packing unpack only the blocks that hold kept rows,
 //! see [`crate::kernels`]), then each kept value is multiplied by its block's power of ten, and
 //! the patches it keeps are applied.
@@ -9,13 +9,13 @@ use vortex::array::{match_each_integer_ptype, ArrayRef, ArrayView, ExecutionCtx,
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 
-use super::{pow10, Pow10, Pow10ArrayExt, Pow10ArraySlotsExt, BLOCK};
+use super::{pow10, Scaled, ScaledArrayExt, ScaledArraySlotsExt, BLOCK};
 
 /// Rows of a filter that ran this kernel, so tests can tell it did.
 #[cfg(test)]
 pub(super) static FILTERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-impl FilterKernel for Pow10 {
+impl FilterKernel for Scaled {
     fn filter(
         array: ArrayView<'_, Self>,
         mask: &Mask,
@@ -68,7 +68,7 @@ mod tests {
     use super::FILTERED;
 
     /// Prices in cents at a scale of 4, block by block around very different levels, with a
-    /// sub-cent price now and then (Pow10's patches) and a few far outliers (the bit-packing's).
+    /// sub-cent price now and then (Scaled's patches) and a few far outliers (the bit-packing's).
     fn prices(len: usize) -> Vec<i64> {
         (0..len as i64)
             .map(|i| {
@@ -82,7 +82,7 @@ mod tests {
             .collect()
     }
 
-    /// A filter on a compressed decimal column reaches Pow10's kernel through its integer part,
+    /// A filter on a compressed decimal column reaches Scaled's kernel through its integer part,
     /// and keeps what the values do: a few rows of some blocks, whole blocks, and the short last
     /// block.
     #[test]

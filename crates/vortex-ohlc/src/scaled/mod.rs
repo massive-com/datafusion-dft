@@ -1,4 +1,4 @@
-//! `vortex_ohlc.pow10`: integers stored a block of [`BLOCK`] values at a time, divided by a power
+//! `vortex_ohlc.scaled`: integers stored a block of [`BLOCK`] values at a time, divided by a power
 //! of ten the block's values share.
 //!
 //! Decimal columns keep the trailing zeros of their scale: prices at a scale of 4 that move in
@@ -41,7 +41,7 @@ mod encode;
 mod filter;
 mod scheme;
 
-pub use encode::pow10_encode;
+pub use encode::scaled_encode;
 pub(crate) use scheme::is_decimal_values;
 pub use scheme::Pow10Scheme;
 
@@ -55,23 +55,23 @@ pub fn register(session: &VortexSession) {
     use vortex::array::arrays::Filter;
     use vortex::array::optimizer::kernels::ArrayKernelsExt;
     use vortex::array::session::ArraySessionExt;
-    session.arrays().register(Pow10);
+    session.arrays().register(Scaled);
     session.kernels().register_execute_parent_kernel(
         Filter.id(),
-        Pow10,
-        FilterExecuteAdaptor(Pow10),
+        Scaled,
+        FilterExecuteAdaptor(Scaled),
     );
     crate::register_scheme(session, &Pow10Scheme);
 }
 
-/// A [`Pow10`]-encoded array.
-pub type Pow10Array = Array<Pow10>;
+/// A [`Scaled`]-encoded array.
+pub type ScaledArray = Array<Scaled>;
 
 #[derive(Clone, Debug)]
-pub struct Pow10;
+pub struct Scaled;
 
-#[array_slots(Pow10)]
-pub struct Pow10Slots {
+#[array_slots(Scaled)]
+pub struct ScaledSlots {
     /// The values divided by their block's power of ten, with the array's validity.
     #[slot(0)]
     pub encoded: ArrayRef,
@@ -90,18 +90,18 @@ pub struct Pow10Slots {
 }
 
 const PATCH_SLOTS: PatchSlotIndices = PatchSlotIndices {
-    indices: Pow10Slots::PATCH_INDICES,
-    values: Pow10Slots::PATCH_VALUES,
-    chunk_offsets: Pow10Slots::PATCH_CHUNK_OFFSETS,
+    indices: ScaledSlots::PATCH_INDICES,
+    values: ScaledSlots::PATCH_VALUES,
+    chunk_offsets: ScaledSlots::PATCH_CHUNK_OFFSETS,
 };
 
-/// What a [`Pow10Array`] keeps besides its slots: where its patches start.
+/// What a [`ScaledArray`] keeps besides its slots: where its patches start.
 #[derive(Clone, Debug)]
-pub struct Pow10Data {
+pub struct ScaledData {
     patches: Option<PatchesData>,
 }
 
-impl Display for Pow10Data {
+impl Display for ScaledData {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self.patches {
             Some(patches) => write!(f, "patch_offset: {}", patches.offset()),
@@ -110,20 +110,20 @@ impl Display for Pow10Data {
     }
 }
 
-impl ArrayHash for Pow10Data {
+impl ArrayHash for ScaledData {
     fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         std::hash::Hash::hash(&self.patches, state);
     }
 }
 
-impl ArrayEq for Pow10Data {
+impl ArrayEq for ScaledData {
     fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.patches == other.patches
     }
 }
 
 #[derive(Clone, prost::Message)]
-struct Pow10Metadata {
+struct ScaledMetadata {
     #[prost(message, optional, tag = "1")]
     patches: Option<PatchesMetadata>,
 }
@@ -138,7 +138,7 @@ fn slots(encoded: ArrayRef, exponents: ArrayRef, patches: Option<&Patches>) -> A
     slots
 }
 
-impl Pow10 {
+impl Scaled {
     /// The array of `encoded[i] × 10^exponents[i / BLOCK]`, but where `patches` have a value.
     /// `encoded` gives the array its dtype and validity; `exponents` has one non-null `u8` per
     /// block of [`BLOCK`] values.
@@ -146,17 +146,17 @@ impl Pow10 {
         encoded: ArrayRef,
         exponents: ArrayRef,
         patches: Option<Patches>,
-    ) -> VortexResult<Pow10Array> {
+    ) -> VortexResult<ScaledArray> {
         let (dtype, len) = (encoded.dtype().clone(), encoded.len());
-        let data = Pow10Data {
+        let data = ScaledData {
             patches: patches.as_ref().map(PatchesData::from_patches),
         };
         let slots = slots(encoded, exponents, patches.as_ref());
-        Array::try_from_parts(ArrayParts::new(Pow10, dtype, len, data, slots))
+        Array::try_from_parts(ArrayParts::new(Scaled, dtype, len, data, slots))
     }
 }
 
-pub trait Pow10ArrayExt: Pow10ArraySlotsExt {
+pub trait ScaledArrayExt: ScaledArraySlotsExt {
     /// The rows whose values aren't their block's multiples, with those values.
     fn patches(&self) -> Option<Patches> {
         PatchesData::patches_from_slots(
@@ -168,44 +168,44 @@ pub trait Pow10ArrayExt: Pow10ArraySlotsExt {
     }
 }
 
-impl<T: TypedArrayRef<Pow10>> Pow10ArrayExt for T {}
+impl<T: TypedArrayRef<Scaled>> ScaledArrayExt for T {}
 
-impl VTable for Pow10 {
-    type TypedArrayData = Pow10Data;
+impl VTable for Scaled {
+    type TypedArrayData = ScaledData;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChild;
 
     fn id(&self) -> ArrayId {
-        static ID: CachedId = CachedId::new("vortex_ohlc.pow10");
+        static ID: CachedId = CachedId::new("vortex_ohlc.scaled");
         *ID
     }
 
     fn validate(
         &self,
-        data: &Pow10Data,
+        data: &ScaledData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
     ) -> VortexResult<()> {
-        let view = Pow10SlotsView::from_slots(slots);
+        let view = ScaledSlotsView::from_slots(slots);
         if let Some(patches) =
             PatchesData::patches_from_slots(data.patches.as_ref(), len, slots, PATCH_SLOTS)
         {
-            vortex_ensure_eq!(patches.array_len(), len, "Pow10 patches' length");
-            vortex_ensure_eq!(patches.dtype(), dtype, "Pow10 patches' dtype");
+            vortex_ensure_eq!(patches.array_len(), len, "Scaled patches' length");
+            vortex_ensure_eq!(patches.dtype(), dtype, "Scaled patches' dtype");
         }
-        vortex_ensure!(dtype.is_int(), "Pow10 needs an integer dtype, got {dtype}");
-        vortex_ensure_eq!(view.encoded.dtype(), dtype, "Pow10 encoded dtype");
-        vortex_ensure_eq!(view.encoded.len(), len, "Pow10 encoded length");
+        vortex_ensure!(dtype.is_int(), "Scaled needs an integer dtype, got {dtype}");
+        vortex_ensure_eq!(view.encoded.dtype(), dtype, "Scaled encoded dtype");
+        vortex_ensure_eq!(view.encoded.len(), len, "Scaled encoded length");
         vortex_ensure_eq!(
             view.exponents.dtype(),
             &exponents_dtype(),
-            "Pow10 exponents"
+            "Scaled exponents"
         );
         vortex_ensure_eq!(
             view.exponents.len(),
             len.div_ceil(BLOCK),
-            "Pow10 needs an exponent per block"
+            "Scaled needs an exponent per block"
         );
         Ok(())
     }
@@ -215,7 +215,7 @@ impl VTable for Pow10 {
     }
 
     fn buffer(_array: ArrayView<'_, Self>, idx: usize) -> BufferHandle {
-        vortex_panic!("Pow10 has no buffer {idx}")
+        vortex_panic!("Scaled has no buffer {idx}")
     }
 
     fn buffer_name(_array: ArrayView<'_, Self>, _idx: usize) -> Option<String> {
@@ -238,7 +238,7 @@ impl VTable for Pow10 {
             .patches()
             .map(|patches| patches.to_metadata(array.len(), array.dtype()))
             .transpose()?;
-        Ok(Some(Pow10Metadata { patches }.encode_to_vec()))
+        Ok(Some(ScaledMetadata { patches }.encode_to_vec()))
     }
 
     fn deserialize(
@@ -250,7 +250,7 @@ impl VTable for Pow10 {
         children: &dyn ArrayChildren,
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
-        let metadata = Pow10Metadata::decode(metadata)?;
+        let metadata = ScaledMetadata::decode(metadata)?;
         let encoded = children.get(0, dtype, len)?;
         let exponents = children.get(1, &exponents_dtype(), len.div_ceil(BLOCK))?;
         let patches = metadata
@@ -265,7 +265,7 @@ impl VTable for Pow10 {
                 Patches::new(len, p.offset()?, indices, values, chunk_offsets)
             })
             .transpose()?;
-        let data = Pow10Data {
+        let data = ScaledData {
             patches: patches.as_ref().map(PatchesData::from_patches),
         };
         let slots = slots(encoded, exponents, patches.as_ref());
@@ -279,7 +279,7 @@ impl VTable for Pow10 {
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
-        Pow10Slots::NAMES[idx].to_string()
+        ScaledSlots::NAMES[idx].to_string()
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
@@ -306,11 +306,11 @@ impl VTable for Pow10 {
     }
 }
 
-impl OperationsVTable<Pow10> for Pow10 {
+impl OperationsVTable<Scaled> for Scaled {
     type ProbeState = ();
 
     fn scalar_at(
-        array: ArrayView<'_, Pow10>,
+        array: ArrayView<'_, Scaled>,
         index: usize,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Scalar> {
@@ -336,8 +336,8 @@ impl OperationsVTable<Pow10> for Pow10 {
     }
 }
 
-impl ValidityChild<Pow10> for Pow10 {
-    fn validity_child(array: ArrayView<'_, Pow10>) -> ArrayRef {
+impl ValidityChild<Scaled> for Scaled {
+    fn validity_child(array: ArrayView<'_, Scaled>) -> ArrayRef {
         array.encoded().clone()
     }
 }
