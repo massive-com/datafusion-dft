@@ -47,9 +47,9 @@ use vortex::scalar_fn::fns::get_item::GetItem;
 use vortex::session::registry::CachedId;
 use vortex::session::VortexSession;
 
-use crate::dollar_volume::{dollar_volume, residual, shift, Residual};
 use crate::ohlc::{ohlc_to_parts, Part, Price};
 use crate::price_fn::{ohlc_price, OhlcPriceFn};
+use crate::product_residual::{product_residual, residual, shift, Residual};
 
 /// The stored table's struct column holding the four prices as their [`Part`]s, where open is in
 /// the source.
@@ -59,7 +59,7 @@ pub const OHLC: &str = "ohlc";
 const MAX_PART_PRECISION: u8 = 38;
 
 /// The source's dollar volume, which the stored table has as [`DOLLAR_VOLUME_RESIDUAL`] when it
-/// also has a [`VOLUME`] (see [`crate::dollar_volume`]).
+/// also has a [`VOLUME`] (see [`crate::product_residual`]).
 pub const DOLLAR_VOLUME: &str = "dollar_volume";
 
 /// The source's volume.
@@ -69,8 +69,9 @@ pub const VOLUME: &str = "volume";
 /// name no source column has, so that its zone map is never taken for the dollar volume's.
 pub const DOLLAR_VOLUME_RESIDUAL: &str = "dollar_volume_residual";
 
-/// Register the layout, [`OhlcPriceFn`] and [`DollarVolumeFn`](crate::dollar_volume::DollarVolumeFn),
-/// so files that use them can be read back.
+/// Register the layout, [`OhlcPriceFn`] and
+/// [`ProductResidualFn`](crate::product_residual::ProductResidualFn), so files that use them can
+/// be read back.
 pub fn register(session: &VortexSession) {
     use vortex::layout::session::LayoutSessionExt;
     use vortex::layout::LayoutEncoding;
@@ -81,7 +82,7 @@ pub fn register(session: &VortexSession) {
     session.scalar_fns().register(OhlcPriceFn);
     session
         .scalar_fns()
-        .register(crate::dollar_volume::DollarVolumeFn);
+        .register(crate::product_residual::ProductResidualFn);
 }
 
 #[derive(Clone, Debug)]
@@ -413,7 +414,7 @@ fn stored_chunk(
         (close, &valid),
     ];
     if let Some(residual) = &residual {
-        zoned.push((&residual.dollar_volume, &residual.valid));
+        zoned.push((&residual.values, &residual.valid));
     }
     zones.lock().unwrap().add(&zoned);
     let limit = 10i128.pow(u32::from(parts.precision()));
@@ -524,8 +525,8 @@ impl BarsStrategy {
     }
 
     /// Whether to store the dollar volume as a residual against `volume × open` where the table
-    /// can (see [`crate::dollar_volume`]). It's smaller, 29.7 MiB less for a month of minute bars
-    /// (−12.6%), but reading the dollar volume then decodes the volume and the open as well:
+    /// can (see [`crate::product_residual`]). It's smaller, 29.7 MiB less for a month of minute
+    /// bars (−12.6%), but reading the dollar volume then decodes the volume and the open as well:
     /// filters on it were 14–23% slower, and a scan of it alone 35–85%.
     pub fn with_dollar_volume_residual(mut self, residual: bool) -> Self {
         self.residual = residual;
@@ -685,7 +686,7 @@ impl BarsReader {
     /// The source's column `name`, over the stored table.
     fn column(&self, name: &str) -> Expression {
         if let Some(decimal) = self.dollar_volume.filter(|_| name == DOLLAR_VOLUME) {
-            return dollar_volume(
+            return product_residual(
                 decimal,
                 get_item(DOLLAR_VOLUME_RESIDUAL, root()),
                 get_item(VOLUME, root()),
