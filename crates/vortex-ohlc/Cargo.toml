@@ -19,7 +19,7 @@ vortex-compressor.workspace = true
 vortex-error.workspace = true
 
 [dev-dependencies]
-test-util = { path = "../test-util" }
+test-util.workspace = true
 
 [lints]
 workspace = true
