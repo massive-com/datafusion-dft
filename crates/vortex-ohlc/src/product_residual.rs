@@ -6,8 +6,8 @@
 //! `volume × open`. A bar's dollar volume is the sum of price × size over its trades:
 //! `volume × vwap`, with the vwap between the bar's low and high. So `dollar_volume - volume ×
 //! open` is at most `volume × (high - low)` in size, and 0 when every trade was at the open (a
-//! single trade, a flat bar), as many minute bars are. A null `a` counts as 0,
-//! so where it is null the residual is the column itself.
+//! single trade, a flat bar), as many minute bars are. Where `a` or `b` is
+//! null, `a × b` counts as 0, so the residual is the column itself.
 
 use std::fmt;
 
@@ -72,13 +72,11 @@ pub(crate) struct Residual {
     pub residual: ArrayRef,
 }
 
-/// The residual of a chunk of `column`, given `a` and the unscaled values of `b`, at `b_scale`.
-/// A null `a` counts as 0.
+/// The residual of a chunk of `column` against `a × b`, which counts as 0 where either is null.
 pub(crate) fn residual(
     column: &DecimalArray,
     a: &DecimalArray,
-    b: &[i128],
-    b_scale: i8,
+    b: &DecimalArray,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Residual> {
     let unscaled = |column: &DecimalArray, ctx: &mut ExecutionCtx| -> VortexResult<_> {
@@ -87,12 +85,14 @@ pub(crate) fn residual(
     };
     let (values, valid) = unscaled(column, ctx)?;
     let (a_values, a_valid) = unscaled(a, ctx)?;
-    let factor = shift(column.scale(), a.scale(), b_scale)
+    let (b_values, b_valid) = unscaled(b, ctx)?;
+    let both_valid = &a_valid & &b_valid;
+    let factor = shift(column.scale(), a.scale(), b.scale())
         .ok_or_else(|| vortex_err!("the column's scale is below a × b's"))?;
     let mut residual = BufferMut::with_capacity(values.len());
     for i in 0..values.len() {
-        let product = match a_valid.value(i) {
-            true => (a_values[i].checked_mul(b[i]))
+        let product = match both_valid.value(i) {
+            true => (a_values[i].checked_mul(b_values[i]))
                 .and_then(|p| p.checked_mul(factor))
                 .ok_or_else(|| vortex_err!("a × b is too wide for an i128"))?,
             false => 0,
@@ -146,8 +146,8 @@ fn widening(x: i64, y: i64) -> i128 {
     i128::from(x) * i128::from(y)
 }
 
-/// `r × r_factor + a × b × product_factor` for each row, `a × b` taken as 0 where `valid`
-/// (`a`'s) is false.
+/// `r × r_factor + a × b × product_factor` for each row, `a × b` taken as 0 where `valid` (both
+/// `a`'s and `b`'s) is false.
 fn rebuild<R, A, B>(
     r: &[R],
     a: &[A],
@@ -264,13 +264,14 @@ impl ScalarFnVTable for ProductResidualFn {
             pow10(scale - i32::from(a.scale()) - i32::from(b.scale())).ok_or_else(below)?;
         let validity = residual.validity()?;
         let a_valid = a.validity()?.execute_mask(a.len(), ctx)?;
+        let both_valid = &a_valid & &b.validity()?.execute_mask(b.len(), ctx)?;
         let rebuilt = with_values!(residual, |r| {
             with_values!(a, |a| {
                 with_values!(b, |b| rebuild(
                     &r,
                     &a,
                     &b,
-                    &a_valid,
+                    &both_valid,
                     r_factor,
                     product_factor
                 ))
@@ -291,7 +292,7 @@ mod tests {
     use super::*;
     use crate::scaled::Scaled;
 
-    /// `residual + a × b` at the column's scale, a null `a` counting as 0: a dollar volume from
+    /// `residual + a × b` at the column's scale, a null factor counting as 0: a dollar volume from
     /// its residual, the volume and the open.
     #[test]
     fn rebuilds_the_column() {
@@ -299,21 +300,22 @@ mod tests {
         crate::register(&session);
         let mut ctx = session.create_execution_ctx();
         let decimal = DecimalDType::new(38, 12);
-        // $1.50 × 100 shares = $150, plus a residual of $0.25, and a bar with a null volume.
+        // $1.50 × 100 shares = $150, plus a residual of $0.25, a bar with a null volume and one
+        // with a null open.
         let residual = DecimalArray::new(
-            Buffer::from_iter([250_000_000_000i128, 7]),
+            Buffer::from_iter([250_000_000_000i128, 7, 9]),
             decimal,
             Validity::NonNullable,
         );
         let volume = DecimalArray::new(
-            Buffer::from_iter([100_000_000i128, 5]),
+            Buffer::from_iter([100_000_000i128, 5, 2]),
             DecimalDType::new(38, 6),
-            Validity::from_iter([true, false]),
+            Validity::from_iter([true, false, true]),
         );
         let open = DecimalArray::new(
-            Buffer::from_iter([15_000i128, 3]),
+            Buffer::from_iter([15_000i128, 3, 4]),
             DecimalDType::new(38, 4),
-            Validity::NonNullable,
+            Validity::from_iter([true, true, false]),
         );
         let table = vortex::array::arrays::StructArray::from_fields(&[
             ("residual", residual.into_array()),
@@ -330,9 +332,9 @@ mod tests {
         );
         let rebuilt = table.apply(&expr).unwrap();
         let rebuilt = rebuilt.execute::<DecimalArray>(&mut ctx).unwrap();
-        let valid = Mask::new_true(2);
+        let valid = Mask::new_true(3);
         let values = converted_buffer::<i128>(&rebuilt, &valid).unwrap();
-        assert_eq!(values.as_slice(), &[150_250_000_000_000, 7]);
+        assert_eq!(values.as_slice(), &[150_250_000_000_000, 7, 9]);
         assert_eq!(shift(12, 6, 4), Some(100));
         assert_eq!(shift(4, 6, 4), None);
     }

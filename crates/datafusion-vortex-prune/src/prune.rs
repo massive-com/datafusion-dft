@@ -32,8 +32,8 @@
 //!
 //! - a column the file stores as it is has its zone maps' min and max, in the table's type;
 //! - a decimal stored at a smaller scale than the table's has them scaled up to the table's;
-//! - a price, and a dollar volume stored as a residual, have the min and max the bars layout keeps
-//!   for them (`vortex_ohlc::bars`'s `source_zones`), the source's own.
+//! - a price, and a column stored as a residual, have the min and max the bars layout keeps for
+//!   them (`vortex_ohlc::bars`'s `source_zones`), the source's own.
 //!
 //! Columns may have zones of different lengths, the bars layout's prices every 1024 rows, say,
 //! and the other columns once a chunk, as long as each length is a whole multiple of the
@@ -338,8 +338,7 @@ impl FileZones {
         let mut root_layout = Arc::clone(file.footer().layout());
         if let Some((zones, zone_len)) = source_zones(&root_layout)? {
             let table = read_table(session, file, "zones", &zones).await?;
-            // A min and a max per column: the prices, and the dollar volume if it's stored as a
-            // residual.
+            // A min and a max per column: the prices, and the columns stored as residuals.
             let names: Vec<String> = (table.column_names().iter())
                 .filter_map(|name| name.strip_suffix(".min").map(str::to_string))
                 .collect();

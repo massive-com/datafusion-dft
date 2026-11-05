@@ -49,7 +49,7 @@ use vortex::session::VortexSession;
 
 use crate::ohlc::{ohlc_to_parts, Part, Price};
 use crate::price_fn::{ohlc_price, OhlcPriceFn};
-use crate::product_residual::{product_residual, residual, shift, Residual};
+use crate::product_residual::{product_residual, residual, shift};
 
 /// The stored table's struct column holding the four prices as their [`Part`]s, where open is in
 /// the source.
@@ -58,16 +58,50 @@ pub const OHLC: &str = "ohlc";
 /// The most digits a part may have: an `i128`'s.
 const MAX_PART_PRECISION: u8 = 38;
 
-/// The source's dollar volume, which the stored table has as [`DOLLAR_VOLUME_RESIDUAL`] when it
-/// also has a [`VOLUME`] (see [`crate::product_residual`]).
-pub const DOLLAR_VOLUME: &str = "dollar_volume";
+/// A decimal column of the source that the layout stores as its residual against the product of
+/// two others, `target - a × b` (see [`crate::product_residual`]), under [`Self::stored_name`].
+///
+/// A table can store it if all three are decimals, `a`'s and `b`'s scales add up to no more than
+/// the target's, the target is no price and the factors no target, and the table has no column
+/// of the stored name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProductResidual {
+    pub target: FieldName,
+    pub a: FieldName,
+    pub b: FieldName,
+}
 
-/// The source's volume.
-pub const VOLUME: &str = "volume";
+impl ProductResidual {
+    pub fn new(
+        target: impl Into<FieldName>,
+        a: impl Into<FieldName>,
+        b: impl Into<FieldName>,
+    ) -> Self {
+        Self {
+            target: target.into(),
+            a: a.into(),
+            b: b.into(),
+        }
+    }
 
-/// The stored table's column for the source's dollar volume, less its volume times its open. A
-/// name no source column has, so that its zone map is never taken for the dollar volume's.
-pub const DOLLAR_VOLUME_RESIDUAL: &str = "dollar_volume_residual";
+    /// A bar's dollar volume against its volume × open. It's smaller, 29.7 MiB less for a month
+    /// of minute bars (−12.6%), but reading the dollar volume then decodes the volume and the
+    /// open as well: filters on it were 14–23% slower, and a scan of it alone 35–85%.
+    pub fn dollar_volume() -> Self {
+        Self::new("dollar_volume", "volume", Price::Open.name())
+    }
+
+    /// The stored table's column in the target's place, `<target>_residual`: a name no source
+    /// column has, so that its zone map is never taken for the target's.
+    pub fn stored_name(&self) -> FieldName {
+        format!("{}_residual", self.target).into()
+    }
+
+    /// The target, `a` and `b`.
+    fn names(&self) -> [&FieldName; 3] {
+        [&self.target, &self.a, &self.b]
+    }
+}
 
 /// Register the layout, [`OhlcPriceFn`] and
 /// [`ProductResidualFn`](crate::product_residual::ProductResidualFn), so files that use them can
@@ -88,13 +122,13 @@ pub fn register(session: &VortexSession) {
 #[derive(Clone, Debug)]
 pub struct BarsLayout;
 
-/// The parts' decimal type and whether the dollar volume is stored as a residual, which with the
-/// layout's dtype give the stored table's, and the rows per zone of the source's zones.
+/// The parts' decimal type and the columns stored as residuals, which with the layout's dtype give
+/// the stored table's, and the rows per zone of the source's zones.
 #[derive(Clone, Debug)]
 pub struct BarsData {
     parts: DecimalDType,
     zone_len: u64,
-    residual: bool,
+    residuals: Vec<ProductResidual>,
 }
 
 impl VTable for BarsLayout {
@@ -106,12 +140,17 @@ impl VTable for BarsLayout {
         *ID
     }
 
-    /// The parts' precision and scale, the zone length as a little-endian `u64`, then 1 if the
-    /// dollar volume is stored as a residual and 0 if not.
+    /// The parts' precision and scale, the zone length as a little-endian `u64`, then for each
+    /// column stored as a residual its target's name, `a`'s and `b`'s, each as its length in
+    /// bytes (a little-endian `u32`) and its UTF-8.
     fn metadata(layout: &Layout<Self>) -> RawMetadata {
         let mut metadata = vec![layout.parts.precision(), layout.parts.scale() as u8];
         metadata.extend(layout.zone_len.to_le_bytes());
-        metadata.push(u8::from(layout.residual));
+        for name in layout.residuals.iter().flat_map(ProductResidual::names) {
+            let len = u32::try_from(name.as_ref().len()).expect("a column name under 4 GiB");
+            metadata.extend(len.to_le_bytes());
+            metadata.extend(name.as_ref().as_bytes());
+        }
         RawMetadata(metadata)
     }
 
@@ -120,23 +159,33 @@ impl VTable for BarsLayout {
         args: &LayoutDeserializeArgs<'_>,
         metadata: &Vec<u8>,
     ) -> VortexResult<BarsData> {
-        let [precision, scale, zone_len @ .., residual] = metadata.as_slice() else {
-            vortex_bail!("a bars layout's metadata is too short");
+        let short = || vortex_err!("a bars layout's metadata is cut short");
+        let [precision, scale, rest @ ..] = metadata.as_slice() else {
+            return Err(short());
         };
-        let zone_len = <[u8; 8]>::try_from(zone_len)
-            .map(u64::from_le_bytes)
-            .map_err(|_| vortex_err!("a bars layout's metadata is 11 bytes"))?;
+        let (zone_len, mut rest) = rest.split_first_chunk::<8>().ok_or_else(short)?;
+        let zone_len = u64::from_le_bytes(*zone_len);
         vortex_ensure!(zone_len > 0, "a bars layout's zones have rows");
         let parts = DecimalDType::new(*precision, *scale as i8);
-        let residual = match residual {
-            0 => false,
-            1 => true,
-            other => vortex_bail!("a bars layout's residual flag is 0 or 1, not {other}"),
+        let mut names = Vec::new();
+        while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+            let len = u32::from_le_bytes(*len) as usize;
+            let name = tail.get(..len).ok_or_else(short)?;
+            let name = std::str::from_utf8(name)
+                .map_err(|err| vortex_err!("a bars layout's column name isn't UTF-8: {err}"))?;
+            names.push(FieldName::from(name));
+            rest = &tail[len..];
+        }
+        let (triples, []) = names.as_chunks::<3>() else {
+            return Err(short());
         };
-        vortex_ensure!(
-            !residual || dollar_volume_residual(args.dtype).is_some(),
-            "a bars layout stores a dollar volume its table can't have as a residual"
-        );
+        if !rest.is_empty() {
+            return Err(short());
+        }
+        let residuals: Vec<ProductResidual> = (triples.iter())
+            .map(|[target, a, b]| ProductResidual::new(target.clone(), a.clone(), b.clone()))
+            .collect();
+        residual_decimals(args.dtype, &residuals)?;
         vortex_ensure!(
             args.children.nchildren() == 2,
             "a bars layout has two children, its table and the source's zones"
@@ -144,20 +193,20 @@ impl VTable for BarsLayout {
         vortex_ensure!(args.children.child_row_count(0) == args.row_count);
         vortex_ensure!(args.children.child_row_count(1) == args.row_count.div_ceil(zone_len));
         args.children
-            .child(0, &stored_dtype(args.dtype, parts, residual)?)?;
+            .child(0, &stored_dtype(args.dtype, parts, &residuals)?)?;
         args.children
-            .child(1, &zones_dtype(args.dtype, residual)?)?;
+            .child(1, &zones_dtype(args.dtype, &residuals)?)?;
         Ok(BarsData {
             parts,
             zone_len,
-            residual,
+            residuals,
         })
     }
 
     fn child_dtype(layout: &Layout<Self>, slot: usize) -> VortexResult<DType> {
         match slot {
-            0 => stored_dtype(layout.dtype(), layout.parts, layout.residual),
-            1 => zones_dtype(layout.dtype(), layout.residual),
+            0 => stored_dtype(layout.dtype(), layout.parts, &layout.residuals),
+            1 => zones_dtype(layout.dtype(), &layout.residuals),
             _ => vortex_bail!("a bars layout has no child {slot}"),
         }
     }
@@ -185,7 +234,7 @@ impl VTable for BarsLayout {
             layout.dtype().clone(),
             inner,
             (zones, layout.zone_len),
-            layout.residual,
+            layout.residuals.clone(),
             segment_source,
             session.clone(),
         )?))
@@ -212,16 +261,15 @@ pub fn bound_name(column: &str, max: bool) -> String {
     format!("{column}.{bound}")
 }
 
-/// The dtype of the source's zones for a table of `source`'s dtype, with the dollar volume stored
-/// as a `residual` or not: a row per zone, and the min and max there ([`bound_name`]) of each
-/// column the stored table doesn't have as it is (see [`zoned_columns`]), at its type, null where
-/// a zone has none.
-pub fn zones_dtype(source: &DType, residual: bool) -> VortexResult<DType> {
+/// The dtype of the source's zones for a table of `source`'s dtype, with `residuals`: a row per
+/// zone, and the min and max there ([`bound_name`]) of each column the stored table doesn't have
+/// as it is (see [`zoned_columns`]), at its type, null where a zone has none.
+pub fn zones_dtype(source: &DType, residuals: &[ProductResidual]) -> VortexResult<DType> {
     let mut names: Vec<FieldName> = Vec::new();
     let mut dtypes = Vec::new();
-    for (name, decimal) in zoned_columns(source, residual)? {
+    for (name, decimal) in zoned_columns(source, residuals)? {
         for max in [false, true] {
-            names.push(bound_name(name, max).into());
+            names.push(bound_name(name.as_ref(), max).into());
             dtypes.push(DType::Decimal(decimal, Nullability::Nullable));
         }
     }
@@ -232,22 +280,20 @@ pub fn zones_dtype(source: &DType, residual: bool) -> VortexResult<DType> {
 }
 
 /// The columns of a table of `source`'s dtype that the stored table doesn't have as they are,
-/// with their decimal types: the four prices, and the dollar volume if it's stored as a
-/// `residual` (see [`dollar_volume_residual`]).
+/// with their decimal types: the four prices, and the targets of `residuals`.
 fn zoned_columns(
     source: &DType,
-    residual: bool,
-) -> VortexResult<Vec<(&'static str, DecimalDType)>> {
+    residuals: &[ProductResidual],
+) -> VortexResult<Vec<(FieldName, DecimalDType)>> {
     let mut columns = Vec::new();
     for price in Price::ALL {
         let Some(DType::Decimal(decimal, _)) = field(source, price.name()) else {
             vortex_bail!("{} is not a decimal", price.name());
         };
-        columns.push((price.name(), decimal));
+        columns.push((price.name().into(), decimal));
     }
-    if let Some(decimal) = dollar_volume_residual(source).filter(|_| residual) {
-        columns.push((DOLLAR_VOLUME, decimal));
-    }
+    let targets = residuals.iter().map(|residual| residual.target.clone());
+    columns.extend(targets.zip(residual_decimals(source, residuals)?));
     Ok(columns)
 }
 
@@ -256,21 +302,46 @@ fn field(source: &DType, name: &str) -> Option<DType> {
     source.as_struct_fields_opt()?.field(name)
 }
 
-/// The dollar volume's decimal type, if a table of `source`'s dtype can store it as a residual:
-/// if it has a decimal [`DOLLAR_VOLUME`] and [`VOLUME`] whose product with the open fits its
-/// scale. Whether it does is the writer's choice (see
-/// [`BarsStrategy::with_dollar_volume_residual`]).
-fn dollar_volume_residual(source: &DType) -> Option<DecimalDType> {
-    let (Some(DType::Decimal(dollar_volume, _)), Some(DType::Decimal(volume, _))) =
-        (field(source, DOLLAR_VOLUME), field(source, VOLUME))
-    else {
-        return None;
+/// The targets' decimal types, if a table of `source`'s dtype can store `residuals` (see
+/// [`ProductResidual`]).
+fn residual_decimals(
+    source: &DType,
+    residuals: &[ProductResidual],
+) -> VortexResult<Vec<DecimalDType>> {
+    let decimal = |name: &FieldName| match field(source, name.as_ref()) {
+        Some(DType::Decimal(decimal, _)) => Ok(decimal),
+        Some(other) => Err(vortex_err!("{name} is {other}, not a decimal")),
+        None => Err(vortex_err!("the table has no {name}")),
     };
-    let Some(DType::Decimal(open, _)) = field(source, Price::Open.name()) else {
-        return None;
-    };
-    shift(dollar_volume.scale(), volume.scale(), open.scale())?;
-    Some(dollar_volume)
+    let is_target = |name: &FieldName| residuals.iter().any(|other| other.target == *name);
+    let mut decimals = Vec::with_capacity(residuals.len());
+    for (i, residual) in residuals.iter().enumerate() {
+        let ProductResidual { target, a, b } = residual;
+        let (decimal, a_decimal, b_decimal) = (decimal(target)?, decimal(a)?, decimal(b)?);
+        vortex_ensure!(
+            Price::from_name(target.as_ref()).is_none(),
+            "{target} is a price, which the bars layout stores as a part, not as a residual"
+        );
+        vortex_ensure!(
+            !residuals[..i].iter().any(|other| other.target == *target),
+            "{target} is stored as a residual twice"
+        );
+        vortex_ensure!(
+            !is_target(a) && !is_target(b),
+            "{target} is stored against {a} × {b}, but a factor is stored as a residual itself"
+        );
+        let stored = residual.stored_name();
+        vortex_ensure!(
+            field(source, stored.as_ref()).is_none(),
+            "{target}'s residual would be stored as {stored}, a column the table has"
+        );
+        vortex_ensure!(
+            shift(decimal.scale(), a_decimal.scale(), b_decimal.scale()).is_some(),
+            "{target}'s scale is below {a} × {b}'s"
+        );
+        decimals.push(decimal);
+    }
+    Ok(decimals)
 }
 
 /// Each zone's min and max of some of a table's columns, from the chunks written so far.
@@ -316,7 +387,7 @@ impl ZoneBounds {
 
     /// The bounds as the source's zones (see [`zones_dtype`]) of the columns `columns` (see
     /// [`zoned_columns`]).
-    fn table(&self, columns: &[(&str, DecimalDType)]) -> VortexResult<ArrayRef> {
+    fn table(&self, columns: &[(FieldName, DecimalDType)]) -> VortexResult<ArrayRef> {
         let nzones = self.rows.div_ceil(self.zone_len) as usize;
         let mut fields = Vec::new();
         for (bounds, &(_, decimal)) in self.bounds.iter().zip(columns) {
@@ -332,8 +403,9 @@ impl ZoneBounds {
                 fields.push(DecimalArray::from_option_iter(values, decimal).into_array());
             }
         }
-        let names = (columns.iter())
-            .flat_map(|&(name, _)| [false, true].map(|max| FieldName::from(bound_name(name, max))));
+        let names = (columns.iter()).flat_map(|(name, _)| {
+            [false, true].map(|max| FieldName::from(bound_name(name.as_ref(), max)))
+        });
         Ok(
             StructArray::try_new(names.collect(), fields, nzones, Validity::NonNullable)?
                 .into_array(),
@@ -341,17 +413,21 @@ impl ZoneBounds {
     }
 }
 
-/// The stored table's dtype, given the source's, the parts' decimal type and whether the dollar
-/// volume is stored as a `residual`: the [`OHLC`] struct where open is, no other price, and
-/// [`DOLLAR_VOLUME_RESIDUAL`] where the dollar volume is, if it's stored as one.
-fn stored_dtype(source: &DType, parts: DecimalDType, residual: bool) -> VortexResult<DType> {
+/// The stored table's dtype, given the source's, the parts' decimal type and the columns stored as
+/// `residuals`: the [`OHLC`] struct where open is, no other price, and each residual's stored
+/// column where its target is.
+fn stored_dtype(
+    source: &DType,
+    parts: DecimalDType,
+    residuals: &[ProductResidual],
+) -> VortexResult<DType> {
     let fields = source
         .as_struct_fields_opt()
         .ok_or_else(|| vortex_err!("a table of bars is a struct, not {source}"))?;
     let (mut names, mut dtypes): (Vec<FieldName>, Vec<DType>) = (Vec::new(), Vec::new());
     for (name, dtype) in fields.names().iter().zip(fields.fields()) {
-        if residual && name.as_ref() == DOLLAR_VOLUME {
-            names.push(DOLLAR_VOLUME_RESIDUAL.into());
+        if let Some(residual) = residuals.iter().find(|residual| residual.target == *name) {
+            names.push(residual.stored_name());
             dtypes.push(dtype);
             continue;
         }
@@ -376,13 +452,12 @@ fn stored_dtype(source: &DType, parts: DecimalDType, residual: bool) -> VortexRe
 }
 
 /// A chunk of a table of bars as stored, with `parts` (see [`parts_dtype`]): the four prices as
-/// the [`OHLC`] struct's parts, where open is in the source, and the dollar volume as its residual
-/// if it's stored as one (see [`stored_dtype`]). Its prices, and its dollar volume if it's a
-/// residual, go into `zones`.
+/// the [`OHLC`] struct's parts, where open is in the source, and the targets of `residuals` as
+/// their residuals (see [`stored_dtype`]). Its prices and those targets go into `zones`.
 fn stored_chunk(
     chunk: ArrayRef,
     parts: DecimalDType,
-    residual: bool,
+    residuals: &[ProductResidual],
     zones: &Mutex<ZoneBounds>,
     session: &VortexSession,
 ) -> VortexResult<ArrayRef> {
@@ -391,8 +466,7 @@ fn stored_chunk(
     let len = table.len();
     let mut prices = Vec::with_capacity(Price::ALL.len());
     for price in Price::ALL {
-        let column = (table.unmasked_field_by_name(price.name())?.clone())
-            .execute::<DecimalArray>(&mut ctx)?;
+        let column = decimal_column(&table, price.name(), &mut ctx)?;
         let valid = column.validity()?.execute_mask(len, &mut ctx)?;
         vortex_ensure!(
             valid.all_true(),
@@ -403,19 +477,20 @@ fn stored_chunk(
     }
     let [open, high, low, close] = [&prices[0], &prices[1], &prices[2], &prices[3]];
     let valid = Mask::new_true(len);
-    let residual = match residual {
-        true => Some(residual_column(&table, open, &mut ctx)?),
-        false => None,
-    };
+    let mut stored_residuals = Vec::with_capacity(residuals.len());
+    for column in residuals {
+        let [target, a, b] = column
+            .names()
+            .map(|name| decimal_column(&table, name.as_ref(), &mut ctx));
+        stored_residuals.push(residual(&target?, &a?, &b?, &mut ctx)?);
+    }
     let mut zoned: Vec<(&[i128], &Mask)> = vec![
         (open, &valid),
         (high, &valid),
         (low, &valid),
         (close, &valid),
     ];
-    if let Some(residual) = &residual {
-        zoned.push((&residual.values, &residual.valid));
-    }
+    zoned.extend((stored_residuals.iter()).map(|r| (r.values.as_slice(), &r.valid)));
     zones.lock().unwrap().add(&zoned);
     let limit = 10i128.pow(u32::from(parts.precision()));
     let mut columns: [BufferMut<i128>; 4] = std::array::from_fn(|_| BufferMut::with_capacity(len));
@@ -447,9 +522,9 @@ fn stored_chunk(
     )?;
     let (mut names, mut fields): (Vec<FieldName>, Vec<ArrayRef>) = (Vec::new(), Vec::new());
     for (name, field) in table.names().iter().zip(table.iter_unmasked_fields()) {
-        if let Some(residual) = residual.as_ref().filter(|_| name.as_ref() == DOLLAR_VOLUME) {
-            names.push(DOLLAR_VOLUME_RESIDUAL.into());
-            fields.push(residual.residual.clone());
+        if let Some(i) = residuals.iter().position(|column| column.target == *name) {
+            names.push(residuals[i].stored_name());
+            fields.push(stored_residuals[i].residual.clone());
             continue;
         }
         match Price::from_name(name.as_ref()) {
@@ -467,22 +542,13 @@ fn stored_chunk(
     Ok(StructArray::try_new(names.into(), fields, len, table.struct_validity())?.into_array())
 }
 
-/// The [`Residual`] of `table`'s dollar volume, a chunk of a table of bars that stores it as one,
-/// given its unscaled `open` prices.
-fn residual_column(
+/// `table`'s column `name`, a decimal, decoded.
+fn decimal_column(
     table: &StructArray,
-    open: &[i128],
+    name: &str,
     ctx: &mut ExecutionCtx,
-) -> VortexResult<Residual> {
-    let decimal = |name: &str, ctx: &mut ExecutionCtx| {
-        (table.unmasked_field_by_name(name)?.clone()).execute::<DecimalArray>(ctx)
-    };
-    let open_scale = match field(table.dtype(), Price::Open.name()) {
-        Some(DType::Decimal(decimal, _)) => decimal.scale(),
-        _ => vortex_bail!("open is not a decimal"),
-    };
-    let (dollar_volume, volume) = (decimal(DOLLAR_VOLUME, ctx)?, decimal(VOLUME, ctx)?);
-    residual(&dollar_volume, &volume, open, open_scale, ctx)
+) -> VortexResult<DecimalArray> {
+    (table.unmasked_field_by_name(name)?.clone()).execute::<DecimalArray>(ctx)
 }
 
 /// The parts' decimal type for a table of `source`'s dtype, if it is a table of bars: one with
@@ -509,27 +575,25 @@ fn parts_dtype(source: &DType) -> Option<DecimalDType> {
 pub struct BarsStrategy {
     inner: Arc<dyn LayoutStrategy>,
     zone_len: u64,
-    residual: bool,
+    residuals: Vec<ProductResidual>,
 }
 
 impl BarsStrategy {
-    /// The strategy, storing the dollar volume as a residual where it can (see
-    /// [`Self::with_dollar_volume_residual`]).
+    /// The strategy, storing the dollar volume as a residual where the table has it (see
+    /// [`Self::with_product_residuals`]).
     pub fn new(inner: Arc<dyn LayoutStrategy>, zone_len: u64) -> Self {
         assert!(zone_len > 0, "a zone has rows");
         Self {
             inner,
             zone_len,
-            residual: true,
+            residuals: vec![ProductResidual::dollar_volume()],
         }
     }
 
-    /// Whether to store the dollar volume as a residual against `volume × open` where the table
-    /// can (see [`crate::product_residual`]). It's smaller, 29.7 MiB less for a month of minute
-    /// bars (−12.6%), but reading the dollar volume then decodes the volume and the open as well:
-    /// filters on it were 14–23% slower, and a scan of it alone 35–85%.
-    pub fn with_dollar_volume_residual(mut self, residual: bool) -> Self {
-        self.residual = residual;
+    /// The columns to store as residuals. One whose three columns a table hasn't all is left out
+    /// of its file; one it has but can't store (see [`ProductResidual`]) fails the write.
+    pub fn with_product_residuals(mut self, residuals: Vec<ProductResidual>) -> Self {
+        self.residuals = residuals;
         self
     }
 }
@@ -550,16 +614,23 @@ impl LayoutStrategy for BarsStrategy {
                 .write_stream(ctx, segment_sink, stream, eof, session)
                 .await;
         };
-        let residual = self.residual && dollar_volume_residual(&source).is_some();
-        let stored = stored_dtype(&source, parts, residual)?;
-        let zoned = zoned_columns(&source, residual)?;
+        let residuals: Vec<ProductResidual> = (self.residuals.iter())
+            .filter(|residual| {
+                (residual.names().iter()).all(|name| field(&source, name.as_ref()).is_some())
+            })
+            .cloned()
+            .collect();
+        let stored = stored_dtype(&source, parts, &residuals)?;
+        let zoned = zoned_columns(&source, &residuals)?;
         let zone_bounds = Arc::new(Mutex::new(ZoneBounds::new(self.zone_len, zoned.len())));
         let (chunk_zones, chunk_session) = (Arc::clone(&zone_bounds), session.clone());
+        let chunk_residuals = residuals.clone();
         let stream = SequentialStreamAdapter::new(
             stored,
             stream.map(move |chunk| {
                 let (sequence, chunk) = chunk?;
-                let chunk = stored_chunk(chunk, parts, residual, &chunk_zones, &chunk_session)?;
+                let chunk =
+                    stored_chunk(chunk, parts, &chunk_residuals, &chunk_zones, &chunk_session)?;
                 Ok((sequence, chunk))
             }),
         )
@@ -590,7 +661,7 @@ impl LayoutStrategy for BarsStrategy {
             BarsData {
                 parts,
                 zone_len: self.zone_len,
-                residual,
+                residuals,
             },
         )
         .into_layout())
@@ -605,8 +676,8 @@ struct BarsReader {
     inner: LayoutReaderRef,
     /// Each price's decimal type, in [`Price::ALL`] order.
     prices: [DecimalDType; 4],
-    /// The dollar volume's decimal type, if it's stored as a residual.
-    dollar_volume: Option<DecimalDType>,
+    /// The columns stored as residuals, with their targets' decimal types.
+    residuals: Vec<(ProductResidual, DecimalDType)>,
     /// Expressions over the source's columns, rewritten over the stored table and bound.
     rewritten: Mutex<HashMap<ExactBoundExpr, BoundExpression>>,
     /// The source's zones and the rows per zone.
@@ -625,7 +696,7 @@ impl BarsReader {
         dtype: DType,
         inner: LayoutReaderRef,
         zones: (LayoutRef, u64),
-        residual: bool,
+        residuals: Vec<ProductResidual>,
         segment_source: Arc<dyn SegmentSource>,
         session: VortexSession,
     ) -> VortexResult<Self> {
@@ -637,13 +708,13 @@ impl BarsReader {
             _ => Err(vortex_err!("{} is not a decimal", price.name())),
         });
         let [open, high, low, close] = prices;
-        let dollar_volume = dollar_volume_residual(&dtype).filter(|_| residual);
+        let decimals = residual_decimals(&dtype, &residuals)?;
         Ok(Self {
             name,
             dtype,
             inner,
             prices: [open?, high?, low?, close?],
-            dollar_volume,
+            residuals: residuals.into_iter().zip(decimals).collect(),
             rewritten: Mutex::new(HashMap::new()),
             zones,
             segment_source,
@@ -683,19 +754,47 @@ impl BarsReader {
         Expression::try_new(scalar_fn.clone(), children)
     }
 
+    /// The residual whose target is the source's column `name`, if it's stored as one.
+    fn residual(&self, name: &str) -> Option<&(ProductResidual, DecimalDType)> {
+        (self.residuals.iter()).find(|(residual, _)| residual.target.as_ref() == name)
+    }
+
     /// The source's column `name`, over the stored table.
     fn column(&self, name: &str) -> Expression {
-        if let Some(decimal) = self.dollar_volume.filter(|_| name == DOLLAR_VOLUME) {
+        if let Some((residual, decimal)) = self.residual(name) {
             return product_residual(
-                decimal,
-                get_item(DOLLAR_VOLUME_RESIDUAL, root()),
-                get_item(VOLUME, root()),
-                get_item(Part::Open.name(), get_item(OHLC, root())),
+                *decimal,
+                get_item(residual.stored_name(), root()),
+                self.factor(residual.a.as_ref()),
+                self.factor(residual.b.as_ref()),
             );
         }
         match Price::from_name(name) {
             Some(price) => ohlc_price(price, self.price_decimal(price), get_item(OHLC, root())),
             None => get_item(name, root()),
+        }
+    }
+
+    /// A residual's factor `name`, over the stored table: as [`Self::column`] has it, but the
+    /// open as its part, which is the open at a digit more precision.
+    fn factor(&self, name: &str) -> Expression {
+        match Price::from_name(name) {
+            Some(Price::Open) => get_item(Part::Open.name(), get_item(OHLC, root())),
+            _ => self.column(name),
+        }
+    }
+
+    /// The stored table's columns that the source's column `name` is read from.
+    fn stored_columns(&self, name: &str) -> Vec<FieldName> {
+        if let Some((residual, _)) = self.residual(name) {
+            let mut columns = vec![residual.stored_name()];
+            columns.extend(self.stored_columns(residual.a.as_ref()));
+            columns.extend(self.stored_columns(residual.b.as_ref()));
+            return columns;
+        }
+        match Price::from_name(name) {
+            Some(_) => vec![OHLC.into()],
+            None => vec![name.into()],
         }
     }
 
@@ -808,8 +907,8 @@ impl LayoutReader for BarsReader {
         split_range: &SplitRange,
         splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        // A price is read from the struct, and the dollar volume from its residual, the volume and
-        // the struct.
+        // A price is read from the struct, and a residual's target from the residual and its
+        // factors.
         let masks: Vec<FieldMask> = field_mask
             .iter()
             .flat_map(|mask| match mask {
@@ -817,10 +916,16 @@ impl LayoutReader for BarsReader {
                     let first = path.parts().first().and_then(|field| field.as_name());
                     let prefix = |name: &str| FieldMask::Prefix(FieldPath::from_name(name));
                     match first {
-                        Some(name) if self.dollar_volume.is_some() && name == DOLLAR_VOLUME => {
-                            vec![prefix(DOLLAR_VOLUME_RESIDUAL), prefix(VOLUME), prefix(OHLC)]
+                        Some(name)
+                            if self.residual(name).is_some()
+                                || Price::from_name(name).is_some() =>
+                        {
+                            let columns = self.stored_columns(name);
+                            columns
+                                .iter()
+                                .map(|column| prefix(column.as_ref()))
+                                .collect()
                         }
-                        Some(name) if Price::from_name(name).is_some() => vec![prefix(OHLC)],
                         _ => vec![mask.clone()],
                     }
                 }
@@ -884,7 +989,7 @@ impl LayoutReader for BarsReader {
     }
 }
 
-/// Binds the min and max of a column in the source's zones (a price, the dollar volume) to its
+/// Binds the min and max of a column in the source's zones (a price, a residual's target) to its
 /// field there, and no other statistic.
 struct PriceStats {
     /// The table's dtype.

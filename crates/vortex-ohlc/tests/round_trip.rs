@@ -18,22 +18,24 @@ use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::layout::LayoutReader;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_ohlc::bars::{data_child, DOLLAR_VOLUME, DOLLAR_VOLUME_RESIDUAL, OHLC};
+use vortex_ohlc::bars::{data_child, ProductResidual, OHLC};
 use vortex_ohlc::ohlc::Part;
 
-use test_util::{source, write_with_residual, ROWS, ROW_BLOCK};
+use test_util::{source, write_with_residuals, ROWS, ROW_BLOCK};
 
-/// Write `source`, its dollar volume as a `residual` or not, and read it back: its chunks as
-/// stored, under the bars layout, as Vortex arrays, and its rows through the layout, with
-/// `source`'s schema, as one Arrow batch.
-fn write_and_read(source: &RecordBatch, residual: bool) -> (Vec<ArrayRef>, RecordBatch) {
+/// Write `source` with `residuals`, and read it back: its chunks as stored, under the bars layout,
+/// as Vortex arrays, and its rows through the layout, with `source`'s schema, as one Arrow batch.
+fn write_and_read(
+    source: &RecordBatch,
+    residuals: Vec<ProductResidual>,
+) -> (Vec<ArrayRef>, RecordBatch) {
     let schema = source.schema();
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     vortex_ohlc::register(&session);
     let file = session
         .open_options()
-        .open_buffer(write_with_residual(source, residual))
+        .open_buffer(write_with_residuals(source, residuals))
         .unwrap();
     let scan = |reader: Arc<dyn LayoutReader>| -> Vec<ArrayRef> {
         ScanBuilder::new(session.clone(), reader)
@@ -94,11 +96,11 @@ fn encoding_ids(array: &ArrayRef) -> Vec<String> {
 #[test]
 fn round_trip() {
     let source = source();
-    let (chunks, read) = write_and_read(&source, true);
+    let (chunks, read) = write_and_read(&source, vec![ProductResidual::dollar_volume()]);
     assert_eq!(chunks.len(), ROWS.div_ceil(ROW_BLOCK));
     assert_eq!(read, source);
-    assert!(names(&chunks[0]).contains(&DOLLAR_VOLUME_RESIDUAL.to_string()));
-    assert!(!names(&chunks[0]).contains(&DOLLAR_VOLUME.to_string()));
+    assert!(names(&chunks[0]).contains(&"dollar_volume_residual".to_string()));
+    assert!(!names(&chunks[0]).contains(&"dollar_volume".to_string()));
 
     // The parts and transactions are bit-packed, in the encodings the edition allows.
     let mut v2 = false;
@@ -136,12 +138,35 @@ fn round_trip() {
     assert!(volume_children(last) > volume_children(&chunks[0]));
 }
 
-/// Written without the residual, the dollar volume is stored as it is, and reads back the same.
+/// Written with only a residual whose columns the table hasn't all, the dollar volume is stored
+/// as it is, and reads back the same.
 #[test]
 fn round_trip_without_residual() {
     let source = source();
-    let (chunks, read) = write_and_read(&source, false);
+    let residuals = vec![ProductResidual::new("dollar_volume", "volume", "vwap")];
+    let (chunks, read) = write_and_read(&source, residuals);
     assert_eq!(read, source);
-    assert!(names(&chunks[0]).contains(&DOLLAR_VOLUME.to_string()));
-    assert!(!names(&chunks[0]).contains(&DOLLAR_VOLUME_RESIDUAL.to_string()));
+    assert!(names(&chunks[0]).contains(&"dollar_volume".to_string()));
+    assert!(!names(&chunks[0]).contains(&"dollar_volume_residual".to_string()));
+}
+
+/// A residual against any two columns reads back the same: the dollar volume against the volume
+/// and the close, a price the layout rebuilds from its parts.
+#[test]
+fn round_trip_against_other_factors() {
+    let source = source();
+    let residuals = vec![ProductResidual::new("dollar_volume", "volume", "close")];
+    let (chunks, read) = write_and_read(&source, residuals);
+    assert_eq!(read, source);
+    assert!(names(&chunks[0]).contains(&"dollar_volume_residual".to_string()));
+}
+
+/// A residual whose columns the table has but can't store fails the write: a price can't be one.
+#[test]
+#[should_panic(expected = "open is a price")]
+fn residual_of_a_price_fails() {
+    write_with_residuals(
+        &source(),
+        vec![ProductResidual::new("open", "volume", "close")],
+    );
 }
