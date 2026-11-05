@@ -638,8 +638,38 @@ impl FilterReduce for Scaled {
 
 impl SliceReduce for Scaled {
     fn slice(array: ArrayView<'_, Self>, range: Range<usize>) -> VortexResult<Option<ArrayRef>> {
-        map_uniform(array, |values| values.slice(range))
+        if let Some(sliced) = map_uniform(array, |values| values.slice(range.clone()))? {
+            return Ok(Some(sliced));
+        }
+        slice_blocks(array, range)
     }
+}
+
+/// `array` cut to the blocks that hold `range`, then sliced within them: an array whose blocks
+/// have their own divisors, or with patches, so slicing it decodes those blocks and not the rest
+/// (a needle's rows are often one range of a chunk). `None` if the blocks are all of `array`.
+fn slice_blocks(
+    array: ArrayView<'_, Scaled>,
+    range: Range<usize>,
+) -> VortexResult<Option<ArrayRef>> {
+    let start = range.start / BLOCK * BLOCK;
+    let end = (range.end.div_ceil(BLOCK) * BLOCK).min(array.len());
+    if start == 0 && end == array.len() {
+        return Ok(None);
+    }
+    let values = array.values().slice(start..end)?;
+    let exponents = (array.exponents())
+        .map(|exponents| exponents.slice(start / BLOCK..end.div_ceil(BLOCK)))
+        .transpose()?;
+    let patches = (array.patches())
+        .map(|patches| patches.slice(start..end))
+        .transpose()?
+        .flatten();
+    let blocks = Scaled::from_parts(values, exponents, array.exponent, array.base, patches)?;
+    blocks
+        .into_array()
+        .slice(range.start - start..range.end - start)
+        .map(Some)
 }
 
 impl TakeReduce for Scaled {
@@ -706,6 +736,7 @@ impl CompareKernel for Scaled {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use vortex::array::arrays::Slice;
     use vortex::array::validity::Validity;
     use vortex::array::{Canonical, VortexSessionExecute};
     use vortex::dtype::DecimalDType;
@@ -857,6 +888,49 @@ pub(crate) mod tests {
             positive.true_count(),
             want.iter().filter(|&&v| v > 0).count()
         );
+    }
+
+    /// A slice of an array with an exponent per block and patches reads only the blocks that hold
+    /// it, whether it starts or ends mid-block, spans blocks, or is all of the array, and gives
+    /// what slicing the decoded values does.
+    #[test]
+    fn slices_read_their_blocks() {
+        let mut ctx = session().create_execution_ctx();
+        let len = 3 * BLOCK + 6;
+        let quotients = PrimitiveArray::from_iter((0..len as i64).map(|i| i % 7 - 3));
+        let exponents = Buffer::from(vec![3u8, 0, 5, 1]).into_array();
+        // Rows whose values aren't their block's multiples, in three of the blocks.
+        let rows: Buffer<u16> = [5u16, 1030, 2050, 2051, 3075].into_iter().collect();
+        let patched: Buffer<i64> = [-1i64, 7, 9, -9, 11].into_iter().collect();
+        let patches = Patches::new(len, 0, rows.into_array(), patched.into_array(), None).unwrap();
+        let scaled = Scaled::try_new(quotients.into_array(), exponents, 2, Some(patches))
+            .unwrap()
+            .into_array();
+        let mut want: Vec<i128> = (0..len as i128)
+            .map(|i| (i % 7 - 3) * [8, 1, 32, 2][i as usize / BLOCK])
+            .collect();
+        for (row, value) in [(5, -1), (1030, 7), (2050, 9), (2051, -9), (3075, 11)] {
+            want[row] = value;
+        }
+        assert_eq!(decoded(&scaled, &mut ctx), want);
+        for (range, blocks) in [
+            (1500..2060, 2 * BLOCK),
+            (5..10, BLOCK),
+            (1030..1040, BLOCK),
+            (2 * BLOCK..3 * BLOCK, BLOCK),
+            (3 * BLOCK + 2..len, 6),
+            (3..len - 1, len),
+        ] {
+            let sliced = scaled.slice(range.clone()).unwrap();
+            // The Scaled array the slice reads: itself, or what a Slice is of.
+            let read = match sliced.as_opt::<Slice>() {
+                Some(_) => sliced.children()[0].clone(),
+                None => sliced.clone(),
+            };
+            assert!(read.as_opt::<Scaled>().is_some(), "{range:?}");
+            assert_eq!(read.len(), blocks, "rows read for {range:?}");
+            assert_eq!(decoded(&sliced, &mut ctx), want[range]);
+        }
     }
 
     /// Exponents that are a constant are kept as the one exponent, without an exponents child.
