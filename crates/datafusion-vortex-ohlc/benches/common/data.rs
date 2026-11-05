@@ -43,7 +43,7 @@ const DATA_DIR: &str = concat!(
 /// bit-packing picks, 22 since that encoding is `vortex_ohlc.scaled` (`vortex_ohlc.pow10` before),
 /// 23 since its metadata has a base, 24 since every decimal is rescaled a chunk at a time
 /// (`vortex_ohlc::scaled::DecimalPow10Scheme`), 25 since the dollar volume is stored as a residual
-/// against volume × open (`vortex_ohlc::dollar_volume`), 26 since the layout's metadata says
+/// against volume × open (`vortex_ohlc::product_residual`), 26 since the layout's metadata says
 /// whether it is, 27 since timestamps' seconds into the day are divided by their chunk's common
 /// divisor (`vortex_ohlc::gcd`). 9 to 16 were these steps in an earlier order.
 const VORTEX_VERSION: u32 = 27;

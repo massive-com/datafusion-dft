@@ -1,12 +1,13 @@
-//! A bar's dollar volume as the [`bars`](crate::bars) layout stores it, a residual against
-//! `volume × open`: [`residual`] to write it, and `vortex_ohlc.dollar_volume`, a Vortex scalar
-//! function, to rebuild `residual + volume × open` on reading.
+//! A decimal column stored as its residual against the product of two others: [`residual`] to
+//! write it, and `vortex_ohlc.product_residual`, a Vortex scalar function, to rebuild
+//! `residual + a × b` on reading.
 //!
-//! A bar's dollar volume is the sum of price × size over its trades: `volume × vwap`, with the
-//! vwap between the bar's low and high. So `dollar_volume - volume × open` is at most
-//! `volume × (high - low)` in size, and 0 when every trade was at the open (a single trade, a flat
-//! bar), as many minute bars are. The layout stores that residual in its place.
-//! A null volume counts as 0, so where the volume is null the residual is the dollar volume.
+//! The [`bars`](crate::bars) layout stores a bar's dollar volume this way, against
+//! `volume × open`. A bar's dollar volume is the sum of price × size over its trades:
+//! `volume × vwap`, with the vwap between the bar's low and high. So `dollar_volume - volume ×
+//! open` is at most `volume × (high - low)` in size, and 0 when every trade was at the open (a
+//! single trade, a flat bar), as many minute bars are. A null `a` counts as 0,
+//! so where it is null the residual is the column itself.
 
 use std::fmt;
 
@@ -27,85 +28,84 @@ use vortex::session::VortexSession;
 
 use crate::scaled::decoded;
 
-/// The scalar function: its children are the residual, the volume and the open, all decimals,
-/// with the residual at the dollar volume's scale and the volume's and the open's adding up to no
-/// more than it.
+/// The scalar function: its children are the residual, `a` and `b`, all decimals, with the
+/// residual at the column's scale and `a`'s and `b`'s adding up to no more than it.
 #[derive(Clone, Debug)]
-pub struct DollarVolumeFn;
+pub struct ProductResidualFn;
 
-/// The dollar volume's decimal type.
+/// The column's decimal type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DollarVolumeOptions {
+pub struct ProductResidualOptions {
     pub decimal: DecimalDType,
 }
 
-impl fmt::Display for DollarVolumeOptions {
+impl fmt::Display for ProductResidualOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.decimal)
     }
 }
 
-/// The dollar volume, a `decimal`, from expressions for its residual, the volume and the open.
-pub fn dollar_volume(
+/// The column, a `decimal`, from expressions for its residual, `a` and `b`.
+pub fn product_residual(
     decimal: DecimalDType,
     residual: Expression,
-    volume: Expression,
-    open: Expression,
+    a: Expression,
+    b: Expression,
 ) -> Expression {
-    DollarVolumeFn.new_expr(DollarVolumeOptions { decimal }, [residual, volume, open])
+    ProductResidualFn.new_expr(ProductResidualOptions { decimal }, [residual, a, b])
 }
 
-/// `10^k`, for the `k` that brings `volume × open` to the dollar volume's `scale`; `None` if it
-/// can't: the residual is only exact at a scale at least theirs.
-pub fn shift(scale: i8, volume: i8, open: i8) -> Option<i128> {
-    let k = i32::from(scale) - i32::from(volume) - i32::from(open);
+/// `10^k`, for the `k` that brings `a × b`, at scales `a` and `b`, to the column's `scale`;
+/// `None` if it can't: the residual is only exact at a scale at least theirs.
+pub fn shift(scale: i8, a: i8, b: i8) -> Option<i128> {
+    let k = i32::from(scale) - i32::from(a) - i32::from(b);
     10i128.checked_pow(u32::try_from(k).ok()?)
 }
 
-/// A chunk's dollar volume and what the [`bars`](crate::bars) layout stores for it (see
+/// A chunk of a column and what the [`bars`](crate::bars) layout stores for it (see
 /// [`residual`]).
 pub(crate) struct Residual {
-    /// The dollar volume's unscaled values, and which are valid.
-    pub dollar_volume: Buffer<i128>,
+    /// The column's unscaled values, and which are valid.
+    pub values: Buffer<i128>,
     pub valid: Mask,
-    /// `dollar_volume - volume × open`, at the dollar volume's type and with its validity.
+    /// `column - a × b`, at the column's type and with its validity.
     pub residual: ArrayRef,
 }
 
-/// The residual of a chunk's `dollar_volume`, given its `volume` and its unscaled `open` prices,
-/// at `open_scale`. A null volume counts as 0.
+/// The residual of a chunk of `column`, given `a` and the unscaled values of `b`, at `b_scale`.
+/// A null `a` counts as 0.
 pub(crate) fn residual(
-    dollar_volume: &DecimalArray,
-    volume: &DecimalArray,
-    open: &[i128],
-    open_scale: i8,
+    column: &DecimalArray,
+    a: &DecimalArray,
+    b: &[i128],
+    b_scale: i8,
     ctx: &mut ExecutionCtx,
 ) -> VortexResult<Residual> {
     let unscaled = |column: &DecimalArray, ctx: &mut ExecutionCtx| -> VortexResult<_> {
         let valid = column.validity()?.execute_mask(column.len(), ctx)?;
         Ok((converted_buffer::<i128>(column, &valid)?, valid))
     };
-    let (dv_values, valid) = unscaled(dollar_volume, ctx)?;
-    let (volume_values, volume_valid) = unscaled(volume, ctx)?;
-    let factor = shift(dollar_volume.scale(), volume.scale(), open_scale)
-        .ok_or_else(|| vortex_err!("the dollar volume's scale is below volume × open's"))?;
-    let mut residual = BufferMut::with_capacity(dv_values.len());
-    for i in 0..dv_values.len() {
-        let product = match volume_valid.value(i) {
-            true => (volume_values[i].checked_mul(open[i]))
+    let (values, valid) = unscaled(column, ctx)?;
+    let (a_values, a_valid) = unscaled(a, ctx)?;
+    let factor = shift(column.scale(), a.scale(), b_scale)
+        .ok_or_else(|| vortex_err!("the column's scale is below a × b's"))?;
+    let mut residual = BufferMut::with_capacity(values.len());
+    for i in 0..values.len() {
+        let product = match a_valid.value(i) {
+            true => (a_values[i].checked_mul(b[i]))
                 .and_then(|p| p.checked_mul(factor))
-                .ok_or_else(|| vortex_err!("volume × open is too wide for an i128"))?,
+                .ok_or_else(|| vortex_err!("a × b is too wide for an i128"))?,
             false => 0,
         };
-        residual.push(dv_values[i].wrapping_sub(product));
+        residual.push(values[i].wrapping_sub(product));
     }
     let residual = DecimalArray::new(
         residual.freeze(),
-        dollar_volume.decimal_dtype(),
-        dollar_volume.validity()?,
+        column.decimal_dtype(),
+        column.validity()?,
     );
     Ok(Residual {
-        dollar_volume: dv_values,
+        values,
         valid,
         residual: residual.into_array(),
     })
@@ -146,63 +146,63 @@ fn widening(x: i64, y: i64) -> i128 {
     i128::from(x) * i128::from(y)
 }
 
-/// `r × r_factor + v × o × product_factor` for each row, `v × o` taken as 0 where `valid`
-/// (the volume's) is false.
-fn rebuild<R, V, O>(
+/// `r × r_factor + a × b × product_factor` for each row, `a × b` taken as 0 where `valid`
+/// (`a`'s) is false.
+fn rebuild<R, A, B>(
     r: &[R],
-    v: &[V],
-    o: &[O],
+    a: &[A],
+    b: &[B],
     valid: &Mask,
     r_factor: i128,
     product_factor: i128,
 ) -> Buffer<i128>
 where
     R: AsPrimitive<i128> + AsPrimitive<i64>,
-    V: AsPrimitive<i128> + AsPrimitive<i64>,
-    O: AsPrimitive<i128> + AsPrimitive<i64>,
+    A: AsPrimitive<i128> + AsPrimitive<i64>,
+    B: AsPrimitive<i128> + AsPrimitive<i64>,
 {
-    let at = |r: R, v: V, o: O| {
-        let (v, o): (i128, i128) = (v.as_(), o.as_());
-        let product = v.wrapping_mul(o).wrapping_mul(product_factor);
+    let at = |r: R, a: A, b: B| {
+        let (a, b): (i128, i128) = (a.as_(), b.as_());
+        let product = a.wrapping_mul(b).wrapping_mul(product_factor);
         AsPrimitive::<i128>::as_(r)
             .wrapping_mul(r_factor)
             .wrapping_add(product)
     };
-    // The usual case: the residual fits an i64, the volume and the open an i32 (so `v × o` is
-    // exact in an i64), and both factors an i64. Each product then widens, and neither the
-    // products nor their sum can overflow.
-    let narrow = size_of::<R>() <= 8 && size_of::<V>() <= 4 && size_of::<O>() <= 4;
+    // The usual case: the residual fits an i64, `a` and `b` an i32 (so `a × b` is exact in an
+    // i64), and both factors an i64. Each product then widens, and neither the products nor
+    // their sum can overflow.
+    let narrow = size_of::<R>() <= 8 && size_of::<A>() <= 4 && size_of::<B>() <= 4;
     if let (true, true, Ok(r_factor), Ok(product_factor)) = (
         narrow,
         valid.all_true(),
         i64::try_from(r_factor),
         i64::try_from(product_factor),
     ) {
-        let rows = r.iter().zip(v).zip(o).map(|((&r, &v), &o)| {
-            let (r, v, o): (i64, i64, i64) = (r.as_(), v.as_(), o.as_());
-            widening(r, r_factor) + widening(v * o, product_factor)
+        let rows = r.iter().zip(a).zip(b).map(|((&r, &a), &b)| {
+            let (r, a, b): (i64, i64, i64) = (r.as_(), a.as_(), b.as_());
+            widening(r, r_factor) + widening(a * b, product_factor)
         });
         return Buffer::from_trusted_len_iter(rows);
     }
     if valid.all_true() {
-        let rows = r.iter().zip(v).zip(o).map(|((&r, &v), &o)| at(r, v, o));
+        let rows = r.iter().zip(a).zip(b).map(|((&r, &a), &b)| at(r, a, b));
         return Buffer::from_trusted_len_iter(rows);
     }
     Buffer::from_trusted_len_iter((0..r.len()).map(|i| match valid.value(i) {
-        true => at(r[i], v[i], o[i]),
+        true => at(r[i], a[i], b[i]),
         false => AsPrimitive::<i128>::as_(r[i]).wrapping_mul(r_factor),
     }))
 }
 
-impl ScalarFnVTable for DollarVolumeFn {
-    type Options = DollarVolumeOptions;
+impl ScalarFnVTable for ProductResidualFn {
+    type Options = ProductResidualOptions;
 
     fn id(&self) -> ScalarFnId {
-        static ID: CachedId = CachedId::new("vortex_ohlc.dollar_volume");
+        static ID: CachedId = CachedId::new("vortex_ohlc.product_residual");
         *ID
     }
 
-    fn serialize(&self, options: &DollarVolumeOptions) -> VortexResult<Option<Vec<u8>>> {
+    fn serialize(&self, options: &ProductResidualOptions) -> VortexResult<Option<Vec<u8>>> {
         let decimal = options.decimal;
         Ok(Some(vec![decimal.precision(), decimal.scale() as u8]))
     }
@@ -211,58 +211,69 @@ impl ScalarFnVTable for DollarVolumeFn {
         &self,
         metadata: &[u8],
         _session: &VortexSession,
-    ) -> VortexResult<DollarVolumeOptions> {
+    ) -> VortexResult<ProductResidualOptions> {
         let &[precision, scale] = metadata else {
             vortex_bail!(
-                "vortex_ohlc.dollar_volume takes 2 bytes of options, not {}",
+                "vortex_ohlc.product_residual takes 2 bytes of options, not {}",
                 metadata.len()
             );
         };
         let decimal = DecimalDType::new(precision, scale as i8);
-        Ok(DollarVolumeOptions { decimal })
+        Ok(ProductResidualOptions { decimal })
     }
 
-    fn arity(&self, _options: &DollarVolumeOptions) -> Arity {
+    fn arity(&self, _options: &ProductResidualOptions) -> Arity {
         Arity::Exact(3)
     }
 
-    fn child_name(&self, _options: &DollarVolumeOptions, child_idx: usize) -> ChildName {
+    fn child_name(&self, _options: &ProductResidualOptions, child_idx: usize) -> ChildName {
         match child_idx {
             0 => ChildName::from("residual"),
-            1 => ChildName::from("volume"),
-            2 => ChildName::from("open"),
-            _ => unreachable!("vortex_ohlc.dollar_volume has three children"),
+            1 => ChildName::from("a"),
+            2 => ChildName::from("b"),
+            _ => unreachable!("vortex_ohlc.product_residual has three children"),
         }
     }
 
-    fn return_dtype(&self, options: &DollarVolumeOptions, args: &[DType]) -> VortexResult<DType> {
+    fn return_dtype(
+        &self,
+        options: &ProductResidualOptions,
+        args: &[DType],
+    ) -> VortexResult<DType> {
         match &args[0] {
             DType::Decimal(_, nullability) => Ok(DType::Decimal(options.decimal, *nullability)),
-            other => vortex_bail!("vortex_ohlc.dollar_volume's residual is a decimal, not {other}"),
+            other => {
+                vortex_bail!("vortex_ohlc.product_residual's residual is a decimal, not {other}")
+            }
         }
     }
 
     fn execute(
         &self,
-        options: &DollarVolumeOptions,
+        options: &ProductResidualOptions,
         args: &dyn ExecutionArgs,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
         let residual = decoded(args.get(0)?, ctx)?;
-        let volume = decoded(args.get(1)?, ctx)?;
-        let open = decoded(args.get(2)?, ctx)?;
+        let a = decoded(args.get(1)?, ctx)?;
+        let b = decoded(args.get(2)?, ctx)?;
         let scale = i32::from(options.decimal.scale());
-        let below = || vortex_err!("the dollar volume's scale is below its parts'");
+        let below = || vortex_err!("the column's scale is below its residual's or a × b's");
         let r_factor = pow10(scale - i32::from(residual.scale())).ok_or_else(below)?;
         let product_factor =
-            pow10(scale - i32::from(volume.scale()) - i32::from(open.scale())).ok_or_else(below)?;
+            pow10(scale - i32::from(a.scale()) - i32::from(b.scale())).ok_or_else(below)?;
         let validity = residual.validity()?;
-        let volume_valid = volume.validity()?.execute_mask(volume.len(), ctx)?;
+        let a_valid = a.validity()?.execute_mask(a.len(), ctx)?;
         let rebuilt = with_values!(residual, |r| {
-            with_values!(volume, |v| {
-                with_values!(open, |o| {
-                    rebuild(&r, &v, &o, &volume_valid, r_factor, product_factor)
-                })
+            with_values!(a, |a| {
+                with_values!(b, |b| rebuild(
+                    &r,
+                    &a,
+                    &b,
+                    &a_valid,
+                    r_factor,
+                    product_factor
+                ))
             })
         });
         Ok(DecimalArray::new(rebuilt, options.decimal, validity).into_array())
@@ -280,9 +291,10 @@ mod tests {
     use super::*;
     use crate::scaled::Scaled;
 
-    /// `residual + volume × open` at the dollar volume's scale, a null volume counting as 0.
+    /// `residual + a × b` at the column's scale, a null `a` counting as 0: a dollar volume from
+    /// its residual, the volume and the open.
     #[test]
-    fn rebuilds_the_dollar_volume() {
+    fn rebuilds_the_column() {
         let session = VortexSession::default();
         crate::register(&session);
         let mut ctx = session.create_execution_ctx();
@@ -310,7 +322,7 @@ mod tests {
         ])
         .unwrap()
         .into_array();
-        let expr = dollar_volume(
+        let expr = product_residual(
             decimal,
             get_item("residual", root()),
             get_item("volume", root()),
@@ -355,7 +367,7 @@ mod tests {
         ])
         .unwrap()
         .into_array();
-        let expr = dollar_volume(
+        let expr = product_residual(
             DecimalDType::new(38, 12),
             get_item("residual", root()),
             get_item("volume", root()),
