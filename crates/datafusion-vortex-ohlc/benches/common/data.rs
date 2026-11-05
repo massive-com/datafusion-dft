@@ -41,8 +41,8 @@ const DATA_DIR: &str = concat!(
 /// (`vortex_ohlc::scaled`), 20 since it may give decimals a FoR reference and bit width per block
 /// (`vortex_ohlc::blocked_for`), 21 since that choice is estimated from the widths blocked
 /// bit-packing picks, 22 since that encoding is `vortex_ohlc.scaled` (`vortex_ohlc.pow10`
-/// before). 9 to 16 were these steps in an earlier order.
-const VORTEX_VERSION: u32 = 22;
+/// before), 23 since its metadata has a base. 9 to 16 were these steps in an earlier order.
+const VORTEX_VERSION: u32 = 23;
 
 /// Rows per batch when converting the source.
 const CONVERT_BATCH_SIZE: usize = 65_536;

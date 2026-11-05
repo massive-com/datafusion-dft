@@ -79,8 +79,10 @@ impl Scheme for Pow10Scheme {
         let compress = |child: &ArrayRef, index: usize, exec_ctx: &mut ExecutionCtx| {
             compressor.compress_child(child, &compress_ctx, self.id(), index, exec_ctx)
         };
-        let encoded = compress(array.encoded(), 0, exec_ctx)?;
-        let exponents = compress(array.exponents(), 1, exec_ctx)?;
+        let quotients = compress(array.values(), 0, exec_ctx)?;
+        let exponents = (array.exponents())
+            .map(|exponents| compress(exponents, 1, exec_ctx))
+            .transpose()?;
         let patches = match array.patches() {
             None => None,
             Some(patches) => Some(
@@ -88,7 +90,8 @@ impl Scheme for Pow10Scheme {
                     .map_values(|values| compress(&values, 2, exec_ctx))?,
             ),
         };
-        Ok(Scaled::try_new(encoded, exponents, patches)?.into_array())
+        let exponent = array.exponent();
+        Ok(Scaled::from_parts(quotients, exponents, exponent, array.base(), patches)?.into_array())
     }
 }
 
@@ -128,28 +131,16 @@ mod tests {
     use vortex::buffer::Buffer;
     use vortex::compressor::BtrBlocksCompressor;
     use vortex::dtype::DecimalDType;
-    use vortex::session::VortexSession;
-    use vortex::VortexSessionDefault;
 
     use super::*;
-
-    /// The encoding IDs of `array` and everything under it.
-    fn encoding_ids(array: &ArrayRef) -> Vec<String> {
-        let mut ids = vec![array.encoding_id().to_string()];
-        for child in array.children() {
-            ids.extend(encoding_ids(&child));
-        }
-        ids
-    }
+    use crate::testing::encoding_ids;
 
     /// The compressor of a session with vortex-ohlc stores a decimal column whose blocks move in
     /// different steps (cents, then odd ten-thousandths) as Scaled under its integer part, and
     /// it reads back as it was.
     #[test]
     fn compressor_picks_pow10_for_decimals() {
-        let session = VortexSession::default();
-        crate::edition::enable(&session).unwrap();
-        crate::register(&session);
+        let session = crate::testing::session();
         let mut ctx = session.create_execution_ctx();
         let values: Buffer<i64> = (0..8192i64)
             .map(|i| match (i / 1024) % 2 {

@@ -1,7 +1,8 @@
-//! Filtering a [`Scaled`] array without decoding all of it: its quotients are filtered by their
-//! own encoding's kernels (blocked FoR and bit-packing unpack only the blocks that hold kept rows,
-//! see [`crate::kernels`]), then each kept value is multiplied by its block's power of ten, and
-//! the patches it keeps are applied.
+//! Filtering a [`Scaled`] array of integers without decoding all of it: its quotients are filtered
+//! by their own encoding's kernels (blocked FoR and bit-packing unpack only the blocks that hold
+//! kept rows, see [`crate::kernels`]), then each kept value is multiplied by its block's divisor,
+//! and the patches it keeps are applied. An array with one divisor for every row is filtered
+//! before this, through its values (see [`Scaled`]'s `FilterReduce`).
 
 use vortex::array::arrays::filter::FilterKernel;
 use vortex::array::arrays::PrimitiveArray;
@@ -9,7 +10,7 @@ use vortex::array::{match_each_integer_ptype, ArrayRef, ArrayView, ExecutionCtx,
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 
-use super::{pow10, Scaled, ScaledArrayExt, ScaledArraySlotsExt, BLOCK};
+use super::{divisors, Divisors, Scaled, ScaledArrayExt, ScaledArraySlotsExt, BLOCK};
 
 /// Rows of a filter that ran this kernel, so tests can tell it did.
 #[cfg(test)]
@@ -24,17 +25,25 @@ impl FilterKernel for Scaled {
         let Mask::Values(selected) = mask else {
             return Ok(None);
         };
-        let quotients = array.encoded().filter(mask.clone())?;
+        if !array.dtype().is_int() {
+            return Ok(None);
+        }
+        let quotients = array.values().filter(mask.clone())?;
         let quotients = quotients.execute::<PrimitiveArray>(ctx)?;
-        let exponents = array.exponents().clone().execute::<PrimitiveArray>(ctx)?;
         let validity = quotients.validity()?;
         let filtered = match_each_integer_ptype!(quotients.ptype(), |T| {
-            let factors: Vec<T> = (exponents.as_slice::<u8>().iter())
-                .map(|&exponent| pow10::<T>(exponent))
-                .collect();
+            let divisors = divisors::<T, _>(&array, ctx)?;
             let mut values = quotients.into_buffer_mut::<T>();
-            for (value, &row) in values.as_mut_slice().iter_mut().zip(selected.indices()) {
-                *value = value.wrapping_mul(factors[row / BLOCK]);
+            let values_mut = values.as_mut_slice();
+            match divisors {
+                Divisors::All(divisor) => values_mut
+                    .iter_mut()
+                    .for_each(|v| *v = v.wrapping_mul(divisor)),
+                Divisors::PerBlock(divisors) => {
+                    for (value, &row) in values_mut.iter_mut().zip(selected.indices()) {
+                        *value = value.wrapping_mul(divisors[row / BLOCK]);
+                    }
+                }
             }
             PrimitiveArray::new(values.freeze(), validity)
         });
@@ -62,8 +71,6 @@ mod tests {
     use vortex::compressor::BtrBlocksCompressor;
     use vortex::dtype::DecimalDType;
     use vortex::mask::Mask;
-    use vortex::session::VortexSession;
-    use vortex::VortexSessionDefault;
 
     use super::FILTERED;
 
@@ -87,9 +94,7 @@ mod tests {
     /// block.
     #[test]
     fn filter_matches_values() {
-        let session = VortexSession::default();
-        crate::edition::enable(&session).unwrap();
-        crate::register(&session);
+        let session = crate::testing::session();
         let mut ctx = session.create_execution_ctx();
         let values = prices(5000);
         let decimal = DecimalArray::new(
