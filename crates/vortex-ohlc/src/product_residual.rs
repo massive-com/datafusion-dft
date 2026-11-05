@@ -277,8 +277,6 @@ mod tests {
     use vortex::array::validity::Validity;
     use vortex::array::VortexSessionExecute;
     use vortex::expr::{get_item, root};
-    use vortex::session::VortexSession;
-    use vortex::VortexSessionDefault;
 
     use super::*;
     use crate::scaled::Scaled;
@@ -287,8 +285,7 @@ mod tests {
     /// its residual, the volume and the open.
     #[test]
     fn rebuilds_the_column() {
-        let session = VortexSession::default();
-        crate::register(&session);
+        let session = crate::testing::session();
         let mut ctx = session.create_execution_ctx();
         let decimal = DecimalDType::new(38, 12);
         // $1.50 × 100 shares = $150, plus a residual of $0.25, a bar with a null volume and one
@@ -333,8 +330,7 @@ mod tests {
     /// The same, from [`Scaled`] children, read at their values' scales and widths.
     #[test]
     fn rebuilds_from_scaled_children() {
-        let session = VortexSession::default();
-        crate::register(&session);
+        let session = crate::testing::session();
         let mut ctx = session.create_execution_ctx();
         fn scaled<T: vortex::dtype::NativeDecimalType>(
             values: Vec<T>,
