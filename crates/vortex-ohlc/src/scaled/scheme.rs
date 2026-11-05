@@ -1,4 +1,4 @@
-//! [`Pow10Scheme`]: when Vortex's compressor stores integers as [`Pow10`].
+//! [`Pow10Scheme`]: when Vortex's compressor stores integers as [`Scaled`].
 
 use std::sync::Arc;
 
@@ -13,10 +13,10 @@ use vortex_btrblocks::{
 };
 use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 
-use super::encode::{block_exponents, pow10_encode_with};
-use super::{Pow10, Pow10ArrayExt, Pow10ArraySlotsExt};
+use super::encode::{block_exponents, scaled_encode_with};
+use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
 
-/// Stores a decimal's integer part as [`Pow10`] whenever a block of it is worth an exponent, then
+/// Stores a decimal's integer part as [`Scaled`] whenever a block of it is worth an exponent, then
 /// compresses its quotients, exponents and patches' values in turn. A block's kept quotients span
 /// no more than its values do, so whatever would have compressed the values compresses them about
 /// as well.
@@ -36,7 +36,7 @@ impl Scheme for Pow10Scheme {
     }
 
     fn produced_encodings(&self) -> Vec<ArrayId> {
-        vec![Pow10.id()]
+        vec![Scaled.id()]
     }
 
     /// Children: the quotients, the exponents, and the patches' values.
@@ -73,7 +73,7 @@ impl Scheme for Pow10Scheme {
         let values = data.array_as_primitive().into_owned();
         let exponents = exponents(data, exec_ctx);
         let exponents = (exponents.0.as_ref()).ok_or_else(|| vortex_err!("no exponents"))?;
-        let Some(array) = pow10_encode_with(&values, exponents, exec_ctx)? else {
+        let Some(array) = scaled_encode_with(&values, exponents, exec_ctx)? else {
             return Ok(values.into_array());
         };
         let compress = |child: &ArrayRef, index: usize, exec_ctx: &mut ExecutionCtx| {
@@ -88,7 +88,7 @@ impl Scheme for Pow10Scheme {
                     .map_values(|values| compress(&values, 2, exec_ctx))?,
             ),
         };
-        Ok(Pow10::try_new(encoded, exponents, patches)?.into_array())
+        Ok(Scaled::try_new(encoded, exponents, patches)?.into_array())
     }
 }
 
@@ -143,7 +143,7 @@ mod tests {
     }
 
     /// The compressor of a session with vortex-ohlc stores a decimal column whose blocks move in
-    /// different steps (cents, then odd ten-thousandths) as Pow10 under its integer part, and
+    /// different steps (cents, then odd ten-thousandths) as Scaled under its integer part, and
     /// it reads back as it was.
     #[test]
     fn compressor_picks_pow10_for_decimals() {
@@ -167,7 +167,7 @@ mod tests {
             .compress(&decimal, &mut ctx)
             .unwrap();
         let ids = encoding_ids(&compressed);
-        assert!(ids.iter().any(|id| id == "vortex_ohlc.pow10"), "{ids:?}");
+        assert!(ids.iter().any(|id| id == "vortex_ohlc.scaled"), "{ids:?}");
         // Read back at the narrowest width that holds the values.
         let read = compressed.execute::<DecimalArray>(&mut ctx).unwrap();
         let read: Vec<i64> = read.buffer::<i32>().iter().map(|&v| v.into()).collect();

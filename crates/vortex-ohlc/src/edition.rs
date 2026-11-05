@@ -1,7 +1,7 @@
 //! The edition a writer needs for what [`crate::write`] writes, beyond Vortex's `core`
 //! editions:
 //!
-//! - ours: the [`bars`](crate::bars) layout and the [`pow10`](crate::pow10) encoding;
+//! - ours: the [`bars`](crate::bars) layout and the [`scaled`](crate::scaled) encoding;
 //! - three of Vortex's own wire formats, new in Vortex 0.89 and in no Vortex edition yet: blocked
 //!   FoR and bit-packing (a reference and a bit width per 1024 values), and DecimalByteParts with
 //!   lower parts (for chunks wider than an i64).
@@ -33,7 +33,7 @@ pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     },
     added: &[
         EditionMember::layout(&"vortex_ohlc.bars"),
-        EditionMember::array(&"vortex_ohlc.pow10"),
+        EditionMember::array(&"vortex_ohlc.scaled"),
         EditionMember::array(&"fastlanes.for.v2"),
         EditionMember::array(&"fastlanes.bitpacked.v2"),
         EditionMember::array(&"vortex.decimal_byte_parts.v2"),

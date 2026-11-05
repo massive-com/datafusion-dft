@@ -11,25 +11,25 @@ use vortex::buffer::{Buffer, BufferMut};
 use vortex::error::VortexResult;
 use vortex::mask::Mask;
 
-use super::{Pow10, Pow10Array, BLOCK};
+use super::{Scaled, ScaledArray, BLOCK};
 
-/// `array` as a [`Pow10Array`] with plain children, for the caller to compress; `None` when no
+/// `array` as a [`ScaledArray`] with plain children, for the caller to compress; `None` when no
 /// block is worth an exponent.
-pub fn pow10_encode(
+pub fn scaled_encode(
     array: &PrimitiveArray,
     ctx: &mut ExecutionCtx,
-) -> VortexResult<Option<Pow10Array>> {
+) -> VortexResult<Option<ScaledArray>> {
     let exponents = block_exponents(array, ctx)?;
-    pow10_encode_with(array, &exponents, ctx)
+    scaled_encode_with(array, &exponents, ctx)
 }
 
-/// `array` as a [`Pow10Array`] with each block's exponent in `exponents`, as
+/// `array` as a [`ScaledArray`] with each block's exponent in `exponents`, as
 /// [`block_exponents`] chose them; `None` when they're all 0.
-pub(super) fn pow10_encode_with(
+pub(super) fn scaled_encode_with(
     array: &PrimitiveArray,
     exponents: &[u8],
     ctx: &mut ExecutionCtx,
-) -> VortexResult<Option<Pow10Array>> {
+) -> VortexResult<Option<ScaledArray>> {
     if exponents.iter().all(|&e| e == 0) {
         return Ok(None);
     }
@@ -58,7 +58,7 @@ pub(super) fn pow10_encode_with(
         };
         let quotients = PrimitiveArray::new(divided.quotients, array.validity()?);
         let exponents = Buffer::copy_from(exponents).into_array();
-        Ok(Some(Pow10::try_new(
+        Ok(Some(Scaled::try_new(
             quotients.into_array(),
             exponents,
             patches,
@@ -135,7 +135,7 @@ fn powers<T: PrimInt + CheckedMul>() -> Vec<T> {
     std::iter::successors(Some(T::one()), |p| p.checked_mul(&ten)).collect()
 }
 
-/// The quotients of a [`Pow10Array`], and its patches' rows and values.
+/// The quotients of a [`ScaledArray`], and its patches' rows and values.
 struct Divided<T> {
     quotients: Buffer<T>,
     patch_rows: Vec<u64>,
@@ -187,19 +187,19 @@ mod tests {
     use vortex::array::VortexSessionExecute;
 
     use super::*;
-    use crate::pow10::Pow10ArraySlotsExt;
+    use crate::scaled::ScaledArraySlotsExt;
 
     fn session() -> vortex::session::VortexSession {
         use vortex::VortexSessionDefault;
         let session = vortex::session::VortexSession::default();
-        crate::pow10::register(&session);
+        crate::scaled::register(&session);
         session
     }
 
     /// What `array` decodes to, read whole and one row at a time.
     fn assert_round_trip(array: PrimitiveArray, exponents: &[u8]) {
         let mut ctx = session().create_execution_ctx();
-        let encoded = pow10_encode(&array, &mut ctx)
+        let encoded = scaled_encode(&array, &mut ctx)
             .unwrap()
             .expect("a block divides");
         let got = encoded
@@ -254,10 +254,10 @@ mod tests {
             .collect();
         let odd = values.iter().filter(|&&v| v % 100 != 0).count();
         let mut ctx = session().create_execution_ctx();
-        let encoded = pow10_encode(&PrimitiveArray::from_iter(values.clone()), &mut ctx)
+        let encoded = scaled_encode(&PrimitiveArray::from_iter(values.clone()), &mut ctx)
             .unwrap()
             .unwrap();
-        let patches = crate::pow10::Pow10ArrayExt::patches(&encoded).expect("patches");
+        let patches = crate::scaled::ScaledArrayExt::patches(&encoded).expect("patches");
         assert_eq!(patches.num_patches(), odd);
         assert_round_trip(PrimitiveArray::from_iter(values), &[2, 2, 2]);
     }

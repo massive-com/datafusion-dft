@@ -21,10 +21,10 @@ use vortex_btrblocks::schemes::integer::BitPackingScheme;
 use vortex_btrblocks::{ArrayAndStats, CascadingCompressor, CompressorContext, Scheme, SchemeExt};
 use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 
-use crate::pow10::is_decimal_values;
+use crate::scaled::is_decimal_values;
 
 /// Blocked FoR over blocked bit-packing for a decimal's integer part, or the quotients
-/// [`Pow10`](crate::pow10::Pow10) made of it, when its blocks' ranges pack smaller than the
+/// [`Scaled`](crate::scaled::Scaled) made of it, when its blocks' ranges pack smaller than the
 /// values do without a reference.
 ///
 /// A workaround, to be fixed upstream: Vortex's own FoR scheme should estimate a reference per

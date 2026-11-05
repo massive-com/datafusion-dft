@@ -8,7 +8,7 @@
 //! - [`write`](mod@write): the options to write a table with.
 //! - [`edition`]: the edition that lets a writer emit Vortex's blocked FoR and bit-packing.
 //! - [`kernels`]: filters on those blocked encodings that unpack only the blocks they keep.
-//! - [`pow10`]: integers divided, a block at a time, by a power of ten the block shares.
+//! - [`scaled`]: integers divided, a block at a time, by a power of ten the block shares.
 //! - [`blocked_for`]: a reference and a bit width per block for decimals, where that pays.
 //!
 //! Reading the files from DataFusion is datafusion-vortex-ohlc's, and pruning scans on the zone
@@ -21,17 +21,17 @@ pub mod blocked_for;
 pub mod edition;
 pub mod kernels;
 pub mod ohlc;
-pub mod pow10;
 pub mod price_fn;
+pub mod scaled;
 pub mod write;
 
 /// Register what a session needs to read vortex-ohlc's files, and to read them well: the
-/// [`bars`] layout and its price function, the [`pow10`] encoding, the filter [`kernels`], and
-/// for writing, the compression schemes that pick [`pow10`] and [`blocked_for`].
+/// [`bars`] layout and its price function, the [`scaled`] encoding, the filter [`kernels`], and
+/// for writing, the compression schemes that pick [`scaled`] and [`blocked_for`].
 pub fn register(session: &VortexSession) {
     bars::register(session);
     kernels::register(session);
-    pow10::register(session);
+    scaled::register(session);
     register_scheme(session, &blocked_for::BlockedForScheme);
 }
 
