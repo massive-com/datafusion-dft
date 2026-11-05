@@ -40,6 +40,7 @@
 //! data with, so the reads go wherever the data's do (S3, a disk cache in front of it, or a local
 //! file). [`VortexExecFactory`](crate::VortexExecFactory) calls it for every scan it builds.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -49,7 +50,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, StructArray};
 use arrow::compute::{cast, nullif};
 use arrow::datatypes::Schema;
 use datafusion::common::pruning::PruningStatistics;
-use datafusion::common::{Column, Result, ScalarValue};
+use datafusion::common::{Column, DataFusionError, Result, ScalarValue};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -140,20 +141,17 @@ impl ZonePruner {
             .map(|group| {
                 let files = group.iter().map(|file| {
                     let mut file = file.clone();
-                    // A file whose zone maps couldn't be read is scanned whole.
-                    let Some(zones) = zones.next().flatten() else {
-                        return file;
-                    };
-                    if let Some(selection) = selection(&zones, predicate, table) {
+                    let zones = zones.next().expect("zone maps for every file");
+                    if let Some(selection) = selection(&zones, predicate, table)? {
                         file.extensions
                             .insert(VortexAccessPlan::default().with_selection(selection));
                         pruned = true;
                     }
-                    file
+                    Ok(file)
                 });
-                FileGroup::new(files.collect())
+                Ok(FileGroup::new(files.collect::<Result<Vec<_>>>()?))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         if !pruned {
             return Ok(conf);
         }
@@ -170,7 +168,8 @@ impl ZonePruner {
 
     /// The zone maps of `file` in the object store at `url`: the ones kept, unless the file has
     /// changed since they were read, or else read through `readers` (or by the query already
-    /// reading them) and kept. `None` if they can't be read, until a later query tries again.
+    /// reading them) and kept. An error if they can't be read, which isn't kept, so a later
+    /// query tries again.
     ///
     /// *Upstream*: this opens the file again, reading its footer, which vortex-datafusion has
     /// already put in DataFusion's file metadata cache as `CachedVortexMetadata`
@@ -182,12 +181,12 @@ impl ZonePruner {
         url: &ObjectStoreUrl,
         file: &PartitionedFile,
         readers: &dyn VortexReaderFactory,
-    ) -> Result<Option<Arc<FileZones>>> {
+    ) -> Result<Arc<FileZones>> {
         let key = key(url, file);
         let meta = &file.object_meta;
         if let Some(zones) = self.files.get(&key).await {
             if zones.meta.size == meta.size && zones.meta.last_modified == meta.last_modified {
-                return Ok(Some(zones));
+                return Ok(zones);
             }
             self.files.invalidate(&key).await;
         }
@@ -198,12 +197,13 @@ impl ZonePruner {
                 .open_options()
                 .with_file_size(meta.size)
                 .open_read(reader)
+                .await?;
+            FileZones::read(&self.session, &file, meta.clone())
                 .await
-                .ok()?;
-            let zones = FileZones::read(&self.session, &file, meta.clone()).await;
-            zones.ok().map(Arc::new)
+                .map(Arc::new)
         };
-        Ok(self.files.optionally_get_with(key, read).await)
+        (self.files.try_get_with(key, read).await)
+            .map_err(|err| DataFusionError::External(Box::new(err)))
     }
 }
 
@@ -220,44 +220,69 @@ fn key(url: &ObjectStoreUrl, file: &PartitionedFile) -> String {
 
 /// The child named `name` of the first layout at or under `layout` that has one, depth first:
 /// a field of the table's struct layout, wherever that is.
-fn find_child(layout: &LayoutRef, name: &str) -> Option<LayoutRef> {
-    let children = layout.children().ok()?;
+fn find_child(layout: &LayoutRef, name: &str) -> VortexResult<Option<LayoutRef>> {
+    let children = layout.children()?;
     if let Some(index) = layout.child_names().position(|n| n.as_ref() == name) {
-        return children.get(index).map(Arc::clone);
+        return Ok(children.get(index).map(Arc::clone));
     }
-    children.iter().find_map(|child| find_child(child, name))
+    for child in children.iter() {
+        if let Some(found) = find_child(child, name)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// The first zoned layout at or under `layout`, depth first.
-fn find_zoned(layout: &LayoutRef) -> Option<LayoutRef> {
+fn find_zoned(layout: &LayoutRef) -> VortexResult<Option<LayoutRef>> {
     if layout.is::<Zoned>() {
-        return Some(Arc::clone(layout));
+        return Ok(Some(Arc::clone(layout)));
     }
-    layout.children().ok()?.iter().find_map(find_zoned)
+    for child in layout.children()?.iter() {
+        if let Some(found) = find_zoned(child)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 /// The rows in the zones of a file with the zone maps `zones` that `predicate` (over `table`,
-/// the table's schema) can match; `None` to scan it whole.
+/// the table's schema) can match; `None` to scan it whole: it has no zone maps, the predicate
+/// can't rule any zone out, or it keeps too many to be worth it.
 fn selection(
     zones: &FileZones,
     predicate: &Arc<dyn PhysicalExpr>,
     table: &Arc<Schema>,
-) -> Option<Selection> {
+) -> Result<Option<Selection>> {
+    let Some((zone_len, nzones)) = zones.shape else {
+        return Ok(None);
+    };
     let pruning = PruningPredicateBuilder::new()
         .with_file_schema(Arc::clone(table))
-        .build(Arc::clone(predicate))?;
-    let stats = ZoneStatistics { zones, table };
-    let keep = pruning.prune(&stats).ok()?;
+        .try_build(Arc::clone(predicate))?;
+    if pruning.always_true() {
+        return Ok(None);
+    }
+    let stats = ZoneStatistics {
+        zones,
+        table,
+        nzones,
+        error: RefCell::new(None),
+    };
+    let keep = pruning.prune(&stats)?;
+    if let Some(err) = stats.error.take() {
+        return Err(err);
+    }
     let kept = keep.iter().filter(|&&keep| keep).count();
     if kept as f64 > keep.len() as f64 * MAX_KEPT {
-        return None;
+        return Ok(None);
     }
     let mut selected = RoaringTreemap::new();
     for (zone, _) in keep.iter().enumerate().filter(|(_, &keep)| keep) {
-        let start = zone as u64 * zones.zone_len;
-        selected.insert_range(start..(start + zones.zone_len).min(zones.row_count));
+        let start = zone as u64 * zone_len;
+        selected.insert_range(start..(start + zone_len).min(zones.row_count));
     }
-    Some(Selection::IncludeRoaring(selected))
+    Ok(Some(Selection::IncludeRoaring(selected)))
 }
 
 /// A file's zone maps, as of its size and modification time (in `meta`): every zoned column's
@@ -267,14 +292,15 @@ struct FileZones {
     meta: ObjectMeta,
     /// What the min and max arrays take in memory, as the cache weighs them.
     bytes: u32,
-    zone_len: u64,
+    /// The rows per zone and the zones every column has; `None` if the file has no zone maps.
+    shape: Option<(u64, usize)>,
     row_count: u64,
-    nzones: usize,
     columns: HashMap<String, (ArrayRef, ArrayRef)>,
 }
 
 impl FileZones {
-    /// Every zoned column's zone map in `file`; an error unless they all have the same zones.
+    /// Every zoned column's zone map in `file`: an error if one can't be read, or unless they
+    /// all have the same zones.
     async fn read(
         session: &VortexSession,
         file: &VortexFile,
@@ -285,7 +311,7 @@ impl FileZones {
         let mut root_layout = Arc::clone(file.footer().layout());
         let mut columns = HashMap::new();
         let mut shape = None;
-        if let Some((zones, zone_len)) = source_zones(&root_layout) {
+        if let Some((zones, zone_len)) = source_zones(&root_layout)? {
             shape = Some((zone_len, zones.row_count() as usize));
             let table = read_table(session, file, "zones", &zones).await?;
             // A min and a max per column: the prices, and the dollar volume if it's stored as a
@@ -312,21 +338,22 @@ impl FileZones {
         // Each zoned column's zoned layout, by path.
         let mut zoned: Vec<(String, LayoutRef)> = Vec::new();
         for (name, dtype) in fields.names().iter().zip(fields.fields()) {
-            let Some(column) = find_child(root_layout, name.as_ref()) else {
+            let Some(column) = find_child(root_layout, name.as_ref())? else {
                 continue;
             };
             match dtype.as_struct_fields_opt() {
                 Some(parts) => {
                     for part in parts.names().iter() {
-                        let layout =
-                            find_child(&column, part.as_ref()).and_then(|l| find_zoned(&l));
-                        if let Some(layout) = layout {
+                        let Some(part_layout) = find_child(&column, part.as_ref())? else {
+                            continue;
+                        };
+                        if let Some(layout) = find_zoned(&part_layout)? {
                             zoned.push((format!("{name}.{part}"), layout));
                         }
                     }
                 }
                 None => {
-                    if let Some(layout) = find_zoned(&column) {
+                    if let Some(layout) = find_zoned(&column)? {
                         zoned.push((name.to_string(), layout));
                     }
                 }
@@ -344,17 +371,15 @@ impl FileZones {
             let bounds = read_zone_map(session, file, &path, &zones).await?;
             columns.insert(path, bounds);
         }
-        let (zone_len, nzones) = shape.ok_or_else(|| vortex_err!("no zoned columns"))?;
-        let bytes = columns
-            .values()
+        let bytes = (columns.values())
             .map(|(min, max)| min.get_array_memory_size() + max.get_array_memory_size())
             .sum::<usize>();
         Ok(Self {
             meta,
+            // The cache's weight saturates; a file's zone maps never come near 4 GiB.
             bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
-            zone_len,
+            shape,
             row_count: file.row_count(),
-            nzones,
             columns,
         })
     }
@@ -431,18 +456,28 @@ async fn read_table(
 }
 
 /// A file's zone maps as DataFusion's statistics over the table's columns, a zone a container.
+/// `PruningStatistics` can't return an error, so the first one is kept for [`selection`].
 struct ZoneStatistics<'a> {
     zones: &'a FileZones,
     table: &'a Schema,
+    nzones: usize,
+    error: RefCell<Option<DataFusionError>>,
 }
 
 impl ZoneStatistics<'_> {
-    /// The zones' min (`max` false) or max of the table's `column`, in the table's type.
+    /// The zones' min (`max` false) or max of the table's `column`, in the table's type; `None`
+    /// if the table or the file's zone maps don't have the column.
     fn bound(&self, column: &Column, max: bool) -> Option<ArrayRef> {
-        let field = self.table.field_with_name(&column.name).ok()?;
+        let (_, field) = self.table.column_with_name(&column.name)?;
         let (min_values, max_values) = self.zones.columns.get(&column.name)?;
         let stored = if max { max_values } else { min_values };
-        cast(stored, field.data_type()).ok()
+        match cast(stored, field.data_type()) {
+            Ok(bound) => Some(bound),
+            Err(err) => {
+                (self.error.borrow_mut()).get_or_insert(DataFusionError::from(err));
+                None
+            }
+        }
     }
 }
 
@@ -456,7 +491,7 @@ impl PruningStatistics for ZoneStatistics<'_> {
     }
 
     fn num_containers(&self) -> usize {
-        self.zones.nzones
+        self.nzones
     }
 
     fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {

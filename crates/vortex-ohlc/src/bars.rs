@@ -29,7 +29,7 @@ use vortex::buffer::BufferMut;
 use vortex::dtype::{
     DType, DecimalDType, FieldMask, FieldName, FieldPath, Nullability, StructFields,
 };
-use vortex::error::{vortex_bail, vortex_ensure, vortex_err, VortexResult};
+use vortex::error::{vortex_bail, vortex_ensure, vortex_err, VortexError, VortexResult};
 use vortex::expr::{get_item, pack, root, BoundExpression, ExactBoundExpr, Expression};
 use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex::layout::segments::{SegmentSinkRef, SegmentSource};
@@ -198,9 +198,11 @@ pub fn data_child(layout: &LayoutRef) -> VortexResult<LayoutRef> {
 
 /// A bars layout's source zones (see [`zones_dtype`]) and the rows per zone; `None` for any other
 /// layout.
-pub fn source_zones(layout: &LayoutRef) -> Option<(LayoutRef, u64)> {
-    let bars = layout.as_opt::<BarsLayout>()?;
-    Some((Arc::clone(&layout.children().ok()?[1]), bars.zone_len))
+pub fn source_zones(layout: &LayoutRef) -> VortexResult<Option<(LayoutRef, u64)>> {
+    let Some(bars) = layout.as_opt::<BarsLayout>() else {
+        return Ok(None);
+    };
+    Ok(Some((Arc::clone(&layout.children()?[1]), bars.zone_len)))
 }
 
 /// The field of the source's zones (see [`zones_dtype`]) with `column`'s min, or its max.
@@ -727,16 +729,16 @@ impl BarsReader {
                 let all = root().bind(zones.dtype())?;
                 reader.projection_evaluation(&(0..n), &all, MaskFuture::new_true(n as usize))
             });
-        async move {
-            let table = read.ok()?.await.ok()?;
-            Some(Arc::new(PriceBounds {
+        let bounds = async move {
+            Ok(Arc::new(PriceBounds {
                 zone_len,
                 row_count,
-                table,
+                table: read?.await?,
             }))
-        }
-        .boxed()
-        .shared()
+        };
+        async move { bounds.await.map_err(Arc::new) }
+            .boxed()
+            .shared()
     }
 
     /// The zones the prices' bounds rule out for `expr`, once per filter: Vortex's own rules
@@ -763,14 +765,13 @@ impl BarsReader {
             let (bounds, session) = (self.bounds(), self.session.clone());
             async move {
                 let bounds = bounds.await?;
-                let mut ctx = session.create_execution_ctx();
-                let proven = bounds.table.clone().apply_bound(&proof).ok()?;
-                let zones = proven
-                    .fill_null(false)
-                    .ok()?
-                    .execute::<Mask>(&mut ctx)
-                    .ok()?;
-                Some(Arc::new(RuledOut { bounds, zones }))
+                let prove = || -> VortexResult<Mask> {
+                    let mut ctx = session.create_execution_ctx();
+                    let proven = bounds.table.clone().apply_bound(&proof)?;
+                    proven.fill_null(false)?.execute::<Mask>(&mut ctx)
+                };
+                let zones = prove().map_err(Arc::new)?;
+                Ok(Arc::new(RuledOut { bounds, zones }))
             }
             .boxed()
             .shared()
@@ -841,9 +842,8 @@ impl LayoutReader for BarsReader {
         };
         let row_range = row_range.clone();
         Ok(MaskFuture::new(mask.len(), async move {
-            let Some(ruled_out) = ruled_out.await else {
-                return Ok(mask);
-            };
+            let ruled_out = (ruled_out.await)
+                .map_err(|err| vortex_err!("ruling out zones by the prices' bounds: {err}"))?;
             let zone_len = ruled_out.bounds.zone_len;
             let end = row_range.end.min(ruled_out.bounds.row_count);
             let mut keep: Vec<(usize, usize)> = Vec::new();
@@ -926,7 +926,8 @@ struct RuledOut {
     zones: Mask,
 }
 
-type SharedRuledOut = Shared<BoxFuture<'static, Option<Arc<RuledOut>>>>;
+/// Shared by every split of a scan, so an error is shared as well.
+type SharedRuledOut = Shared<BoxFuture<'static, Result<Arc<RuledOut>, Arc<VortexError>>>>;
 
 /// The source's zones (see [`zones_dtype`]) as read, with their rows per zone.
 struct PriceBounds {
@@ -935,7 +936,7 @@ struct PriceBounds {
     table: ArrayRef,
 }
 
-type SharedBounds = Shared<BoxFuture<'static, Option<Arc<PriceBounds>>>>;
+type SharedBounds = Shared<BoxFuture<'static, Result<Arc<PriceBounds>, Arc<VortexError>>>>;
 
 #[cfg(test)]
 mod tests {
