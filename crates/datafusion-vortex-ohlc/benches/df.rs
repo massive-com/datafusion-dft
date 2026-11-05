@@ -29,14 +29,13 @@
 
 mod common;
 
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
-use arrow::row::{RowConverter, SortField};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
+use datafusion::common::hash_utils::{with_hashes, RandomState};
 use datafusion::datasource::file_format::FileFormatFactory;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -44,7 +43,7 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_vortex_ohlc::vortex_format_factory;
 use datafusion_vortex_prune::{reader_factory, PrunedTable, VortexExecFactory, ZonePruner};
@@ -164,7 +163,7 @@ async fn run(ctx: &SessionContext, sql: &str) -> usize {
 }
 
 /// What a query returned, whatever the order of its rows: their count, the columns' types, and
-/// a sum of each row's hash.
+/// a sum of each row's hash (DataFusion's, over all its columns, with a fixed seed).
 #[derive(Debug, PartialEq)]
 struct Fingerprint {
     rows: usize,
@@ -172,30 +171,31 @@ struct Fingerprint {
     hash: u64,
 }
 
-fn fingerprint(schema: &Schema, batches: &[RecordBatch]) -> Fingerprint {
-    let types: Vec<DataType> = schema
-        .fields()
-        .iter()
-        .map(|f| f.data_type().clone())
-        .collect();
-    let fields = types.iter().cloned().map(SortField::new).collect();
-    let converter = RowConverter::new(fields).unwrap();
-    let mut hash = 0u64;
-    let mut rows = 0;
-    for batch in batches {
-        let converted = converter.convert_columns(batch.columns()).unwrap();
-        for row in converted.iter() {
-            let mut hasher = DefaultHasher::new();
-            row.as_ref().hash(&mut hasher);
-            hash = hash.wrapping_add(hasher.finish());
+impl Fingerprint {
+    fn new(schema: &Schema) -> Self {
+        let types = (schema.fields().iter())
+            .map(|f| f.data_type().clone())
+            .collect();
+        Self {
+            rows: 0,
+            types,
+            hash: 0,
         }
-        rows += batch.num_rows();
     }
-    Fingerprint { rows, types, hash }
+
+    fn add(&mut self, batch: &RecordBatch) {
+        let state = RandomState::with_seed(0);
+        let sum = with_hashes(batch.columns(), &state, |hashes| {
+            Ok(hashes.iter().copied().fold(0, u64::wrapping_add))
+        });
+        self.hash = self.hash.wrapping_add(sum.unwrap());
+        self.rows += batch.num_rows();
+    }
 }
 
 /// Run `sql` once to check it, and to see what its file scan counted: its fingerprint, and the
-/// scan's DataFusion metrics, summed by name (all but the timings).
+/// scan's DataFusion metrics, summed by name (all but the timings). The batches are hashed as
+/// they come, not kept.
 async fn check(ctx: &SessionContext, sql: &str) -> (Fingerprint, Vec<String>) {
     let plan = ctx
         .sql(sql)
@@ -204,8 +204,12 @@ async fn check(ctx: &SessionContext, sql: &str) -> (Fingerprint, Vec<String>) {
         .create_physical_plan()
         .await
         .unwrap();
-    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
-    (fingerprint(&plan.schema(), &batches), scan_metrics(&plan))
+    let mut fingerprint = Fingerprint::new(&plan.schema());
+    let mut stream = execute_stream(Arc::clone(&plan), ctx.task_ctx()).unwrap();
+    while let Some(batch) = stream.next().await {
+        fingerprint.add(&batch.unwrap());
+    }
+    (fingerprint, scan_metrics(&plan))
 }
 
 fn scan_metrics(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
@@ -334,7 +338,7 @@ impl Setup {
     /// Check every reader of `sql` that runs (under `id/<reader>/<partitions>`) against Parquet
     /// with DataFusion's defaults, print what each counted, and time them as one group; `label`
     /// names the query in what's printed.
-    fn bench(&self, c: &mut Criterion, id: &str, label: &str, sql: &str, scan: bool) {
+    fn bench(&self, c: &mut Criterion, id: &str, label: &str, sql: &str) {
         let runs: Vec<(Reader, usize)> = Reader::ALL
             .into_iter()
             .flat_map(|reader| self.partitions.map(|partitions| (reader, partitions)))
@@ -364,15 +368,15 @@ impl Setup {
             contexts.push((name, ctx, rt));
         }
 
+        // Few, flat samples in short windows: criterion's 100 samples took 25 s on a 250 ms
+        // needle. Changes are kept at 14% or more, so a rough median does.
         let mut group = c.benchmark_group(id);
-        group.throughput(Throughput::Elements(expected.rows as u64));
-        if scan {
-            group.sampling_mode(SamplingMode::Flat).sample_size(10);
-        } else {
-            group
-                .warm_up_time(Duration::from_secs(1))
-                .measurement_time(Duration::from_secs(3));
-        }
+        group
+            .throughput(Throughput::Elements(expected.rows as u64))
+            .sampling_mode(SamplingMode::Flat)
+            .sample_size(20)
+            .warm_up_time(Duration::from_millis(500))
+            .measurement_time(Duration::from_secs(2));
         for (name, ctx, rt) in contexts {
             group.bench_function(name, |b| b.iter(|| rt.block_on(run(&ctx, sql))));
         }
@@ -385,7 +389,7 @@ fn df_needles(c: &mut Criterion) {
     for needle in &needles() {
         let sql = needle_sql(needle, &setup.tables.schema);
         let id = format!("df needle/{}", needle.name);
-        setup.bench(c, &id, needle.name, &sql, false);
+        setup.bench(c, &id, needle.name, &sql);
     }
 }
 
@@ -406,9 +410,14 @@ fn df_scans(c: &mut Criterion) {
     ];
     for (label, columns) in projections {
         let sql = format!("SELECT {columns} FROM {TABLE}");
-        setup.bench(c, &format!("df scan/{label}"), label, &sql, true);
+        setup.bench(c, &format!("df scan/{label}"), label, &sql);
     }
 }
 
-criterion_group!(benches, df_needles, df_scans);
+criterion_group! {
+    name = benches;
+    // The logs are what an A/B compares (`site/ab_summary.py`), so no plots.
+    config = Criterion::default().without_plots();
+    targets = df_needles, df_scans
+}
 criterion_main!(benches);
