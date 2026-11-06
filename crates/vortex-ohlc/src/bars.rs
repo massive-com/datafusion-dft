@@ -50,6 +50,7 @@ use crate::decimal::unscaled;
 use crate::ohlc::{ohlc_to_parts, Part, Price};
 use crate::price_fn::{ohlc_price, OhlcPriceFn};
 use crate::product_residual::{product_residual, residual, shift};
+use crate::scaled::predecoded;
 
 /// The stored table's struct column holding the four prices as their [`Part`]s, where open is in
 /// the source.
@@ -679,6 +680,8 @@ struct BarsReader {
     residuals: Vec<(ProductResidual, DecimalDType)>,
     /// Expressions over the source's columns, rewritten over the stored table and bound.
     rewritten: Mutex<HashMap<ExactBoundExpr, BoundExpression>>,
+    /// Per projection, how its prices share the parts they decode (see [`Self::shared_parts`]).
+    shared_parts: Mutex<HashMap<ExactBoundExpr, Option<SharedParts>>>,
     /// The source's zones and the rows per zone.
     zones: (LayoutRef, u64),
     segment_source: Arc<dyn SegmentSource>,
@@ -715,6 +718,7 @@ impl BarsReader {
             prices: [open?, high?, low?, close?],
             residuals: residuals.into_iter().zip(decimals).collect(),
             rewritten: Mutex::new(HashMap::new()),
+            shared_parts: Mutex::new(HashMap::new()),
             zones,
             segment_source,
             session,
@@ -806,6 +810,62 @@ impl BarsReader {
         let bound = self.to_stored(expr)?.bind(self.inner.dtype())?;
         self.rewritten.lock().unwrap().insert(key, bound.clone());
         Ok(bound)
+    }
+
+    /// For a projection that rebuilds more than one price, how they share the parts they
+    /// decode, once per expression; `None` for any other, which the stored table's reader
+    /// evaluates whole.
+    ///
+    /// Each [`ohlc_price`] decodes the parts its price uses, and the stored table's reader
+    /// evaluates each on its own: a row's four prices decoded the open four times and the body
+    /// three, each time filtered to the rows read.
+    fn shared_parts(&self, expr: &BoundExpression) -> VortexResult<Option<SharedParts>> {
+        let key = ExactBoundExpr(expr.clone());
+        if let Some(shared) = self.shared_parts.lock().unwrap().get(&key) {
+            return Ok(shared.clone());
+        }
+        let shared = self.plan_shared_parts(expr)?;
+        (self.shared_parts.lock().unwrap()).insert(key, shared.clone());
+        Ok(shared)
+    }
+
+    fn plan_shared_parts(&self, expr: &BoundExpression) -> VortexResult<Option<SharedParts>> {
+        let stored = self.to_stored(expr)?;
+        let (mut prices, mut parts, mut columns) = (0, [false; 4], Vec::<FieldName>::new());
+        let mut pending = vec![&stored];
+        while let Some(node) = pending.pop() {
+            if let Some(options) = node.as_opt::<OhlcPriceFn>() {
+                prices += 1;
+                for (part, used) in Part::ALL.into_iter().zip(&mut parts) {
+                    *used |= options.price.uses(part);
+                }
+            } else if let Some(name) = node.as_opt::<GetItem>() {
+                if node.child(0).is_root() {
+                    if !columns.contains(name) {
+                        columns.push(name.clone());
+                    }
+                    continue;
+                }
+            }
+            if node.is_root() {
+                // The whole stored row, which the stored table's reader is left to read.
+                return Ok(None);
+            }
+            pending.extend(node.children());
+        }
+        if prices < 2 {
+            return Ok(None);
+        }
+        let reads = columns
+            .into_iter()
+            .map(|name| (name.clone(), get_item(name, root())));
+        let reads = pack(reads, self.inner.dtype().nullability()).bind(self.inner.dtype())?;
+        let projection = stored.bind(reads.dtype())?;
+        Ok(Some(SharedParts {
+            reads,
+            projection,
+            parts,
+        }))
     }
 
     fn bounds(&self) -> SharedBounds {
@@ -983,9 +1043,62 @@ impl LayoutReader for BarsReader {
         expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<ArrayFuture> {
-        self.inner
-            .projection_evaluation(row_range, &self.stored(expr)?, mask)
+        let Some(shared) = self.shared_parts(expr)? else {
+            return (self.inner).projection_evaluation(row_range, &self.stored(expr)?, mask);
+        };
+        let read = (self.inner).projection_evaluation(row_range, &shared.reads, mask)?;
+        let session = self.session.clone();
+        Ok(async move {
+            let mut ctx = session.create_execution_ctx();
+            let columns = read.await?.execute::<StructArray>(&mut ctx)?;
+            let columns = with_parts_predecoded(&columns, shared.parts, &mut ctx)?;
+            columns.into_array().apply_bound(&shared.projection)
+        }
+        .boxed())
     }
+}
+
+/// How a projection that rebuilds more than one price reads the [`OHLC`] struct once for all of
+/// them (see [`BarsReader::shared_parts`]).
+#[derive(Clone)]
+struct SharedParts {
+    /// The stored columns the projection reads, as a `pack` bound to the stored table.
+    reads: BoundExpression,
+    /// The projection, bound to what `reads` returns.
+    projection: BoundExpression,
+    /// The parts its prices use, in [`Part::ALL`] order.
+    parts: [bool; 4],
+}
+
+/// `columns`, stored columns among them the [`OHLC`] struct, with the `parts` of that struct
+/// [`predecoded`], so that the prices using a part share its decoding.
+fn with_parts_predecoded(
+    columns: &StructArray,
+    parts: [bool; 4],
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<StructArray> {
+    let mut fields = Vec::with_capacity(columns.names().len());
+    for (name, field) in columns.names().iter().zip(columns.iter_unmasked_fields()) {
+        if name.as_ref() != OHLC {
+            fields.push(field.clone());
+            continue;
+        }
+        let ohlc = field.clone().execute::<StructArray>(ctx)?;
+        let mut decoded = Vec::with_capacity(ohlc.names().len());
+        for (name, part) in ohlc.names().iter().zip(ohlc.iter_unmasked_fields()) {
+            let used = (Part::ALL.into_iter().zip(parts))
+                .any(|(each, used)| used && each.name() == name.as_ref());
+            decoded.push(match used {
+                true => predecoded(part.clone(), ctx)?,
+                false => part.clone(),
+            });
+        }
+        let (dtype, validity) = (ohlc.struct_fields().clone(), ohlc.struct_validity());
+        let ohlc = StructArray::try_new_with_dtype(decoded, dtype, ohlc.len(), validity)?;
+        fields.push(ohlc.into_array());
+    }
+    let (dtype, validity) = (columns.struct_fields().clone(), columns.struct_validity());
+    StructArray::try_new_with_dtype(fields, dtype, columns.len(), validity)
 }
 
 /// Binds the min and max of a column in the source's zones (a price, a residual's target) to its

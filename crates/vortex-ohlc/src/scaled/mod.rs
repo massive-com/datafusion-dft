@@ -69,8 +69,8 @@ mod encode;
 mod filter;
 mod scheme;
 
-pub(crate) use decimal::decoded;
 pub use decimal::{chunk_exponent, DecimalPow10Scheme};
+pub(crate) use decimal::{decoded, predecoded};
 pub use encode::scaled_encode;
 pub(crate) use scheme::is_decimal_values;
 pub use scheme::Pow10Scheme;
