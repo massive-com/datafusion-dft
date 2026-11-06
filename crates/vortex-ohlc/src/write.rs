@@ -55,9 +55,7 @@ pub fn write_options_zoned(
     zone_len: u64,
     residuals: Vec<ProductResidual>,
 ) -> VortexWriteOptions {
-    let compressor = BtrBlocksCompressorBuilder::from_session(session)
-        .exclude_schemes([DecimalScheme::v1().id()])
-        .with_new_scheme(&DecimalPow10Scheme);
+    let compressor = with_decimal_pow10(BtrBlocksCompressorBuilder::from_session(session));
     let strategy = WriteStrategyBuilder::from_session(session)
         .with_btrblocks_builder(compressor)
         .with_row_block_size(row_block)
@@ -65,6 +63,14 @@ pub fn write_options_zoned(
         .build();
     let bars = BarsStrategy::new(strategy, zone_len).with_product_residuals(residuals);
     session.write_options().with_strategy(Arc::new(bars))
+}
+
+/// `compressor` with [`DecimalPow10Scheme`] in the place of Vortex's decimal scheme, for a writer
+/// that builds its own strategy and wraps it in a [`BarsStrategy`].
+pub fn with_decimal_pow10(compressor: BtrBlocksCompressorBuilder) -> BtrBlocksCompressorBuilder {
+    compressor
+        .exclude_schemes([DecimalScheme::v1().id()])
+        .with_new_scheme(&DecimalPow10Scheme)
 }
 
 /// `batches` with `schema`, as the arrays to write with [`write_options`].
