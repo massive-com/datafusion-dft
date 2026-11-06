@@ -40,6 +40,29 @@ SELECT 1
     assert.stdout(contains_str(expected));
 }
 
+/// With the dedicated executor on, each iteration runs there, the way queries do.
+#[test]
+fn test_bench_command_on_dedicated_executor() {
+    let assert = Command::cargo_bin("dft")
+        .unwrap()
+        .args(["--set", "cli.execution.dedicated_executor_enabled=true"])
+        .arg("-c")
+        .arg("SELECT count(*) FROM generate_series(1, 100000)")
+        .arg("--bench")
+        .args(["-n", "3"])
+        .assert()
+        .success();
+
+    let expected = r##"
+----------------------------
+Benchmark Stats (3 runs, serial)
+----------------------------
+SELECT count(*) FROM generate_series(1, 100000)
+----------------------------
+Row counts match across runs"##;
+    assert.stdout(contains_str(expected));
+}
+
 #[test]
 fn test_bench_files() {
     let file = sql_in_file(r#"SELECT 1 + 1;"#);

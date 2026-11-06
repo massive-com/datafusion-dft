@@ -20,6 +20,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::eyre;
 use datafusion::logical_expr::LogicalPlan;
@@ -510,32 +511,27 @@ impl ExecutionContext {
         }
     }
 
-    /// Benchmark the provided query.  Currently, only a single statement can be benchmarked
-    async fn benchmark_single_iteration(
-        &self,
-        statement: Statement,
-    ) -> Result<(
-        usize,
-        std::time::Duration,
-        std::time::Duration,
-        std::time::Duration,
-        std::time::Duration,
-    )> {
-        let start = std::time::Instant::now();
-        let logical_plan = self
-            .session_ctx()
-            .state()
-            .statement_to_plan(statement)
-            .await?;
+    /// Benchmark the provided query.  Currently, only a single statement can be benchmarked.
+    /// Uses the [`DedicatedExecutor`] if it is available, as queries do: without it, a plan's
+    /// partitions all run on the caller's runtime, which in the CLI is a single thread. The
+    /// iteration is timed where it runs, so the hand-off to the executor isn't counted.
+    async fn benchmark_single_iteration(&self, statement: Statement) -> Result<IterationTimes> {
+        let iteration = Self::time_iteration(self.session_ctx().clone(), statement);
+        match &self.executor {
+            Some(executor) => executor.spawn(iteration).await.map_err(|e| eyre!(e))?,
+            None => iteration.await,
+        }
+    }
+
+    /// Plan and run `statement` on `ctx` once, timing each step (see
+    /// [`ExecutionContext::benchmark_single_iteration`]).
+    async fn time_iteration(ctx: SessionContext, statement: Statement) -> Result<IterationTimes> {
+        let start = Instant::now();
+        let logical_plan = ctx.state().statement_to_plan(statement).await?;
         let logical_planning_duration = start.elapsed();
-        let physical_plan = self
-            .session_ctx()
-            .state()
-            .create_physical_plan(&logical_plan)
-            .await?;
+        let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;
         let physical_planning_duration = start.elapsed();
-        let task_ctx = self.session_ctx().task_ctx();
-        let mut stream = execute_stream(physical_plan, task_ctx)?;
+        let mut stream = execute_stream(physical_plan, ctx.task_ctx())?;
         let mut rows = 0;
         while let Some(b) = stream.next().await {
             rows += b?.num_rows();
@@ -653,7 +649,7 @@ impl ExecutionContext {
 
     pub async fn analyze_query(&self, query: &str) -> Result<ExecutionStats> {
         let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let statements = DFParser::parse_sql_with_dialect(query, &dialect)?;
         let parsing_duration = start.elapsed();
         if statements.len() == 1 {
@@ -716,3 +712,7 @@ impl ExecutionContext {
         Ok(ExecResult::RecordBatchStream(df.execute_stream().await?))
     }
 }
+
+/// One benchmark iteration: the rows returned, and how long logical planning, physical planning
+/// and execution took, and the three together.
+type IterationTimes = (usize, Duration, Duration, Duration, Duration);
