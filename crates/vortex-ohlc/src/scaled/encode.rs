@@ -54,6 +54,7 @@ pub(super) fn scaled_encode_with(
                     rows.narrow(ctx)?.into_array(),
                     patched.into_array(),
                     None,
+                    ctx,
                 )?)
             }
         };

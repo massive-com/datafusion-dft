@@ -19,7 +19,6 @@ use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{DecimalArray, StructArray};
 use vortex::array::builtins::ArrayBuiltins;
 use vortex::array::expr::stats::Stat;
-use vortex::array::stats::bind::{bind_stats, StatBinder};
 use vortex::array::validity::Validity;
 use vortex::array::{
     ArrayRef, ExecutionCtx, IntoArray, MaskFuture, RawMetadata, VortexSessionExecute,
@@ -29,6 +28,8 @@ use vortex::dtype::{
     DType, DecimalDType, FieldMask, FieldName, FieldPath, Nullability, StructFields,
 };
 use vortex::error::{vortex_bail, vortex_ensure, vortex_err, VortexError, VortexResult};
+use vortex::expr::stats::bind::{bind_stats, StatBinder};
+use vortex::expr::stats::rewrite::BoundExpressionPruneExt;
 use vortex::expr::{get_item, pack, root, BoundExpression, ExactBoundExpr, Expression};
 use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
 use vortex::layout::segments::{SegmentSinkRef, SegmentSource};
@@ -109,11 +110,9 @@ impl ProductResidual {
 /// be read back.
 pub fn register(session: &VortexSession) {
     use vortex::layout::session::LayoutSessionExt;
-    use vortex::layout::LayoutEncoding;
+    use vortex::layout::LayoutPlugin;
     use vortex::scalar_fn::session::ScalarFnSessionExt;
-    session
-        .layouts()
-        .register(&BarsLayout as &dyn LayoutEncoding);
+    session.layouts().register(&BarsLayout as &dyn LayoutPlugin);
     session.scalar_fns().register(OhlcPriceFn);
     session
         .scalar_fns()

@@ -1,5 +1,5 @@
 //! A `between` kernel for Vortex's DateTimeParts ([`DateTimePartsBetween`]), which
-//! `vortex-datetime-parts` 0.89 has none of: a window of time (`t >= a AND t < b`, which reaches
+//! `vortex-datetime-parts` 0.91 has none of: a window of time (`t >= a AND t < b`, which reaches
 //! the scan as one `between`) otherwise decodes every timestamp of a chunk to compare it.
 //!
 //! DateTimeParts stores a timestamp as days, seconds into the day and subseconds, each with the
@@ -10,8 +10,12 @@
 //! within one day reads about one row in 23. Subseconds are read too unless they are a constant,
 //! as minute bars' are.
 //!
-//! *Upstream*: the kernel belongs in `vortex-datetime-parts`, whose compare kernel would gain from
-//! the same order: its `=` compares every row's seconds, and executes the days twice more.
+//! `t = c` is left to Vortex's compare kernel for DateTimeParts, which answers it before any kernel
+//! a session registers can. Since Vortex 0.91 it evaluates each part once (vortex#10684), and
+//! passing `=` to this kernel instead, as a `between`, measured no faster.
+//!
+//! *Upstream:* the kernel belongs in `vortex-datetime-parts` (a draft in this repo's
+//! `site/upstream/datetime-parts-between/`).
 
 use std::cmp::Ordering;
 use std::ops::RangeInclusive;

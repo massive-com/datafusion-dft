@@ -86,10 +86,12 @@ lists yet. Files that use them need a Vortex reader that decodes those component
 const BLOCKED_ENCODINGS_EDITION: EditionId = EditionId::new("dft", 2026, 10, 0);
 
 /// Vortex's blocked FoR (a reference per chunk of values) and blocked bit-packing (a bit width
-/// per 1024 values), new in Vortex 0.89 and in no Vortex edition.
+/// per 1024 values), new in Vortex 0.89 and in no stable Vortex edition (0.91 lists them only in
+/// `unstable`, which never freezes).
 static BLOCKED_ENCODINGS_DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: BLOCKED_ENCODINGS_EDITION,
+        immutable: true,
         min_library_version: None,
     },
     added: &[

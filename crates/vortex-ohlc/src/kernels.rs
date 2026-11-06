@@ -72,7 +72,13 @@ impl ExecuteParentKernel<BitPacked> for BlockedBitPackedFilter {
                 packed: array.data().packed_slice::<U>(),
                 offsets: &offsets,
             };
-            filter_chunked(&blocks, usize::from(array.offset()), values).into_byte_buffer()
+            filter_chunked(
+                &blocks,
+                usize::from(array.offset()),
+                values,
+                ctx.allocator(),
+            )
+            .into_byte_buffer()
         });
         let validity = array.validity()?.filter(mask)?;
         let primitive = PrimitiveArray::from_byte_buffer(buffer, ptype, validity);
@@ -125,7 +131,7 @@ impl ExecuteParentKernel<BitPacked> for BlockedBitPackedSlice {
         let bytes = (offsets[blocks.start] - offsets[0]) as usize
             ..(offsets[blocks.end] - offsets[0]) as usize;
         let patches = (array.patches())
-            .map(|patches| patches.slice(range.clone()))
+            .map(|patches| patches.slice(range.clone(), ctx))
             .transpose()?
             .flatten();
         Ok(Some(

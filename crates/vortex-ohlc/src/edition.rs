@@ -20,7 +20,8 @@ pub static FAMILY: EditionFamily = EditionFamily {
     name: "vortex_ohlc",
     origin: "vortex-ohlc",
     doc: "The components vortex-ohlc writes OHLC bars with that no Vortex edition lists: \
-its own, and Vortex's own components that are in no edition yet. A draft: nothing is frozen.",
+its own, and Vortex's own components that are in no stable edition yet. A draft: nothing is \
+frozen.",
 };
 
 /// The first edition, a draft.
@@ -29,6 +30,7 @@ pub const VORTEX_OHLC_2026_10: EditionId = EditionId::new("vortex_ohlc", 2026, 1
 pub static DECLARATION: EditionDeclaration = EditionDeclaration {
     edition: Edition {
         id: VORTEX_OHLC_2026_10,
+        immutable: true,
         min_library_version: None,
     },
     added: &[

@@ -36,7 +36,7 @@ use num_traits::{checked_pow, AsPrimitive, PrimInt, ToPrimitive};
 use prost::Message;
 use vortex::array::arrays::dict::{TakeReduce, TakeReduceAdaptor};
 use vortex::array::arrays::filter::{FilterReduce, FilterReduceAdaptor};
-use vortex::array::arrays::slice::{SliceReduce, SliceReduceAdaptor};
+use vortex::array::arrays::slice::{SliceKernel, SliceReduce, SliceReduceAdaptor};
 use vortex::array::arrays::{ConstantArray, DecimalArray, PrimitiveArray};
 use vortex::array::buffer::BufferHandle;
 use vortex::array::builtins::ArrayBuiltins;
@@ -54,7 +54,7 @@ use vortex::array::vtable::{OperationsVTable, VTable, ValidityChild, ValidityVTa
 use vortex::array::{
     array_slots, match_each_integer_ptype, Array, ArrayEq, ArrayHash, ArrayId, ArrayParts,
     ArrayRef, ArraySlots, ArrayView, EqMode, ExecutionCtx, ExecutionResult, IntoArray,
-    TypedArrayRef,
+    TypedArrayRef, VortexSessionExecute,
 };
 use vortex::buffer::Buffer;
 use vortex::error::{
@@ -78,11 +78,12 @@ pub(crate) use scheme::{failed_estimate, is_decimal_values};
 /// Values per exponent: one FastLanes block, as Vortex's blocked FoR and bit-packing use.
 pub const BLOCK: usize = 1024;
 
-/// Register the encoding and its filter and compare kernels on `session`, and its
+/// Register the encoding and its filter, compare and slice kernels on `session`, and its
 /// [`Pow10Scheme`] for the compressor (once).
 pub fn register(session: &VortexSession) {
     use vortex::array::arrays::filter::FilterExecuteAdaptor;
-    use vortex::array::arrays::Filter;
+    use vortex::array::arrays::slice::SliceExecuteAdaptor;
+    use vortex::array::arrays::{Filter, Slice};
     use vortex::array::optimizer::kernels::ArrayKernelsExt;
     use vortex::array::scalar_fn::fns::binary::{Binary, CompareExecuteAdaptor};
     use vortex::array::scalar_fn::ScalarFnVTable;
@@ -97,6 +98,11 @@ pub fn register(session: &VortexSession) {
         Binary.id(),
         Scaled,
         CompareExecuteAdaptor(Scaled),
+    );
+    session.kernels().register_execute_parent_kernel(
+        Slice.id(),
+        Scaled,
+        SliceExecuteAdaptor(Scaled),
     );
     crate::register_scheme(session, &Pow10Scheme);
 }
@@ -428,7 +434,7 @@ impl VTable for Scaled {
         metadata: &[u8],
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
-        _session: &VortexSession,
+        session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let metadata = ScaledMetadata::decode(metadata)?;
         let exponent = (metadata.exponent)
@@ -453,7 +459,8 @@ impl VTable for Scaled {
                         children.get(first_patch + 2, &dtype, len)
                     })
                     .transpose()?;
-                Patches::new(len, p.offset()?, indices, values, chunk_offsets)
+                let mut ctx = session.create_execution_ctx();
+                Patches::from_metadata(len, &p, indices, values, chunk_offsets, &mut ctx)
             })
             .transpose()?;
         let data = ScaledData {
@@ -647,16 +654,28 @@ impl SliceReduce for Scaled {
         if let Some(sliced) = map_uniform(array, |values| values.slice(range.clone()))? {
             return Ok(Some(sliced));
         }
-        slice_blocks(array, range)
+        slice_blocks(array, range, None)
+    }
+}
+
+impl SliceKernel for Scaled {
+    fn slice(
+        array: ArrayView<'_, Self>,
+        range: Range<usize>,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        slice_blocks(array, range, Some(ctx))
     }
 }
 
 /// `array` cut to the blocks that hold `range`, then sliced within them: an array whose blocks
 /// have their own divisors, or with patches, so slicing it decodes those blocks and not the rest
-/// (a needle's rows are often one range of a chunk). `None` if the blocks are all of `array`.
+/// (a needle's rows are often one range of a chunk). `None` if the blocks are all of `array`, or
+/// if it has patches and there is no `ctx` to slice them with.
 fn slice_blocks(
     array: ArrayView<'_, Scaled>,
     range: Range<usize>,
+    ctx: Option<&mut ExecutionCtx>,
 ) -> VortexResult<Option<ArrayRef>> {
     let start = range.start / BLOCK * BLOCK;
     let end = (range.end.div_ceil(BLOCK) * BLOCK).min(array.len());
@@ -667,10 +686,11 @@ fn slice_blocks(
     let exponents = (array.exponents())
         .map(|exponents| exponents.slice(start / BLOCK..end.div_ceil(BLOCK)))
         .transpose()?;
-    let patches = (array.patches())
-        .map(|patches| patches.slice(start..end))
-        .transpose()?
-        .flatten();
+    let patches = match (array.patches(), ctx) {
+        (None, _) => None,
+        (Some(patches), Some(ctx)) => patches.slice(start..end, ctx)?,
+        (Some(_), None) => return Ok(None),
+    };
     let blocks = Scaled::from_parts(values, exponents, array.exponent, array.base, patches)?;
     blocks
         .into_array()
@@ -721,7 +741,7 @@ impl CompareKernel for Scaled {
         if !rhs.dtype().eq_ignore_nullability(lhs.dtype()) {
             return Ok(None);
         }
-        let Some(value) = rhs.as_constant().and_then(|constant| to_i128(&constant)) else {
+        let Some(value) = rhs.as_constant().and_then(to_i128) else {
             return Ok(None);
         };
         let operator = match (operator, value.rem_euclid(divisor) == 0) {
@@ -908,7 +928,8 @@ pub(crate) mod tests {
         // Rows whose values aren't their block's multiples, in three of the blocks.
         let rows: Buffer<u16> = [5u16, 1030, 2050, 2051, 3075].into_iter().collect();
         let patched: Buffer<i64> = [-1i64, 7, 9, -9, 11].into_iter().collect();
-        let patches = Patches::new(len, 0, rows.into_array(), patched.into_array(), None).unwrap();
+        let (rows, patched) = (rows.into_array(), patched.into_array());
+        let patches = Patches::new(len, 0, rows, patched, None, &mut ctx).unwrap();
         let scaled = Scaled::try_new(quotients.into_array(), exponents, 2, Some(patches))
             .unwrap()
             .into_array();
@@ -927,7 +948,13 @@ pub(crate) mod tests {
             (3 * BLOCK + 2..len, 6),
             (3..len - 1, len),
         ] {
-            let sliced = scaled.slice(range.clone()).unwrap();
+            // Slicing the patches reads them, so the slice kernel cuts the blocks; the reduce
+            // rule leaves a Slice of the whole array.
+            let lazy = scaled.slice(range.clone()).unwrap();
+            let view = scaled.as_opt::<Scaled>().unwrap();
+            let sliced = <Scaled as SliceKernel>::slice(view, range.clone(), &mut ctx)
+                .unwrap()
+                .unwrap_or_else(|| lazy.clone());
             // The Scaled array the slice reads: itself, or what a Slice is of.
             let read = match sliced.as_opt::<Slice>() {
                 Some(_) => sliced.children()[0].clone(),
@@ -935,7 +962,8 @@ pub(crate) mod tests {
             };
             assert!(read.as_opt::<Scaled>().is_some(), "{range:?}");
             assert_eq!(read.len(), blocks, "rows read for {range:?}");
-            assert_eq!(decoded(&sliced, &mut ctx), want[range]);
+            assert_eq!(decoded(&sliced, &mut ctx), want[range.clone()]);
+            assert_eq!(decoded(&lazy, &mut ctx), want[range]);
         }
     }
 
