@@ -1,17 +1,18 @@
 //! A table of bars written under the bars layout reads back with the source's prices, through
-//! Vortex's own scan: the whole row, one price, a price filter, and pruning on prices and the
-//! dollar volume.
+//! Vortex's own scan: the whole row, one price, a price filter, pruning on prices and the dollar
+//! volume, and filters on a timestamp.
 
 use std::sync::Arc;
 
 use arrow::array::cast::AsArray;
-use arrow::array::types::Decimal128Type;
-use arrow::array::RecordBatch;
-use arrow::datatypes::DataType;
+use arrow::array::types::{Decimal128Type, Int64Type, TimestampNanosecondType};
+use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use vortex::array::extension::datetime::{TimeUnit, Timestamp, TimestampOptions};
 use vortex::array::{ArrayRef, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::dtype::{DType, DecimalDType, Nullability};
-use vortex::expr::{and, get_item, gt, lit, lt, lt_eq, or, root, Expression};
+use vortex::expr::{and, eq, get_item, gt, gt_eq, lit, lt, lt_eq, or, root, Expression};
 use vortex::file::{OpenOptionsSessionExt, VortexFile};
 use vortex::io::runtime::current::CurrentThreadRuntime;
 use vortex::io::runtime::BlockingRuntime;
@@ -207,4 +208,97 @@ fn the_root_prunes_on_a_price() {
             assert_eq!(rows.true_count() > 0, *kept, "{name}: zone {zone}");
         }
     }
+}
+
+/// Seconds since the epoch at 09:30 New York (13:30 UTC) on the first day of
+/// [`source_with_times`].
+const FIRST_OPEN: i64 = 1_155_600_000 / 86_400 * 86_400 + 13 * 3600 + 30 * 60;
+
+/// test-util's source with a `window_start` of minute bars: each ticker's 500 bars are two days
+/// of 250 minutes from 09:30.
+fn source_with_times() -> RecordBatch {
+    let source = source();
+    let starts: Vec<i64> = (0..ROWS as i64)
+        .map(|row| {
+            let bar = row % (ROWS as i64 / 10);
+            (FIRST_OPEN + bar / 250 * 86_400 + bar % 250 * 60) * 1_000_000_000
+        })
+        .collect();
+    let starts = TimestampNanosecondArray::from(starts).with_timezone("America/New_York");
+    let mut fields: Vec<Field> = (source.schema().fields().iter())
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.push(Field::new(
+        "window_start",
+        starts.data_type().clone(),
+        false,
+    ));
+    let mut columns = source.columns().to_vec();
+    columns.push(Arc::new(starts));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
+/// `seconds` since the epoch as a literal of `window_start`'s type.
+fn at(seconds: i64) -> Expression {
+    let options = TimestampOptions {
+        unit: TimeUnit::Nanoseconds,
+        tz: Some("America/New_York".into()),
+    };
+    let nanos = Scalar::primitive(seconds * 1_000_000_000, Nullability::NonNullable);
+    lit(Scalar::extension::<Timestamp>(options, nanos))
+}
+
+/// A timestamp's `=`, which the bars layout passes on as a `between`, and a window across two
+/// days keep the source's rows; an `=` before every bar prunes every zone.
+#[test]
+fn time_filters_keep_the_source_rows() {
+    let runtime = CurrentThreadRuntime::new();
+    let session = session(&runtime);
+    let source = source_with_times();
+    let file = session.open_options().open_buffer(write(&source)).unwrap();
+    let starts = source.column_by_name("window_start").unwrap();
+    let starts = starts.as_primitive::<TimestampNanosecondType>().values();
+    let transactions = source.column_by_name("transactions").unwrap();
+    let transactions = transactions.as_primitive::<Int64Type>().values();
+    let ws = || get_item("window_start", root());
+    let day = 86_400;
+    // 10:00 on the second day, and 13:30 on the first to 09:35 on the second.
+    let ten = FIRST_OPEN + day + 30 * 60;
+    let (from, to) = (FIRST_OPEN + 4 * 3600, FIRST_OPEN + day + 5 * 60);
+    // Each filter, and the seconds it keeps.
+    let cases = [
+        (eq(ws(), at(ten)), ten..ten + 1),
+        (and(gt_eq(ws(), at(from)), lt(ws(), at(to))), from..to),
+    ];
+    let mut ctx = session.create_execution_ctx();
+    for (filter, kept) in cases {
+        let name = filter.to_string();
+        let expected: Vec<i64> = (starts.iter().zip(transactions.iter()))
+            .filter(|(&t, _)| kept.contains(&(t / 1_000_000_000)))
+            .map(|(_, &n)| n)
+            .collect();
+        assert!(!expected.is_empty(), "{name}");
+        let chunks = scan(
+            &runtime,
+            &file,
+            get_item("transactions", root()),
+            Some(filter),
+        );
+        let actual: Vec<i64> = (chunks.into_iter())
+            .flat_map(|chunk| {
+                let array = session
+                    .arrow()
+                    .execute_arrow(chunk, None, &mut ctx)
+                    .unwrap();
+                array.as_primitive::<Int64Type>().values().to_vec()
+            })
+            .collect();
+        assert_eq!(actual, expected, "{name}");
+    }
+    let before = eq(ws(), at(FIRST_OPEN - day)).bind(file.dtype()).unwrap();
+    let reader = file.layout_reader().unwrap();
+    let mask = reader
+        .pruning_evaluation(&(0..ROWS as u64), &before, Mask::new_true(ROWS))
+        .unwrap();
+    assert_eq!(runtime.block_on(mask).unwrap().true_count(), 0);
 }
