@@ -939,6 +939,8 @@ fn count_vortex_layouts(path: &std::path::Path, id: &str) -> usize {
 
     runtime.block_on(async {
         let session = VortexSession::default();
+        // So that files written with `ohlc=true` open as well.
+        vortex_ohlc::register(&session);
         let file = session.open_options().open_path(path).await.unwrap();
         count(file.footer().layout(), id)
     })
@@ -1034,8 +1036,15 @@ const VORTEX_ENCODING_SOURCE: &str = "SELECT value::bigint AS int_col, (value % 
 /// doesn't.
 #[cfg(feature = "vortex")]
 fn vortex_mismatched_rows(file: &str) -> String {
+    mismatched_rows(VORTEX_ENCODING_SOURCE, &format!("SELECT * FROM '{file}'"))
+}
+
+/// [`vortex_mismatched_rows`] for any two queries: the rows of `expected` that `actual` doesn't
+/// return, and how many more rows `actual` returns, for an `expected` whose rows are unique.
+#[cfg(feature = "vortex")]
+fn mismatched_rows(expected: &str, actual: &str) -> String {
     format!(
-        "WITH expected AS ({VORTEX_ENCODING_SOURCE}), actual AS (SELECT * FROM '{file}') \
+        "WITH expected AS ({expected}), actual AS ({actual}) \
          SELECT count(*) AS missing, \
          (SELECT count(*) FROM actual) - (SELECT count(*) FROM expected) AS extra \
          FROM (SELECT * FROM expected EXCEPT SELECT * FROM actual)"
@@ -1138,6 +1147,121 @@ fn test_output_vortex_blocked_encodings_round_trip() {
         .assert()
         .success()
         .stdout(contains_str(VORTEX_ROUND_TRIPPED));
+}
+
+/// A table of bars, as `ohlc=true` writes under vortex-ohlc's layout: four prices of one decimal
+/// type, and a dollar volume that is about volume × open, over two row blocks of 65,536.
+#[cfg(feature = "vortex")]
+const VORTEX_BARS_SOURCE: &str = "SELECT 'T' || (value % 7) AS ticker, \
+    to_timestamp_seconds(value * 60) AS window_start, \
+    arrow_cast(100 + (value % 500) / 100.0, 'Decimal128(18, 6)') AS open, \
+    arrow_cast(100.03 + (value % 500) / 100.0, 'Decimal128(18, 6)') AS high, \
+    arrow_cast(99.98 + (value % 500) / 100.0, 'Decimal128(18, 6)') AS low, \
+    arrow_cast(100.01 + (value % 500) / 100.0, 'Decimal128(18, 6)') AS close, \
+    arrow_cast(value % 1000 + 1, 'Decimal128(38, 6)') AS volume, \
+    arrow_cast((value % 1000 + 1) * (100 + (value % 500) / 100.0) + (value % 3) / 100.0, \
+    'Decimal128(38, 12)') AS dollar_volume \
+    FROM generate_series(1, 70000)";
+
+#[test]
+#[cfg(feature = "vortex")]
+fn test_output_vortex_ohlc_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bars.vortex");
+
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg(VORTEX_BARS_SOURCE)
+        .arg("-o")
+        .arg(&path)
+        .arg("--format-option")
+        .arg("ohlc=true")
+        .assert()
+        .success();
+    assert_eq!(count_vortex_layouts(&path, "vortex_ohlc.bars"), 1);
+
+    // Every row, and the rows a filter on a price (rebuilt from its parts) keeps.
+    let file = path.to_str().unwrap();
+    let high = "high > CAST('104.5' AS DECIMAL(18, 6))";
+    for (expected, actual) in [
+        (
+            VORTEX_BARS_SOURCE.to_string(),
+            format!("SELECT * FROM '{file}'"),
+        ),
+        (
+            format!("SELECT * FROM ({VORTEX_BARS_SOURCE}) WHERE {high}"),
+            format!("SELECT * FROM '{file}' WHERE {high}"),
+        ),
+    ] {
+        Command::cargo_bin("dft")
+            .unwrap()
+            .arg("-c")
+            .arg(mismatched_rows(&expected, &actual))
+            .assert()
+            .success()
+            .stdout(contains_str(VORTEX_ROUND_TRIPPED));
+    }
+}
+
+#[test]
+#[cfg(feature = "vortex")]
+fn test_output_vortex_ohlc_with_other_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bars.vortex");
+
+    // The other options apply to the table as stored, a part's encoding included.
+    let mut write = Command::cargo_bin("dft").unwrap();
+    write.arg("-c").arg(VORTEX_BARS_SOURCE).arg("-o").arg(&path);
+    for option in [
+        "ohlc=true",
+        "row_block_size=65536",
+        "data_block_target_bytes=none",
+        "compressor=compact",
+        "encoding::ohlc.body=byte_parts",
+    ] {
+        write.arg("--format-option").arg(option);
+    }
+    write.assert().success();
+    assert_eq!(count_vortex_layouts(&path, "vortex_ohlc.bars"), 1);
+
+    let file = path.to_str().unwrap();
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg(mismatched_rows(
+            VORTEX_BARS_SOURCE,
+            &format!("SELECT * FROM '{file}'"),
+        ))
+        .assert()
+        .success()
+        .stdout(contains_str(VORTEX_ROUND_TRIPPED));
+}
+
+#[test]
+#[cfg(feature = "vortex")]
+fn test_output_vortex_ohlc_column_options_name_stored_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bars.vortex");
+
+    // `high` isn't stored: it is rebuilt from the parts.
+    Command::cargo_bin("dft")
+        .unwrap()
+        .arg("-c")
+        .arg(VORTEX_BARS_SOURCE)
+        .arg("-o")
+        .arg(&path)
+        .arg("--format-option")
+        .arg("ohlc=true")
+        .arg("--format-option")
+        .arg("encoding::high=byte_parts")
+        .assert()
+        .failure()
+        .stderr(contains_str("Unknown column 'high'"))
+        .stderr(contains_str("ohlc.upper"))
+        .stderr(contains_str("dollar_volume_residual"));
+
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]
