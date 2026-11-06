@@ -64,6 +64,7 @@ use vortex_btrblocks::{
 use vortex_compressor::scheme::{
     AncestorExclusion, CompressionEstimate, DescendantExclusion, EstimateVerdict,
 };
+use vortex_ohlc::bars::{stored_table_dtype, BarsStrategy, ProductResidual};
 use vortex_session::VortexSession;
 
 /// Default row block size. Matches `vortex_file::WriteStrategyBuilder`.
@@ -106,6 +107,9 @@ pub struct VortexWriteConfig {
     statistics: bool,
     blocked_encodings: bool,
     columns: Vec<ColumnOverride>,
+    /// Write a table of bars under vortex-ohlc's layout, around the strategy the other options
+    /// build (see `ohlc` in [`print_options`]).
+    ohlc: bool,
 }
 
 #[derive(Debug)]
@@ -125,6 +129,7 @@ impl Default for VortexWriteConfig {
             statistics: true,
             blocked_encodings: false,
             columns: Vec::new(),
+            ohlc: false,
         }
     }
 }
@@ -146,6 +151,9 @@ impl VortexWriteConfig {
                         ));
                     }
                     config.row_block_size = size;
+                }
+                "ohlc" => {
+                    config.ohlc = parse_bool(value)?;
                 }
                 "data_block_target_bytes" => {
                     config.data_block_target_bytes = match value.to_ascii_lowercase().as_str() {
@@ -201,11 +209,15 @@ impl VortexWriteConfig {
     }
 
     /// The session to write with: Vortex's defaults, plus [`BLOCKED_ENCODINGS_EDITION`] when
-    /// `blocked_encodings` is set. The strategy and the writer both take what they may write from
-    /// the session's enabled editions.
+    /// `blocked_encodings` is set, and with `ohlc`, vortex-ohlc's encodings, schemes and edition
+    /// (which lists blocked FoR and bit-packing too). The strategy and the writer both take what
+    /// they may write from the session's enabled editions.
     pub fn session(&self) -> Result<VortexSession> {
         let session = VortexSession::default();
-        if self.blocked_encodings {
+        if self.ohlc {
+            vortex_ohlc::edition::enable(&session)?;
+            vortex_ohlc::register(&session);
+        } else if self.blocked_encodings {
             session.editions().declare_family(&DFT_EDITION_FAMILY)?;
             session.register_edition(&BLOCKED_ENCODINGS_DECLARATION)?;
             session.enable_edition(BLOCKED_ENCODINGS_EDITION)?;
@@ -228,15 +240,34 @@ impl VortexWriteConfig {
 
     /// Build the layout strategy. Every column uses the same pipeline; only the compressor and
     /// the zone-map layer differ per column, so overrides keep zone maps unless disabled.
+    ///
+    /// With `ohlc`, the strategy is wrapped in vortex-ohlc's [`BarsStrategy`], which hands it a
+    /// table of bars as stored: the prices as the `ohlc` struct of parts, with their own zones
+    /// once a row block, and the dollar volume as `dollar_volume_residual` where the table has it,
+    /// volume and open. Column options name those stored columns. The compressor stores decimals
+    /// without the trailing zeros a chunk's values share (vortex-ohlc's `DecimalPow10Scheme`).
     pub fn build_strategy(
         &self,
         schema: &Schema,
         session: &VortexSession,
     ) -> Result<Arc<dyn LayoutStrategy>> {
+        let residuals = vec![ProductResidual::dollar_volume()];
+        let stored;
+        let schema = match self.ohlc {
+            true => {
+                stored = stored_schema(schema, &residuals, session)?;
+                &stored
+            }
+            false => schema,
+        };
         let base = if self.compact {
             BtrBlocksCompressorBuilder::from_session(session).with_compact()
         } else {
             BtrBlocksCompressorBuilder::from_session(session)
+        };
+        let base = match self.ohlc {
+            true => vortex_ohlc::write::with_decimal_pow10(base),
+            false => base,
         };
         let stats_compressor: Arc<dyn CompressorPlugin> = Arc::new(base.clone().build());
         let adaptive_data_compressor = base
@@ -274,7 +305,14 @@ impl VortexWriteConfig {
 
         let mut field_writers: HashMap<FieldPath, Arc<dyn LayoutStrategy>> = HashMap::new();
         for column in &self.columns {
-            let (path, data_type) = resolve_field(schema, &column.name)?;
+            let (path, data_type) =
+                resolve_field(schema, &column.name).map_err(|err| match self.ohlc {
+                    true => eyre!(
+                        "{err}; with ohlc=true, column options name the columns as stored: {}",
+                        column_paths(schema).join(", ")
+                    ),
+                    false => err,
+                })?;
             if let Some(other) = field_writers.keys().find(|other| path.overlap(other)) {
                 return Err(eyre!(
                     "Vortex format options for '{}' and '{other}' overlap; set options on one of them",
@@ -356,8 +394,49 @@ impl VortexWriteConfig {
             );
         }
 
-        Ok(Arc::new(table))
+        let table: Arc<dyn LayoutStrategy> = Arc::new(table);
+        if !self.ohlc {
+            return Ok(table);
+        }
+        let zone_len = row_block_size.get() as u64;
+        let bars = BarsStrategy::new(table, zone_len).with_product_residuals(residuals);
+        Ok(Arc::new(bars))
     }
+}
+
+/// The schema of what `ohlc`'s [`BarsStrategy`] hands the strategy it wraps for a table of
+/// `schema`: the table of bars as stored ([`stored_table_dtype`]), or `schema` itself for a table
+/// that isn't one.
+fn stored_schema(
+    schema: &Schema,
+    residuals: &[ProductResidual],
+    session: &VortexSession,
+) -> Result<Schema> {
+    use vortex::arrow::ArrowSessionExt;
+    let source = session.arrow().from_arrow_schema(schema)?;
+    match stored_table_dtype(&source, residuals)? {
+        Some(stored) => Ok(session.arrow().to_arrow_schema(&stored)?),
+        None => Ok(schema.clone()),
+    }
+}
+
+/// Every column of `schema`, nested ones as `a.b`, for an error naming the columns options may.
+fn column_paths(schema: &Schema) -> Vec<String> {
+    fn push(prefix: &str, field: &datafusion::arrow::datatypes::Field, out: &mut Vec<String>) {
+        let path = format!("{prefix}{}", field.name());
+        if let DataType::Struct(fields) = field.data_type() {
+            for child in fields {
+                push(&format!("{path}."), child, out);
+            }
+        } else {
+            out.push(path);
+        }
+    }
+    let mut out = Vec::new();
+    for field in schema.fields() {
+        push("", field, &mut out);
+    }
+    out
 }
 
 fn flat_strategy() -> Arc<dyn LayoutStrategy> {
@@ -832,6 +911,10 @@ pub fn print_options() {
     println!(
         "{:<44} {:<18} Allow blocked FoR and bit-packing (needs a Vortex 0.89+ reader)",
         "blocked_encodings", "false"
+    );
+    println!(
+        "{:<44} {:<18} Write a table of bars under vortex-ohlc's layout; column options name stored columns (ohlc.open, ...)",
+        "ohlc", "false"
     );
     println!(
         "{:<44} {:<18} Write zone maps for a top-level column",

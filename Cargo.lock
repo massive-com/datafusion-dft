@@ -2929,6 +2929,7 @@ dependencies = [
  "vortex-compressor",
  "vortex-datafusion",
  "vortex-file",
+ "vortex-ohlc",
  "vortex-session",
 ]
 

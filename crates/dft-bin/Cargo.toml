@@ -78,6 +78,7 @@ vortex-btrblocks = { features = [
 vortex-compressor = { optional = true, workspace = true }
 vortex-datafusion = { optional = true, workspace = true }
 vortex-file = { optional = true, workspace = true }
+vortex-ohlc = { optional = true, workspace = true }
 vortex-session = { optional = true, workspace = true }
 
 [dev-dependencies]
@@ -141,6 +142,7 @@ vortex = [
   "dep:vortex-compressor",
   "dep:vortex-datafusion",
   "dep:vortex-file",
+  "dep:vortex-ohlc",
   "dep:vortex-session",
 ]
 websocket = ["datafusion-app/websocket"]

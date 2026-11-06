@@ -84,6 +84,20 @@ help, which can make files noticeably smaller. Reading such a file needs
 Vortex 0.89 or later; older readers fail with `Unknown encoding:
 fastlanes.for.v2`.
 
+`ohlc=true` writes a table of bars (`open`, `high`, `low` and `close`, 
+all decimals of one type) with `vortex-ohlc`: the four prices are stored as `open`
+and its differences, each with its own zone map. 
+A `dollar_volume` column can be stored as its difference from `volume` × `open`. 
+Other options apply to the table as stored, so column options name `ohlc.open`,
+`ohlc.body`, `ohlc.upper`, `ohlc.lower` and `dollar_volume_residual`, not the prices
+and `dollar_volume`.
+
+dft reads such files back with their original columns, so queries are unchanged:
+```sh
+dft -c "SELECT * FROM 'bars.parquet'" -o bars.vortex --format-option ohlc=true
+dft -c "SELECT * FROM 'bars.vortex' WHERE close > 400.5::DECIMAL(18, 6)"
+```
+
 `statistics_enabled=false` disables zone maps. It accepts a global value or a
 `statistics_enabled::COLUMN` override. Zone maps are what DataFusion uses to
 prune files and row blocks, so disabling them makes files smaller and writes
