@@ -33,6 +33,7 @@ impl Price {
 
     /// Whether the price is rebuilt from `part`: every price from open, every price but open
     /// from the body, and high and low from the wick on their side.
+    #[inline]
     pub fn uses(self, part: Part) -> bool {
         match part {
             Part::Open => true,
@@ -45,6 +46,7 @@ impl Price {
     /// The price of a bar from its parts, in [`Part::ALL`] order; the parts it doesn't
     /// [use](Self::uses) are ignored. It grows with every part but the lower wick, which it
     /// shrinks with.
+    #[inline]
     pub fn from_parts<W: PrimInt>(self, [open, body, upper, lower]: [W; 4]) -> W {
         match self {
             Price::Open => open,
@@ -65,20 +67,20 @@ impl Price {
         // `price` is a constant in each loop, so its match folds away. The closures hold
         // `factor` by value: a loop the compiler doesn't inline here would otherwise load it
         // through two references for every bar, which made scans on one partition 7-8% slower.
-        let at = move |price: Price, parts: [W; 4]| price.from_parts(parts) * factor;
+        let zero = W::zero();
         match self {
             Price::Open => open
                 .iter()
-                .map(move |&o| at(Price::Open, [o, W::zero(), W::zero(), W::zero()]))
+                .map(move |&o| Price::Open.from_parts([o, zero, zero, zero]) * factor)
                 .collect(),
             Price::High => (open.iter().zip(body).zip(upper))
-                .map(move |((&o, &b), &u)| at(Price::High, [o, b, u, W::zero()]))
+                .map(move |((&o, &b), &u)| Price::High.from_parts([o, b, u, zero]) * factor)
                 .collect(),
             Price::Low => (open.iter().zip(body).zip(lower))
-                .map(move |((&o, &b), &l)| at(Price::Low, [o, b, W::zero(), l]))
+                .map(move |((&o, &b), &l)| Price::Low.from_parts([o, b, zero, l]) * factor)
                 .collect(),
             Price::Close => (open.iter().zip(body))
-                .map(move |(&o, &b)| at(Price::Close, [o, b, W::zero(), W::zero()]))
+                .map(move |(&o, &b)| Price::Close.from_parts([o, b, zero, zero]) * factor)
                 .collect(),
         }
     }
@@ -112,6 +114,7 @@ impl Part {
 }
 
 /// The parts of one bar from its prices, in [`Part::ALL`] order; `None` if one overflows `W`.
+#[inline]
 pub fn ohlc_to_parts<W: PrimInt>(open: W, high: W, low: W, close: W) -> Option<[W; 4]> {
     Some([
         open,
@@ -122,6 +125,7 @@ pub fn ohlc_to_parts<W: PrimInt>(open: W, high: W, low: W, close: W) -> Option<[
 }
 
 /// The prices of one bar from its parts, in [`Price::ALL`] order; undoes [`ohlc_to_parts`].
+#[inline]
 pub fn ohlc_from_parts<W: PrimInt>(parts: [W; 4]) -> [W; 4] {
     Price::ALL.map(|price| price.from_parts(parts))
 }
