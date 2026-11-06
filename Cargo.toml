@@ -8,6 +8,7 @@ edition = "2021"
 [workspace.dependencies]
 ### Local
 datafusion-app = { path = "crates/datafusion-app" }
+datafusion-dft = { default-features = false, path = "crates/dft-bin" }
 datafusion-functions-arrow = { path = "crates/datafusion-functions-arrow" }
 datafusion-functions-parquet = { path = "crates/datafusion-functions-parquet" }
 datafusion-functions-rocksdb = { path = "crates/datafusion-functions-rocksdb" }
