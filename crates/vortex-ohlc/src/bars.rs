@@ -414,6 +414,30 @@ impl ZoneBounds {
     }
 }
 
+/// The dtype of the table a [`BarsStrategy`] with `residuals` hands its inner strategy for a
+/// table of `source`'s dtype, so a writer can name the inner strategy's columns: `None` for a
+/// table that isn't a table of bars, which the inner strategy writes as it is.
+pub fn stored_table_dtype(
+    source: &DType,
+    residuals: &[ProductResidual],
+) -> VortexResult<Option<DType>> {
+    let Some(parts) = parts_dtype(source) else {
+        return Ok(None);
+    };
+    stored_dtype(source, parts, &residuals_of(source, residuals)).map(Some)
+}
+
+/// The columns of `residuals` a table of `source`'s dtype stores: those whose three columns it
+/// has.
+fn residuals_of(source: &DType, residuals: &[ProductResidual]) -> Vec<ProductResidual> {
+    (residuals.iter())
+        .filter(|residual| {
+            (residual.names().iter()).all(|name| field(source, name.as_ref()).is_some())
+        })
+        .cloned()
+        .collect()
+}
+
 /// The stored table's dtype, given the source's, the parts' decimal type and the columns stored as
 /// `residuals`: the [`OHLC`] struct where open is, no other price, and each residual's stored
 /// column where its target is.
@@ -614,12 +638,7 @@ impl LayoutStrategy for BarsStrategy {
                 .write_stream(ctx, segment_sink, stream, eof, session)
                 .await;
         };
-        let residuals: Vec<ProductResidual> = (self.residuals.iter())
-            .filter(|residual| {
-                (residual.names().iter()).all(|name| field(&source, name.as_ref()).is_some())
-            })
-            .cloned()
-            .collect();
+        let residuals = residuals_of(&source, &self.residuals);
         let stored = stored_dtype(&source, parts, &residuals)?;
         let zoned = zoned_columns(&source, &residuals)?;
         let zone_bounds = Arc::new(Mutex::new(ZoneBounds::new(self.zone_len, zoned.len())));
