@@ -137,6 +137,11 @@ impl LocalBenchmarkStats {
         }
     }
 
+    /// The runs' total times, as the "Total" section of what's printed summarizes them.
+    pub fn total(&self) -> DurationsSummary {
+        self.summarize(&self.total_durations)
+    }
+
     pub fn to_summary_csv_row(&self) -> String {
         let mut csv = String::new();
         let logical_planning_summary = self.summarize(&self.logical_planning_durations);
