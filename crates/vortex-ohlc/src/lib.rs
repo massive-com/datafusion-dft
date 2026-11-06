@@ -25,6 +25,7 @@ use vortex::session::VortexSession;
 
 pub mod bars;
 pub mod blocked_for;
+pub mod datetime;
 mod decimal;
 pub mod edition;
 pub mod gcd;
@@ -39,7 +40,8 @@ pub mod write;
 mod testing;
 
 /// Register what a session needs to read vortex-ohlc's files, and to read them well: the
-/// [`bars`] layout and its price function, the [`scaled`] encoding, the filter [`kernels`], and
+/// [`bars`] layout and its price function, the [`scaled`] encoding, the filter [`kernels`] and
+/// timestamps' [`datetime`] kernel, and
 /// for writing, the compression schemes that pick [`scaled`] (with [`gcd`]'s) and
 /// [`blocked_for`].
 /// [`DecimalPow10Scheme`](scaled::DecimalPow10Scheme) takes the place of Vortex's decimal scheme,
@@ -47,6 +49,7 @@ mod testing;
 pub fn register(session: &VortexSession) {
     bars::register(session);
     kernels::register(session);
+    datetime::register(session);
     scaled::register(session);
     register_scheme(session, &gcd::GcdScheme);
     register_scheme(session, &blocked_for::BlockedForScheme);
