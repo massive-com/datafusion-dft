@@ -27,7 +27,7 @@ use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 
 #[cfg(doc)]
 use super::Pow10Scheme;
-use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
+use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt, ScaledSlots};
 use crate::decimal::unscaled;
 
 /// `array` decoded, through a [`Scaled`] decimal divided by one `10^k` for every row to its
@@ -42,8 +42,7 @@ pub(crate) fn decoded(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<D
     let Some(scaled) = array.as_opt::<Scaled>() else {
         return array.execute::<DecimalArray>(ctx);
     };
-    let k = scaled.exponent().filter(|_| scaled.divisor().is_some());
-    let Some(k) = k.filter(|_| scaled.base() == 10) else {
+    let Some(k) = pow10_divisor(&scaled) else {
         return array.execute::<DecimalArray>(ctx);
     };
     let values = scaled.values().clone().execute::<DecimalArray>(ctx)?;
@@ -56,6 +55,25 @@ pub(crate) fn decoded(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<D
         DecimalDType::try_new(decimal.precision(), scale)?,
         values.validity()?,
     )
+}
+
+/// `array` with what [`decoded`] executes of it already executed, so that several decodes of it
+/// share that work: a [`Scaled`]'s values, if it divides every row by one `10^k`, or else the
+/// whole array. Its dtype stays.
+pub(crate) fn predecoded(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ArrayRef> {
+    let values = match array.as_opt::<Scaled>() {
+        Some(scaled) if pow10_divisor(&scaled).is_some() => scaled.values().clone(),
+        _ => return Ok(array.execute::<DecimalArray>(ctx)?.into_array()),
+    };
+    let values = values.execute::<DecimalArray>(ctx)?.into_array();
+    // SAFETY: executed, the values are the same values, stored differently.
+    unsafe { array.with_slot(ScaledSlots::VALUES, values) }
+}
+
+/// The `k` a [`Scaled`] divides every row by `10^k` with, if it does.
+fn pow10_divisor(scaled: &impl ScaledArrayExt) -> Option<u8> {
+    let k = scaled.exponent().filter(|_| scaled.divisor().is_some());
+    k.filter(|_| scaled.base() == 10)
 }
 
 /// `10^k`.
