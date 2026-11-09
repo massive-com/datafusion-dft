@@ -2,12 +2,13 @@
 //! the Parquet v2 file (DataFusion's Parquet reader with its defaults, and with
 //! `pushdown_filters`), and against one over the Vortex file with the Parquet table's schema,
 //! read through Vortex's own format with vortex-ohlc registered (see `datafusion_vortex_ohlc`),
-//! with and without a `ZonePruner`. Each runs on one partition on one thread, and on one
-//! partition per core with a thread per core. Vortex's scan spreads even one partition's splits
-//! over every worker of the runtime it runs on, where Parquet's reader keeps a partition on one
-//! thread, so one partition runs on a current-thread runtime: the scan's tasks and the operators
-//! above it on the bench's own thread. (A runtime with one
-//! worker still splits them over two threads: the worker, and the one that polls the plan.)
+//! with and without a `ZonePruner`, and with Vortex's V2 scan in place of one. Each runs on one
+//! partition on one thread, and on one partition per core with a thread per core. Vortex's scan
+//! spreads even one partition's splits over every worker of the runtime it runs on, where
+//! Parquet's reader keeps a partition on one thread, so one partition runs on a current-thread
+//! runtime: the scan's tasks and the operators above it on the bench's own thread.
+//! (A runtime with one worker still splits them over two threads: the worker,
+//! and the one that polls the plan.)
 //!
 //! A needle selects every column of the rows it matches; each of its terms compares a column
 //! with a literal of the column's own type, so no format's filter is held back by a cast. The
@@ -36,7 +37,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use datafusion::common::hash_utils::{with_hashes, RandomState};
-use datafusion::datasource::file_format::FileFormatFactory;
+use datafusion::datasource::file_format::{FileFormat, FileFormatFactory};
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
@@ -52,7 +53,7 @@ use tokio::runtime::Runtime;
 use vortex::scan::selection::Selection as ScanSelection;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
-use vortex_datafusion::VortexAccessPlan;
+use vortex_datafusion::{VortexAccessPlan, VortexFormat, VortexTableOptions};
 
 use common::needle::{needles, Needle, Op, Value};
 use common::{data, Selection};
@@ -72,14 +73,18 @@ enum Reader {
     /// The Vortex file, pruned on Vortex's own zone maps and by the bars layout as the scan runs:
     /// vortex-ohlc alone.
     VortexUnpruned,
+    /// The Vortex file read with Vortex's V2 scan, which prunes a scan's zones before it starts
+    /// on its own, and no `ZonePruner`.
+    VortexScanV2,
 }
 
 impl Reader {
-    const ALL: [Reader; 4] = [
+    const ALL: [Reader; 5] = [
         Reader::Parquet,
         Reader::ParquetPushdown,
         Reader::Vortex,
         Reader::VortexUnpruned,
+        Reader::VortexScanV2,
     ];
 
     fn name(self) -> &'static str {
@@ -88,6 +93,7 @@ impl Reader {
             Reader::ParquetPushdown => "parquet pushdown",
             Reader::Vortex => "vortex",
             Reader::VortexUnpruned => "vortex unpruned",
+            Reader::VortexScanV2 => "vortex v2",
         }
     }
 }
@@ -133,8 +139,18 @@ impl Tables {
         // Vortex does its I/O on the runtime it finds when the session is made.
         let _runtime = runtime.enter();
         let session = VortexSession::default();
-        let options = ListingOptions::new(vortex_format_factory(session.clone()).default())
-            .with_file_extension(".vortex");
+        // The factory registers vortex-ohlc on the session, which the V2 scan's format reads with
+        // too.
+        let factory = vortex_format_factory(session.clone());
+        let format: Arc<dyn FileFormat> = match reader {
+            Reader::VortexScanV2 => {
+                let mut options = VortexTableOptions::default();
+                options.scan_v2 = true;
+                Arc::new(VortexFormat::new_with_options(session.clone(), options))
+            }
+            _ => factory.default(),
+        };
+        let options = ListingOptions::new(format).with_file_extension(".vortex");
         let config = ListingTableConfig::new(ListingTableUrl::parse(&self.vortex).unwrap())
             .with_listing_options(options)
             .with_schema(Arc::clone(&self.schema));
