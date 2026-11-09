@@ -1,33 +1,17 @@
-//! The needles and scans as SQL through DataFusion, the way dft runs them: against a table over
-//! the Parquet v2 file (DataFusion's Parquet reader with its defaults, and with
-//! `pushdown_filters`), and against one over the Vortex file with the Parquet table's schema,
-//! read through Vortex's own format with vortex-ohlc registered (see `datafusion_vortex_ohlc`),
-//! with and without a `ZonePruner`, and with Vortex's V2 scan in place of one. Each runs on one
-//! partition on one thread, and on one partition per core with a thread per core. Vortex's scan
-//! spreads even one partition's splits over every worker of the runtime it runs on, where
-//! Parquet's reader keeps a partition on one thread, so one partition runs on a current-thread
-//! runtime: the scan's tasks and the operators above it on the bench's own thread.
-//! (A runtime with one worker still splits them over two threads: the worker,
-//! and the one that polls the plan.)
+//! The needles and scans as SQL through DataFusion, on Parquet and on Vortex (see [`Reader`]),
+//! at one partition and at one per core. Files: `common::data`.
 //!
-//! A needle selects every column of the rows it matches; each of its terms compares a column
-//! with a literal of the column's own type, so no format's filter is held back by a cast. The
-//! scans select every column, the decimal columns, and dollar_volume alone.
+//! Ids are `df needle/<needle>/<reader>/<partitions>` and
+//! `df scan/<projection>/<reader>/<partitions>`; pick them with Criterion's filter:
 //!
-//! Criterion's filter picks the benchmarks, ids `df needle/<needle>/<reader>/<partitions>` and
-//! `df scan/<projection>/<reader>/<partitions>`, e.g. `cargo bench --bench df -- 'high > 1000/.*/1$'`.
-//! Before timing, every reader that runs is checked against Parquet with DataFusion's defaults
-//! (the same rows, in any order), and what each scan counted is printed: DataFusion's metrics
-//! of the file scan, and for Vortex the rows a scan's selection kept. See `common::data` for the
-//! files. With `DF_BENCH_VORTEX=<path>`, the Vortex readers read that file instead and are named
-//! `<reader>@<file stem>`, so their results are kept apart from the bench's own file's.
+//! ```text
+//! cargo bench --bench df -- 'high > 1000/vortex v2/1$'
+//! cargo bench --bench df -- "$(cat crates/datafusion-vortex-ohlc/benches/quick.filter)"
+//! ```
 //!
-//! For quicker iterations, `benches/quick.filter` holds a filter for one needle or scan of each
-//! kind of work, every Vortex reader at one partition per core:
-//! `cargo bench --bench df -- "$(cat crates/datafusion-vortex-ohlc/benches/quick.filter)"`. Run
-//! them all before relying on a result. Parquet's results don't change with this crate: they are
-//! kept in `target/vortex-ohlc-bench/parquet-results.txt`, to compare against without timing
-//! Parquet again.
+//! Every reader that runs is first checked against Parquet. `DF_BENCH_VORTEX=<path>` benches
+//! another Vortex file; its readers are named `<reader>@<file stem>`. Parquet's last results are
+//! in `target/vortex-ohlc-bench/parquet-results.txt`.
 
 mod common;
 
@@ -344,6 +328,8 @@ impl Setup {
         let partitions = [1, cores];
         let runtimes = partitions.map(|threads| {
             let mut builder = match threads {
+                // Vortex spreads even one partition over every worker (and a one-worker runtime
+                // still uses two threads), so one partition runs on the bench's own thread.
                 1 => tokio::runtime::Builder::new_current_thread(),
                 _ => tokio::runtime::Builder::new_multi_thread(),
             };
