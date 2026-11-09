@@ -6,6 +6,9 @@
 //! - `bars-<VORTEX_VERSION>.vortex`: the source written with [`vortex_ohlc::write`], so under the
 //!   bars layout. Bump [`VORTEX_VERSION`] whenever what the crate writes changes, so the file is
 //!   written again.
+//!
+//! `DF_BENCH_VORTEX=<path>` reads the Vortex file at `<path>` in place of `bars-*.vortex`
+//! ([`Files::vortex_name`]).
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -56,6 +59,9 @@ const CONVERT_BATCH_SIZE: usize = 65_536;
 pub struct Files {
     pub parquet: PathBuf,
     pub vortex: PathBuf,
+    /// The Vortex file's name without its extension, when `DF_BENCH_VORTEX` names it in place of
+    /// the one written here.
+    pub vortex_name: Option<String>,
 }
 
 /// The files written from the source (see the module docs), writing those that are missing.
@@ -65,9 +71,18 @@ pub fn files() -> Files {
     assert!(source.exists(), "no source at {}", source.display());
     let dir = Path::new(DATA_DIR);
     std::fs::create_dir_all(dir).unwrap();
+    let other = std::env::var_os("DF_BENCH_VORTEX").map(PathBuf::from);
+    if let Some(other) = &other {
+        assert!(other.exists(), "no Vortex file at {}", other.display());
+    }
+    let vortex_name = other.as_ref().map(|path| {
+        let stem = path.file_stem().and_then(|stem| stem.to_str());
+        stem.expect("a UTF-8 file name").to_string()
+    });
     let files = Files {
         parquet: dir.join("v2.parquet"),
-        vortex: dir.join(format!("bars-{VORTEX_VERSION}.vortex")),
+        vortex: other.unwrap_or_else(|| dir.join(format!("bars-{VORTEX_VERSION}.vortex"))),
+        vortex_name,
     };
     // Each file is written under a temporary name and renamed once complete, so an interrupted
     // write isn't taken for a finished one.

@@ -19,7 +19,8 @@
 //! Before timing, every reader that runs is checked against Parquet with DataFusion's defaults
 //! (the same rows, in any order), and what each scan counted is printed: DataFusion's metrics
 //! of the file scan, and for Vortex the rows a scan's selection kept. See `common::data` for the
-//! files.
+//! files. With `DF_BENCH_VORTEX=<path>`, the Vortex readers read that file instead and are named
+//! `<reader>@<file stem>`, so their results are kept apart from the bench's own file's.
 //!
 //! For quicker iterations, `benches/quick.filter` holds a filter for one needle or scan of each
 //! kind of work, every Vortex reader at one partition per core:
@@ -96,12 +97,18 @@ impl Reader {
             Reader::VortexScanV2 => "vortex v2",
         }
     }
+
+    fn is_parquet(self) -> bool {
+        matches!(self, Reader::Parquet | Reader::ParquetPushdown)
+    }
 }
 
 /// The files, and the Parquet table's schema, which the Vortex table takes too.
 struct Tables {
     parquet: String,
     vortex: String,
+    /// The Vortex file's name, when it isn't the bench's own (see `common::data`).
+    vortex_name: Option<String>,
     schema: SchemaRef,
 }
 
@@ -118,7 +125,17 @@ impl Tables {
         Self {
             parquet,
             vortex,
+            vortex_name: files.vortex_name,
             schema,
+        }
+    }
+
+    /// `reader`'s name in benchmark ids: a Vortex reader of a file other than the bench's own is
+    /// `<reader>@<file>`.
+    fn reader_name(&self, reader: Reader) -> String {
+        match &self.vortex_name {
+            Some(file) if !reader.is_parquet() => format!("{}@{file}", reader.name()),
+            _ => reader.name().to_string(),
         }
     }
 
@@ -129,7 +146,7 @@ impl Tables {
             config.options_mut().execution.parquet.pushdown_filters = true;
         }
         let ctx = SessionContext::new_with_config(config);
-        if matches!(reader, Reader::Parquet | Reader::ParquetPushdown) {
+        if reader.is_parquet() {
             let options = ParquetReadOptions::default();
             runtime
                 .block_on(ctx.register_parquet(TABLE, &self.parquet, options))
@@ -359,8 +376,8 @@ impl Setup {
             .into_iter()
             .flat_map(|reader| self.partitions.map(|partitions| (reader, partitions)))
             .filter(|(reader, partitions)| {
-                self.selection
-                    .runs(&format!("{id}/{}/{partitions}", reader.name()))
+                let name = self.tables.reader_name(*reader);
+                self.selection.runs(&format!("{id}/{name}/{partitions}"))
             })
             .collect();
         if runs.is_empty() {
@@ -373,7 +390,7 @@ impl Setup {
         println!("  parquet/1: {}", metrics.join(" "));
         let mut contexts = Vec::new();
         for (reader, partitions) in runs {
-            let name = format!("{}/{partitions}", reader.name());
+            let name = format!("{}/{partitions}", self.tables.reader_name(reader));
             let rt = self.runtime(partitions);
             let ctx = self.tables.context(rt, reader, partitions);
             let (actual, metrics) = rt.block_on(check(&ctx, sql));
