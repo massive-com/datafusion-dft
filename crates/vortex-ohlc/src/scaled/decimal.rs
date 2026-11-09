@@ -34,8 +34,10 @@ use crate::decimal::unscaled;
 /// values: the same numbers at `k` less scale, at the width they're stored at rather than an
 /// i128's.
 ///
-/// *Upstream*: with vortex#10701, DecimalByteParts (vortex#10905) and narrow `vortex.decimal`
-/// nodes (vortex#10995) decode to a `Widen` of the values at their stored width, whose compares
+/// *A future Vortex*: once a release enforces vortex#10701's one width per decimal precision
+/// (0.91 has the `Widen` array but still accepts any width, and decodes these to a plain decimal
+/// at its stored width), DecimalByteParts (vortex#10905) and narrow `vortex.decimal` nodes
+/// (vortex#10995) are to decode to a `Widen` of the values at their stored width, whose compares
 /// and arithmetic stay narrow. This should then look through `Widen` as it does `Scaled`:
 /// executed to a `DecimalArray`, the values would be copied out at the precision's width.
 pub(crate) fn decoded(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<DecimalArray> {
