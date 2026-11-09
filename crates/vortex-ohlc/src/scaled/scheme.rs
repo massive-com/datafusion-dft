@@ -5,13 +5,13 @@ use std::sync::Arc;
 use vortex::array::vtable::VTable;
 use vortex::array::{ArrayId, ArrayRef, Canonical, ExecutionCtx, IntoArray};
 use vortex::encodings::decimal_byte_parts::DecimalBytePartsSlots;
-use vortex::error::{vortex_err, VortexResult};
+use vortex::error::{SharedVortexResult, VortexError, VortexResult};
 use vortex_btrblocks::schemes::decimal::DecimalScheme;
 use vortex_btrblocks::{
     compress_patches, ArrayAndStats, CascadingCompressor, CompressorContext, Scheme, SchemeExt,
     SchemeId,
 };
-use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
+use vortex_compressor::scheme::{CompressionEstimate, DeferredEstimate, EstimateVerdict};
 
 use super::encode::{block_exponents, scaled_encode_with};
 use super::{Scaled, ScaledArrayExt, ScaledArraySlotsExt};
@@ -54,9 +54,13 @@ impl Scheme for Pow10Scheme {
         let eligible = !compress_ctx.is_sample()
             && !compress_ctx.finished_cascading()
             && is_decimal_part(compress_ctx.cascade_history());
-        let worth_it = eligible
-            && (exponents(data, exec_ctx).0.as_ref())
-                .is_some_and(|exponents| exponents.iter().any(|&e| e != 0));
+        if !eligible {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+        let worth_it = match &exponents(data, exec_ctx).0 {
+            Ok(exponents) => exponents.iter().any(|&e| e != 0),
+            Err(error) => return failed_estimate(error.into()),
+        };
         CompressionEstimate::Verdict(match worth_it {
             true => EstimateVerdict::AlwaysUse,
             false => EstimateVerdict::Skip,
@@ -72,7 +76,7 @@ impl Scheme for Pow10Scheme {
     ) -> VortexResult<ArrayRef> {
         let values = data.array_as_primitive().into_owned();
         let exponents = exponents(data, exec_ctx);
-        let exponents = (exponents.0.as_ref()).ok_or_else(|| vortex_err!("no exponents"))?;
+        let exponents = exponents.0.as_ref().map_err(VortexError::from)?;
         let Some(array) = scaled_encode_with(&values, exponents, exec_ctx)? else {
             return Ok(values.into_array());
         };
@@ -96,13 +100,23 @@ impl Scheme for Pow10Scheme {
 }
 
 /// Each block's exponent, for both the estimate and [`Pow10Scheme::compress`], which get the same
-/// `data`; `None` if they couldn't be computed.
-struct Exponents(Option<Vec<u8>>);
+/// `data`, or the error computing them.
+struct Exponents(SharedVortexResult<Vec<u8>>);
 
 fn exponents(data: &ArrayAndStats, ctx: &mut ExecutionCtx) -> Arc<Exponents> {
     data.get_or_insert_with(|| {
-        Exponents(block_exponents(&data.array_as_primitive().into_owned(), ctx).ok())
+        Exponents(block_exponents(&data.array_as_primitive().into_owned(), ctx).map_err(Arc::new))
     })
+}
+
+/// The estimate of a scheme whose estimate failed with `error`: a deferred estimate that fails
+/// with it, so the error fails the write instead of the scheme being skipped as if it didn't pay.
+/// The compressor runs deferred estimates only when no scheme is always used, and in that case
+/// this one wouldn't have been used either.
+pub(crate) fn failed_estimate(error: VortexError) -> CompressionEstimate {
+    CompressionEstimate::Deferred(DeferredEstimate::Callback(Box::new(
+        move |_, _, _, _, _| Err(error),
+    )))
 }
 
 /// Whether the compressor is at a decimal column's integer part.
@@ -125,12 +139,13 @@ pub(crate) fn is_decimal_values(history: &[(SchemeId, usize)]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use vortex::array::arrays::DecimalArray;
+    use vortex::array::arrays::{DecimalArray, PrimitiveArray};
     use vortex::array::validity::Validity;
     use vortex::array::VortexSessionExecute;
     use vortex::buffer::Buffer;
-    use vortex::compressor::BtrBlocksCompressor;
+    use vortex::compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder};
     use vortex::dtype::DecimalDType;
+    use vortex::error::vortex_err;
 
     use super::*;
     use crate::testing::encoding_ids;
@@ -163,5 +178,57 @@ mod tests {
         let read = compressed.execute::<DecimalArray>(&mut ctx).unwrap();
         let read: Vec<i64> = read.buffer::<i32>().iter().map(|&v| v.into()).collect();
         assert_eq!(read, values.to_vec());
+    }
+
+    /// A scheme whose estimate fails makes the compression fail, rather than being skipped as if
+    /// it didn't pay.
+    #[test]
+    fn failed_estimate_fails_the_compression() {
+        #[derive(Debug)]
+        struct Failing;
+
+        impl Scheme for Failing {
+            fn scheme_name(&self) -> &'static str {
+                "vortex_ohlc.test.failing"
+            }
+
+            fn matches(&self, canonical: &Canonical) -> bool {
+                canonical.dtype().is_int()
+            }
+
+            fn produced_encodings(&self) -> Vec<ArrayId> {
+                Vec::new()
+            }
+
+            fn expected_compression_ratio(
+                &self,
+                _data: &ArrayAndStats,
+                _compress_ctx: CompressorContext,
+                _exec_ctx: &mut ExecutionCtx,
+            ) -> CompressionEstimate {
+                failed_estimate(vortex_err!("no estimate"))
+            }
+
+            fn compress(
+                &self,
+                _compressor: &CascadingCompressor,
+                _data: &ArrayAndStats,
+                _compress_ctx: CompressorContext,
+                _exec_ctx: &mut ExecutionCtx,
+            ) -> VortexResult<ArrayRef> {
+                unreachable!("its estimate failed")
+            }
+        }
+
+        let session = crate::testing::session();
+        let mut ctx = session.create_execution_ctx();
+        let values: Buffer<i64> = (0..4096).collect();
+        let array = PrimitiveArray::new(values, Validity::NonNullable).into_array();
+        let error = BtrBlocksCompressorBuilder::empty()
+            .with_new_scheme(&Failing)
+            .build()
+            .compress(&array, &mut ctx)
+            .unwrap_err();
+        assert!(error.to_string().contains("no estimate"), "{error}");
     }
 }

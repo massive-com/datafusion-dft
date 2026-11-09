@@ -67,8 +67,8 @@ mod filter;
 mod scheme;
 
 pub use encode::scaled_encode;
-pub(crate) use scheme::is_decimal_values;
 pub use scheme::Pow10Scheme;
+pub(crate) use scheme::{failed_estimate, is_decimal_values};
 
 /// Values per exponent: one FastLanes block, as Vortex's blocked FoR and bit-packing use.
 pub const BLOCK: usize = 1024;

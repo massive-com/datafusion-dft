@@ -16,12 +16,12 @@ use vortex::encodings::fastlanes::{
     bitpacked_v1_id, bitpacked_v2_id, for_v1_id, for_v2_id, FoR, FoRArray, FoRArrayExt,
     FoRArraySlotsExt, FoRReferences, FL_CHUNK_SIZE,
 };
-use vortex::error::VortexResult;
+use vortex::error::{SharedVortexResult, VortexResult};
 use vortex_btrblocks::schemes::integer::BitPackingScheme;
 use vortex_btrblocks::{ArrayAndStats, CascadingCompressor, CompressorContext, Scheme, SchemeExt};
 use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 
-use crate::scaled::is_decimal_values;
+use crate::scaled::{failed_estimate, is_decimal_values};
 
 /// Blocked FoR over blocked bit-packing for a decimal's integer part, or the quotients
 /// [`Scaled`](crate::scaled::Scaled) made of it, when its blocks' ranges pack smaller than the
@@ -65,11 +65,16 @@ impl Scheme for BlockedForScheme {
     ) -> CompressionEstimate {
         let eligible =
             !compress_ctx.finished_cascading() && is_decimal_values(compress_ctx.cascade_history());
-        let ratio = match eligible {
-            true => blocked(data, exec_ctx).as_ref().as_ref().map(|b| b.ratio),
-            false => None,
-        };
-        CompressionEstimate::Verdict(ratio.map_or(EstimateVerdict::Skip, EstimateVerdict::Ratio))
+        if !eligible {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+        match &*blocked(data, exec_ctx) {
+            Ok(blocked) => CompressionEstimate::Verdict(
+                (blocked.as_ref())
+                    .map_or(EstimateVerdict::Skip, |b| EstimateVerdict::Ratio(b.ratio)),
+            ),
+            Err(error) => failed_estimate(error.into()),
+        }
     }
 
     fn compress(
@@ -79,9 +84,10 @@ impl Scheme for BlockedForScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let for_ = match blocked(data, exec_ctx).as_ref() {
-            Some(blocked) => blocked.for_.clone(),
-            None => FoR::encode_chunked(data.array_as_primitive().into_owned(), exec_ctx)?,
+        let for_ = match &*blocked(data, exec_ctx) {
+            Ok(Some(blocked)) => blocked.for_.clone(),
+            Err(error) => return Err(error.into()),
+            Ok(None) => FoR::encode_chunked(data.array_as_primitive().into_owned(), exec_ctx)?,
         };
         let residuals =
             ArrayAndStats::new(for_.encoded().clone(), compress_ctx.merged_stats_options());
@@ -105,13 +111,14 @@ struct Blocked {
     ratio: f64,
 }
 
-/// [`blocked_for`] of `data`, once for both the estimate and [`BlockedForScheme::compress`], which
-/// get the same `data`.
-fn blocked(data: &ArrayAndStats, ctx: &mut ExecutionCtx) -> Arc<Option<Blocked>> {
+/// [`blocked_for`] of `data`, or the error computing it, once for both the estimate and
+/// [`BlockedForScheme::compress`], which get the same `data`.
+fn blocked(
+    data: &ArrayAndStats,
+    ctx: &mut ExecutionCtx,
+) -> Arc<SharedVortexResult<Option<Blocked>>> {
     data.get_or_insert_with(|| {
-        blocked_for(&data.array_as_primitive().into_owned(), ctx)
-            .ok()
-            .flatten()
+        blocked_for(&data.array_as_primitive().into_owned(), ctx).map_err(Arc::new)
     })
 }
 
