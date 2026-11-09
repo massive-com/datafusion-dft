@@ -36,21 +36,7 @@ const DATA_DIR: &str = concat!(
     "/../../target/vortex-ohlc-bench"
 );
 
-/// The version of what the crate writes, in the Vortex file's name: 2 since the OHLC layout, 3
-/// since the bars layout at the root, 4 since it's gone, 5 since Vortex's compressor packs the
-/// planned columns, 6 since Vortex's default strategy writes every column, 8 since the bars layout
-/// is back at the root (7 was a trial of a patched compressor), 17 since the layout computes the
-/// parts itself and nothing is planned or rescaled before writing, 18 since it keeps the prices'
-/// own zones, 19 since the compressor may divide blocks by a power of ten (`vortex_ohlc::scaled`),
-/// 20 since it may give decimals a FoR reference and bit width per block
-/// (`vortex_ohlc::blocked_for`), 21 since that choice is estimated from the widths blocked
-/// bit-packing picks, 22 since that encoding is `vortex_ohlc.scaled` (`vortex_ohlc.pow10` before),
-/// 23 since its metadata has a base, 24 since every decimal is rescaled a chunk at a time
-/// (`vortex_ohlc::scaled::DecimalPow10Scheme`), 25 since the dollar volume is stored as a residual
-/// against volume × open (`vortex_ohlc::product_residual`), 26 since the layout's metadata says
-/// whether it is, 27 since timestamps' seconds into the day are divided by their chunk's common
-/// divisor (`vortex_ohlc::gcd`), 28 since the layout's metadata names the columns stored as
-/// residuals and their factors. 9 to 16 were these steps in an earlier order.
+/// The version suffix for Vortex files.
 const VORTEX_VERSION: u32 = 28;
 
 /// Rows per batch when converting the source.
