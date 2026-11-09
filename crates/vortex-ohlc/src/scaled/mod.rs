@@ -516,9 +516,10 @@ impl VTable for Scaled {
 /// A decimal array's unscaled values times their blocks' `divisors`, as i128s.
 ///
 /// At the widest width a decimal of up to 38 digits needs, whatever the values' width.
-/// *Upstream*: vortex#10701 gives every decimal leaf its precision's one width (i64 up to 18
-/// digits), which makes this i128 buffer invalid for a narrower precision. Build that width, or a
-/// `Widen` of the values, when we take it up.
+/// *A future Vortex*: vortex#10701 is to give every decimal leaf its precision's one width (i64 up
+/// to 18 digits). Vortex 0.91 has the `Widen` array but still accepts any width; once a release
+/// enforces it, this i128 buffer is invalid for a narrower precision, so build that width, or a
+/// `Widen` of the values.
 fn multiplied_decimals(
     values: &DecimalArray,
     divisors: Divisors<i128>,
