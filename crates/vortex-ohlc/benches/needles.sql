@@ -1,7 +1,5 @@
--- The queries the `dft` bench (dft.rs) times, one per line, each named by the comment above it. They
--- are datafusion-vortex-ohlc's `df` bench queries, for a month of minute bars of every US ticker
--- (August 2006): `window_start` in America/New_York, prices DECIMAL(18, 6), `dollar_volume`
--- DECIMAL(38, 12). Edit them for other data.
+-- Queries used by `df` bench queries. They cover a month of minute bars (August 2006).
+-- The comment above each query is used as a display name. 
 
 -- needle: AAPL
 SELECT * FROM bars WHERE ticker = 'AAPL';
