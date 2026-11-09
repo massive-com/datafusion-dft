@@ -18,14 +18,14 @@ use vortex::array::{
     match_each_integer_ptype, ArrayId, ArrayRef, Canonical, ExecutionCtx, IntoArray,
 };
 use vortex::buffer::Buffer;
-use vortex::error::{vortex_bail, vortex_err, VortexResult};
+use vortex::error::{vortex_bail, vortex_err, SharedVortexResult, VortexResult};
 use vortex_btrblocks::schemes::temporal::TemporalScheme;
 use vortex_btrblocks::{
     ArrayAndStats, CascadingCompressor, CompressorContext, Scheme, SchemeExt, SchemeId,
 };
 use vortex_compressor::scheme::{CompressionEstimate, EstimateVerdict};
 
-use crate::scaled::Scaled;
+use crate::scaled::{failed_estimate, Scaled};
 
 /// `divisor` in `T`, if it fits.
 fn divisor_as<T: NumCast>(divisor: u64) -> Option<T> {
@@ -114,7 +114,13 @@ impl Scheme for GcdScheme {
         let eligible = !compress_ctx.is_sample()
             && !compress_ctx.finished_cascading()
             && is_temporal_seconds(compress_ctx.cascade_history());
-        let worth_it = eligible && divisor(data, exec_ctx).0.is_some();
+        if !eligible {
+            return CompressionEstimate::Verdict(EstimateVerdict::Skip);
+        }
+        let worth_it = match &divisor(data, exec_ctx).0 {
+            Ok(divisor) => divisor.is_some(),
+            Err(error) => return failed_estimate(error.into()),
+        };
         CompressionEstimate::Verdict(match worth_it {
             true => EstimateVerdict::AlwaysUse,
             false => EstimateVerdict::Skip,
@@ -128,8 +134,10 @@ impl Scheme for GcdScheme {
         compress_ctx: CompressorContext,
         exec_ctx: &mut ExecutionCtx,
     ) -> VortexResult<ArrayRef> {
-        let Some(divisor) = divisor(data, exec_ctx).0 else {
-            vortex_bail!("Gcd: no divisor");
+        let divisor = match divisor(data, exec_ctx).0 {
+            Ok(Some(divisor)) => divisor,
+            Ok(None) => vortex_bail!("Gcd: no divisor"),
+            Err(ref error) => return Err(error.into()),
         };
         let quotients = divide(&data.array_as_primitive().into_owned(), divisor)?.into_array();
         let quotients =
@@ -139,16 +147,12 @@ impl Scheme for GcdScheme {
 }
 
 /// The divisor of a chunk, for both the estimate and [`GcdScheme::compress`], which get the same
-/// `data`; `None` if it is 1 or couldn't be computed.
-struct Divisor(Option<u64>);
+/// `data`; `None` if it is 1, or the error computing it.
+struct Divisor(SharedVortexResult<Option<u64>>);
 
 fn divisor(data: &ArrayAndStats, ctx: &mut ExecutionCtx) -> Arc<Divisor> {
     data.get_or_insert_with(|| {
-        Divisor(
-            chunk_divisor(&data.array_as_primitive().into_owned(), ctx)
-                .ok()
-                .flatten(),
-        )
+        Divisor(chunk_divisor(&data.array_as_primitive().into_owned(), ctx).map_err(Arc::new))
     })
 }
 
