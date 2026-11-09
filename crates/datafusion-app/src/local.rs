@@ -438,7 +438,7 @@ impl ExecutionContext {
 
     /// Load DDL from configured DDL path for execution (so strips out comments and empty lines)
     pub fn load_ddl(&self) -> Option<String> {
-        info!("Loading DDL from: {:?}", &self.ddl_path);
+        info!("Loading DDL from: {:?}", self.ddl_path);
         if let Some(ddl_path) = &self.ddl_path {
             if ddl_path.exists() {
                 let maybe_ddl = std::fs::read_to_string(ddl_path);
@@ -461,7 +461,7 @@ impl ExecutionContext {
 
     /// Save DDL to configured DDL path
     pub fn save_ddl(&self, ddl: String) {
-        info!("Loading DDL from: {:?}", &self.ddl_path);
+        info!("Loading DDL from: {:?}", self.ddl_path);
         if let Some(ddl_path) = &self.ddl_path {
             match std::fs::File::create(ddl_path) {
                 Ok(mut f) => match f.write_all(ddl.as_bytes()) {

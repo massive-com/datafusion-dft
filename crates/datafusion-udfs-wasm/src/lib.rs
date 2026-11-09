@@ -74,7 +74,7 @@ fn create_wasm_udf(module_bytes: &[u8], udf_details: WasmUdfDetails) -> Result<S
     } = udf_details;
     info!(
         "Registering WASM function {} with input {input_types:?} and return_type {return_type:?}",
-        &name
+        name
     );
 
     // We need to call `create_udf` on each branch because each `impl Trait` creates a distinct
@@ -136,7 +136,7 @@ pub fn try_create_wasm_udf(module_bytes: &[u8], udf_details: WasmUdfDetails) -> 
         .ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "WASM function {} is missing in module",
-                &udf_details.name
+                udf_details.name
             ))
         })?;
 
