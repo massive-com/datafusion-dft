@@ -5,13 +5,14 @@
 //! `df scan/<projection>/<reader>/<partitions>`; pick them with Criterion's filter:
 //!
 //! ```text
-//! cargo bench --bench df -- 'high > 1000/vortex v2/1$'
+//! cargo bench --bench df -- 'high > 1000/vortex/1$'
 //! cargo bench --bench df -- "$(cat crates/datafusion-vortex-ohlc/benches/quick.filter)"
 //! ```
 //!
-//! Every reader that runs is first checked against Parquet. `DF_BENCH_VORTEX=<path>` benches
-//! another Vortex file; its readers are named `<reader>@<file stem>`. Parquet's last results are
-//! in `target/vortex-ohlc-bench/parquet-results.txt`.
+//! Every reader that runs is first checked against Parquet. `VORTEX_OHLC_SOURCE` names the
+//! source the files are written from. `DF_BENCH_VORTEX=<path>` benches another Vortex file; its
+//! readers are named `<reader>@<file stem>`, and only it is read by `vortex v2`. Parquet's last
+//! results are in `target/vortex-ohlc-bench/parquet-results.txt`.
 
 mod common;
 
@@ -59,7 +60,8 @@ enum Reader {
     /// vortex-ohlc alone.
     VortexUnpruned,
     /// The Vortex file read with Vortex's V2 scan, which prunes a scan's zones before it starts
-    /// on its own, and no `ZonePruner`.
+    /// on its own, and no `ZonePruner`. Only for a `DF_BENCH_VORTEX` file that isn't a bars file:
+    /// the bars layout has no V2 scan plan.
     VortexScanV2,
 }
 
@@ -121,6 +123,12 @@ impl Tables {
             Some(file) if !reader.is_parquet() => format!("{}@{file}", reader.name()),
             _ => reader.name().to_string(),
         }
+    }
+
+    /// Whether `reader` runs: Vortex's V2 scan can't read the bench's own file, whose bars layout
+    /// has no V2 scan plan, so it reads only a `DF_BENCH_VORTEX` file.
+    fn runs(&self, reader: Reader) -> bool {
+        reader != Reader::VortexScanV2 || self.vortex_name.is_some()
     }
 
     /// A session on `partitions` partitions with [`TABLE`] read by `reader`.
@@ -362,6 +370,9 @@ impl Setup {
             .into_iter()
             .flat_map(|reader| self.partitions.map(|partitions| (reader, partitions)))
             .filter(|(reader, partitions)| {
+                if !self.tables.runs(*reader) {
+                    return false;
+                }
                 let name = self.tables.reader_name(*reader);
                 self.selection.runs(&format!("{id}/{name}/{partitions}"))
             })
