@@ -1,33 +1,26 @@
-//! The needles through dft, Vortex against Parquet: re-encode a Parquet file of minute bars to
+//! Bench needles through dft, Vortex against Parquet: re-encode a Parquet file of minute bars to
 //! Vortex as `dft -o bars.vortex --format-option ohlc=true` does, check that each query in
 //! `needles.sql` returns as many rows on both, time each with the loop `dft --bench` runs, on
-//! Parquet, Parquet with filter pushdown and the Vortex file, and print each query's median
-//! against the faster Parquet's.
+//! Parquet with filter pushdown and the Vortex file, and print each median time.
 //!
 //! ```sh
 //! cargo bench -p datafusion-dft --features vortex --bench dft -- <bars.parquet> \
-//!     [-n ITERATIONS] [-p PARTITIONS,...] [-r READERS,...] [-o DIR] [--rewrite]
+//!     [-n ITERATIONS] [-p PARTITIONS,...] [-r READERS,...] [-o DIR] [--rewrite] \
+//!     [--row-block-size ROWS]
 //! ```
 //!
 //! See [`Args`] (or `--help`) for the options. Set `VORTEX_OPTIONS` to write the Vortex file with
 //! other `--format-option`s.
-//!
-//! It all runs in this process through dft's own code: the write is dft's CLI
-//! (`datafusion_dft::cli::try_run`), and each reader a dft `ExecutionContext` built as the CLI
-//! builds one. As in dft, the process runs on a runtime with one worker: one partition runs
-//! there, and more on dft's dedicated executor, a thread a core.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use datafusion::arrow::array::AsArray;
 use datafusion::arrow::datatypes::Int64Type;
 use datafusion_app::config::ExecutionConfig;
-use datafusion_app::extensions::DftSessionStateBuilder;
 use datafusion_app::local::ExecutionContext;
 use datafusion_dft::args::DftArgs;
 use datafusion_dft::config::AppConfig;
@@ -42,10 +35,10 @@ const NEEDLES: &str = include_str!("needles.sql");
 /// The table the queries read.
 const TABLE: &str = "bars";
 
-/// The bench's file: a row block, and zones, every 65,536 rows (the source's row group), and no
-/// coalescing of a narrow column's row blocks into bigger chunks, so a needle reads small
-/// segments. `VORTEX_OPTIONS` takes their place.
-const VORTEX_OPTIONS: &str = "ohlc=true row_block_size=65536 data_block_target_bytes=none";
+/// The bench's file: no coalescing of a narrow column's row blocks into bigger chunks, so a
+/// needle reads small segments. `VORTEX_OPTIONS` takes their place; the row block size comes from
+/// `--row-block-size` either way.
+const VORTEX_OPTIONS: &str = "ohlc=true data_block_target_bytes=none";
 
 /// Where the Vortex file, the results and the summary go, under the workspace's `target`.
 const OUT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/ohlc-demo");
@@ -93,7 +86,6 @@ impl Reader {
     }
 }
 
-/// The needles through dft, Vortex against Parquet.
 #[derive(Parser)]
 #[command(name = "cargo bench -p datafusion-dft --features vortex --bench dft --")]
 struct Args {
@@ -114,6 +106,10 @@ struct Args {
     /// Write the Vortex file again even if it exists.
     #[arg(long)]
     rewrite: bool,
+    /// Rows in a row block, and a zone, of the Vortex file.
+    /// It applies when the file is written; see `--rewrite`.
+    #[arg(long, default_value_t = 65536)]
+    row_block_size: usize,
     /// What `cargo bench` passes.
     #[arg(long, hide = true)]
     bench: bool,
@@ -147,30 +143,12 @@ fn main() -> Result<()> {
     if args.partitions.is_empty() {
         args.partitions = vec![1, std::thread::available_parallelism()?.get()];
     }
-    let mut awake = keep_awake()?;
     // dft's runtime (see its `main`): one worker, which runs a query on one partition.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run(args));
-    if let Some(child) = &mut awake {
-        child.kill()?;
-        child.wait()?;
-    }
-    result
-}
-
-/// Keep a Mac awake while this process runs.
-fn keep_awake() -> Result<Option<Child>> {
-    if !cfg!(target_os = "macos") {
-        return Ok(None);
-    }
-    let pid = std::process::id().to_string();
-    let child = Command::new("caffeinate")
-        .args(["-dims", "-w", &pid])
-        .spawn()?;
-    Ok(Some(child))
+    runtime.block_on(run(args))
 }
 
 async fn run(args: Args) -> Result<()> {
@@ -184,7 +162,7 @@ async fn run(args: Args) -> Result<()> {
     if args.rewrite || !vortex.exists() {
         println!("== writing {}", vortex.display());
         let start = Instant::now();
-        write_vortex(&source, &vortex).await?;
+        write_vortex(&source, &vortex, args.row_block_size).await?;
         println!("{:.1} s", start.elapsed().as_secs_f64());
     }
     for path in [&source, &vortex] {
@@ -254,7 +232,7 @@ fn canonical(path: &Path) -> Result<PathBuf> {
 /// Write `source` to `vortex` with dft's CLI, as `dft -c "SELECT * FROM '<source>'" -o <vortex>
 /// --format-option ...` would. One partition reads the Parquet file in order, so the Vortex file
 /// keeps its rows' order (sorted by ticker, then time) and its zone maps stay tight.
-async fn write_vortex(source: &Path, vortex: &Path) -> Result<()> {
+async fn write_vortex(source: &Path, vortex: &Path, row_block_size: usize) -> Result<()> {
     let options = match std::env::var("VORTEX_OPTIONS") {
         Ok(options) => options,
         Err(std::env::VarError::NotPresent) => VORTEX_OPTIONS.to_string(),
@@ -267,11 +245,11 @@ async fn write_vortex(source: &Path, vortex: &Path) -> Result<()> {
         "-o".to_string(),
         vortex.display().to_string(),
     ];
-    for option in options.split_whitespace() {
+    let row_block_size = format!("row_block_size={row_block_size}");
+    for option in options.split_whitespace().chain([row_block_size.as_str()]) {
         argv.extend(["--format-option".to_string(), option.to_string()]);
     }
-    let mut config = AppConfig::default();
-    config.cli.execution = execution_config(&Reader::Parquet.settings(1), false);
+    let config = app_config(&Reader::Parquet.settings(1), false);
     datafusion_dft::cli::try_run(DftArgs::try_parse_from(argv)?, config).await?;
     // dft writes nothing for a query whose first batch fails.
     if !vortex.exists() {
@@ -280,30 +258,25 @@ async fn write_vortex(source: &Path, vortex: &Path) -> Result<()> {
     Ok(())
 }
 
-/// dft's execution settings: DataFusion's `settings`, and its dedicated executor if `dedicated`.
-fn execution_config(settings: &[(&str, String)], dedicated: bool) -> ExecutionConfig {
+fn app_config(settings: &[(&str, String)], dedicated: bool) -> AppConfig {
     let datafusion = settings.iter().map(|(k, v)| (k.to_string(), v.clone()));
-    ExecutionConfig {
+    let mut config = AppConfig::default();
+    config.cli.execution = ExecutionConfig {
         ddl_path: None,
         datafusion: Some(datafusion.collect()),
         dedicated_executor_enabled: dedicated,
         ..ExecutionConfig::default()
-    }
+    };
+    config
 }
 
-/// A dft context built as its CLI builds one (see `datafusion_dft::cli::try_run`), with
-/// [`execution_config`]'s settings, and [`TABLE`] made by `ddl`.
 async fn context(
     settings: &[(&str, String)],
     dedicated: bool,
     ddl: &str,
 ) -> Result<ExecutionContext> {
-    let config = execution_config(settings, dedicated);
-    let state = DftSessionStateBuilder::try_new(Some(config.clone()))?
-        .with_extensions()
-        .await?
-        .build()?;
-    let ctx = ExecutionContext::try_new(&config, state, APP_NAME, "bench")?;
+    let config = app_config(settings, dedicated);
+    let ctx = datafusion_dft::cli::execution_context(&config).await?;
     ctx.execute_sql_and_discard_results(ddl).await?;
     Ok(ctx)
 }
@@ -321,8 +294,7 @@ async fn count_rows(ddl: &str, queries: &[Query]) -> Result<Vec<i64>> {
     Ok(rows)
 }
 
-/// The medians of `reader` on `partitions` partitions kept in `out`, by query: none if it hasn't
-/// run.
+/// The medians of `reader` on `partitions` kept in `out`, by query.
 fn load(out: &Path, reader: Reader, partitions: usize) -> Result<HashMap<String, f64>> {
     let text = match std::fs::read_to_string(reader.results(out, partitions)) {
         Ok(text) => text,
@@ -337,9 +309,8 @@ fn load(out: &Path, reader: Reader, partitions: usize) -> Result<HashMap<String,
     Ok(medians)
 }
 
-/// The summary, in Markdown: at each number of partitions, each query's median on each reader
-/// (as last timed) and Vortex's against the faster Parquet's; then whether the formats agree on
-/// the rows.
+/// Build a Markdown summary: at each number of partitions, each query's median on each reader;
+/// and whether the formats agree on rows.
 fn summary(
     queries: &[Query],
     out: &Path,
@@ -355,35 +326,36 @@ fn summary(
         writeln!(s, "\n### {p} partition{plural} (median ms)\n")?;
         writeln!(
             s,
-            "| query | rows | Parquet | pushdown | Vortex | ÷ best Parquet |"
+            "| query | rows | Parquet | pushdown | Vortex | ÷ Parquet | ÷ pushdown |"
         )?;
-        writeln!(s, "|---|---:|---:|---:|---:|---:|")?;
-        let mut ratios = Vec::new();
+        writeln!(s, "|---|---:|---:|---:|---:|---:|---:|")?;
+        // Vortex's times over Parquet's and over pushdown's, by query.
+        let (mut over_parquets, mut over_pushdowns) = (Vec::new(), Vec::new());
         for (query, rows) in queries.iter().zip(vortex_rows) {
             let [parquet, pushdown, vortex] =
                 [&parquet, &pushdown, &vortex].map(|times| times.get(&query.sql).copied());
-            let best = parquet.into_iter().chain(pushdown).reduce(f64::min);
-            let ratio = vortex.zip(best).map(|(vortex, best)| vortex / best);
-            ratios.extend(ratio);
-            let cell = match ratio {
-                None => String::new(),
-                Some(ratio) if ratio >= 1.0 => format!("**{ratio:.2}**"),
-                Some(ratio) => format!("{ratio:.2}"),
-            };
+            let ratio = |base: Option<f64>| vortex.zip(base).map(|(vortex, base)| vortex / base);
+            let [over_parquet, over_pushdown] = [parquet, pushdown].map(ratio);
+            over_parquets.extend(over_parquet);
+            over_pushdowns.extend(over_pushdown);
+            let [over_parquet, over_pushdown] = [over_parquet, over_pushdown].map(fmt_ratio);
             let [parquet, pushdown, vortex] = [parquet, pushdown, vortex].map(fmt_ms);
             let name = &query.name;
             writeln!(
                 s,
-                "| {name} | {rows} | {parquet} | {pushdown} | {vortex} | {cell} |"
+                "| {name} | {rows} | {parquet} | {pushdown} | {vortex} | {over_parquet} | {over_pushdown} |"
             )?;
         }
-        if !ratios.is_empty() {
+        for (base, ratios) in [("Parquet", over_parquets), ("pushdown", over_pushdowns)] {
+            if ratios.is_empty() {
+                continue;
+            }
             let mean_log = ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64;
             let geomean = mean_log.exp();
             let n = ratios.len();
             writeln!(
                 s,
-                "\nGeometric mean ÷ best Parquet: {geomean:.2} over {n} queries."
+                "\nGeometric mean ÷ {base}: {geomean:.2} over {n} queries."
             )?;
         }
     }
@@ -405,6 +377,15 @@ fn summary(
         )?;
     }
     Ok(s)
+}
+
+/// Vortex's time over another reader's, to two decimals, in bold where Vortex is no faster.
+fn fmt_ratio(ratio: Option<f64>) -> String {
+    match ratio {
+        None => String::new(),
+        Some(ratio) if ratio >= 1.0 => format!("**{ratio:.2}**"),
+        Some(ratio) => format!("{ratio:.2}"),
+    }
 }
 
 /// A time in ms to three significant digits below 100 ms, and to the ms above.

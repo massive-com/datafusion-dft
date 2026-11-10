@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 //! [`CliApp`]: Command Line User Interface
 
 mod progress;
@@ -1218,20 +1219,24 @@ fn is_output_format_option(format: Format, key: &str) -> bool {
     }
 }
 
-pub async fn try_run(cli: DftArgs, config: AppConfig) -> Result<()> {
+pub async fn execution_context(config: &AppConfig) -> Result<ExecutionContext> {
     let merged_exec_config = merge_configs(config.shared.clone(), config.cli.execution.clone());
-    let session_state_builder = DftSessionStateBuilder::try_new(Some(merged_exec_config.clone()))?
+    let session_state = DftSessionStateBuilder::try_new(Some(merged_exec_config.clone()))?
         .with_extensions()
-        .await?;
-
-    // CLI mode: executing commands from files or CLI arguments
-    let session_state = session_state_builder.build()?;
+        .await?
+        .build()?;
     let execution_ctx = ExecutionContext::try_new(
         &merged_exec_config,
         session_state,
         crate::APP_NAME,
         env!("CARGO_PKG_VERSION"),
     )?;
+    Ok(execution_ctx)
+}
+
+// CLI mode: executing commands from files or CLI arguments
+pub async fn try_run(cli: DftArgs, config: AppConfig) -> Result<()> {
+    let execution_ctx = execution_context(&config).await?;
     #[allow(unused_mut)]
     let mut app_execution = AppExecution::new(execution_ctx);
     #[cfg(feature = "flightsql")]
