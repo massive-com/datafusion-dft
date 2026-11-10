@@ -29,9 +29,11 @@
 //! the bounds of the parts.
 
 mod prune;
+mod reader;
 mod table;
 mod tables;
 
 pub use prune::{ZonePruner, DEFAULT_CACHE_BYTES};
-pub use table::{reader_factory, PrunedTable, VortexExecFactory};
+pub use reader::reader_factory;
+pub use table::{PrunedTable, VortexExecFactory};
 pub use tables::{enable_url_table, PrunedTableFactory};

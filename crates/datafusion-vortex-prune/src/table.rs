@@ -25,31 +25,21 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{ScanArgs, ScanResult, Session, TableProvider};
-use datafusion::common::{
-    internal_datafusion_err, Constraints, DFSchema, DataFusionError, Result, Statistics,
-};
+use datafusion::common::{internal_datafusion_err, Constraints, DFSchema, Result, Statistics};
 use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::listing::{ListingTable, PartitionedFile};
+use datafusion::datasource::listing::ListingTable;
 use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::TableType;
-use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
-use datafusion::object_store::local::LocalFileSystem;
-use datafusion::object_store::ObjectStore;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::ExecutionPlan;
-use vortex::array::memory::MemorySessionExt;
-use vortex::io::session::RuntimeSessionExt;
-use vortex::io::std_file::FileReadAt;
-use vortex::io::VortexReadAt;
-use vortex::session::VortexSession;
-use vortex_datafusion::reader::{DefaultVortexReaderFactory, VortexReaderFactory};
+use vortex_datafusion::reader::VortexReaderFactory;
 use vortex_datafusion::VortexSource;
 
-use crate::ZonePruner;
+use crate::{reader_factory, ZonePruner};
 
 /// Builds Vortex scans from a scan's config and filter: the config's files read through `readers`
 /// and, given a [`ZonePruner`] (see [`with_pruner`](Self::with_pruner)), pruned by it, the zone
@@ -115,40 +105,6 @@ impl VortexExecFactory {
     }
 }
 
-/// The readers for files in the object store at `url`, `store`, as a table's scans should read
-/// them: a local file directly, and anything else through `store`, as vortex-datafusion reads
-/// every file by default. Through the `ObjectStore`, a local file is opened again for every read
-/// and nearby reads are merged into requests of up to 16 MiB, a size meant for object storage;
-/// Vortex's file reader keeps it open and merges reads into requests of at most 4 MiB.
-pub fn reader_factory(
-    url: &ObjectStoreUrl,
-    store: Arc<dyn ObjectStore>,
-) -> Arc<dyn VortexReaderFactory> {
-    // DataFusion registers a `LocalFileSystem` rooted at `/` for `file://`.
-    if *url == ObjectStoreUrl::local_filesystem() {
-        Arc::new(LocalFileReaders(LocalFileSystem::new()))
-    } else {
-        Arc::new(DefaultVortexReaderFactory::new(store))
-    }
-}
-
-/// Vortex's own reader for a local file, at the path `LocalFileSystem` maps it to.
-#[derive(Debug)]
-struct LocalFileReaders(LocalFileSystem);
-
-impl VortexReaderFactory for LocalFileReaders {
-    fn create_reader(
-        &self,
-        file: &PartitionedFile,
-        session: &VortexSession,
-    ) -> Result<Arc<dyn VortexReadAt>> {
-        let path = self.0.path_to_filesystem(file.path())?;
-        let file = FileReadAt::open_with_allocator(path, session.handle(), session.allocator())
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(Arc::new(file))
-    }
-}
-
 /// A listing table over Vortex files whose scans a [`VortexExecFactory`] builds, given each scan's
 /// filters. Everything else is `inner`'s.
 #[derive(Debug)]
@@ -162,9 +118,7 @@ impl PrunedTable {
         Self { inner, factory }
     }
 
-    /// `listing`, a listing table over Vortex files, with its scans pruned by `pruner` before they
-    /// start. Its files, and their zone maps, are read as [`reader_factory`] picks for its object
-    /// store.
+    /// `listing` table over Vortex files, with scans pruned by `pruner`.
     pub fn over(
         listing: &ListingTable,
         state: &dyn Session,
@@ -176,7 +130,7 @@ impl PrunedTable {
             .ok_or_else(|| internal_datafusion_err!("a listing table without paths"))?
             .object_store();
         let store = state.runtime_env().object_store(&url)?;
-        let factory = VortexExecFactory::new(reader_factory(&url, store)).with_pruner(pruner);
+        let factory = VortexExecFactory::new(reader_factory(&url, store)?).with_pruner(pruner);
         Ok(Self::new(Arc::new(listing.clone()), factory))
     }
 
@@ -187,8 +141,7 @@ impl PrunedTable {
         plan: Arc<dyn ExecutionPlan>,
         filters: &[Expr],
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // A table with no files scans none.
-        let Some(conf) = plan
+        let Some(scan_config) = plan
             .downcast_ref::<DataSourceExec>()
             .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
         else {
@@ -199,7 +152,7 @@ impl PrunedTable {
             .transpose()?;
         let format = &self.inner.options().format;
         self.factory
-            .create_execution_plan(state, conf.clone(), format, filter.as_ref())
+            .create_execution_plan(state, scan_config.clone(), format, filter.as_ref())
             .await
     }
 }
@@ -246,9 +199,9 @@ impl TableProvider for PrunedTable {
         state: &dyn Session,
         args: ScanArgs<'a>,
     ) -> Result<ScanResult> {
-        let filters = args.filters().unwrap_or(&[]).to_vec();
+        let filters = args.filters().unwrap_or(&[]);
         let plan = self.inner.scan_with_args(state, args).await?.into_inner();
-        Ok(self.rebuild(state, plan, &filters).await?.into())
+        Ok(self.rebuild(state, plan, filters).await?.into())
     }
 
     fn supports_filters_pushdown(
