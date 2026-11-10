@@ -1,16 +1,15 @@
 //! Bench needles through dft, Vortex against Parquet: re-encode a Parquet file of minute bars to
 //! Vortex as `dft -o bars.vortex --format-option ohlc=true` does, check that each query in
-//! `needles.sql` returns as many rows on both, time each with the loop `dft --bench` runs, on
-//! Parquet with filter pushdown and the Vortex file, and print each median time.
+//! `needles.sql` returns as many rows on both, and time each with `dft --bench`.
 //!
 //! ```sh
-//! cargo bench -p datafusion-dft --features vortex --bench dft -- <bars.parquet> \
-//!     [-n ITERATIONS] [-p PARTITIONS,...] [-r READERS,...] [-o DIR] [--rewrite] \
-//!     [--row-block-size ROWS]
+//! cargo bench -p datafusion-dft --features vortex --bench dft -- \
+//!     <bars.parquet> [-n ITERATIONS] [-p PARTITIONS,...] [-r READERS,...] [-o DIR] \
+//!     [--rewrite] [--format-option KEY=VALUE ...]
 //! ```
 //!
-//! See [`Args`] (or `--help`) for the options. Set `VORTEX_OPTIONS` to write the Vortex file with
-//! other `--format-option`s.
+//! See [`Args`] (or `--help`) for the options. The Vortex file is written again whenever its
+//! options differ from the last write's.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -35,10 +34,13 @@ const NEEDLES: &str = include_str!("needles.sql");
 /// The table the queries read.
 const TABLE: &str = "bars";
 
-/// The bench's file: no coalescing of a narrow column's row blocks into bigger chunks, so a
-/// needle reads small segments. `VORTEX_OPTIONS` takes their place; the row block size comes from
-/// `--row-block-size` either way.
-const VORTEX_OPTIONS: &str = "ohlc=true data_block_target_bytes=none";
+/// Each `--format-option` comes after these, and dft keeps an option's last value.
+/// Disables coalescing of narrow columns, so a needle reads small segments.
+const FORMAT_OPTIONS: [&str; 3] = [
+    "ohlc=true",
+    "row_block_size=65536",
+    "data_block_target_bytes=none",
+];
 
 /// Where the Vortex file, the results and the summary go, under the workspace's `target`.
 const OUT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/ohlc-demo");
@@ -86,6 +88,7 @@ impl Reader {
     }
 }
 
+/// Bench needles through dft, Vortex against Parquet.
 #[derive(Parser)]
 #[command(name = "cargo bench -p datafusion-dft --features vortex --bench dft --")]
 struct Args {
@@ -106,10 +109,9 @@ struct Args {
     /// Write the Vortex file again even if it exists.
     #[arg(long)]
     rewrite: bool,
-    /// Rows in a row block, and a zone, of the Vortex file.
-    /// It applies when the file is written; see `--rewrite`.
-    #[arg(long, default_value_t = 65536)]
-    row_block_size: usize,
+    /// Passed to dft, over [`FORMAT_OPTIONS`].
+    #[arg(long = "format-option", value_name = "KEY=VALUE")]
+    format_options: Vec<String>,
     /// What `cargo bench` passes.
     #[arg(long, hide = true)]
     bench: bool,
@@ -158,11 +160,28 @@ async fn run(args: Args) -> Result<()> {
     let out = canonical(&args.out)?;
     let vortex = out.join("bars.vortex");
 
-    // 1. Re-encode.
-    if args.rewrite || !vortex.exists() {
-        println!("== writing {}", vortex.display());
+    // 1. Re-encode, unless the file was last written with these options. The options go next to
+    // the file, so a run with others writes it again in place of timing a stale file.
+    let options: Vec<String> = (FORMAT_OPTIONS.iter().map(|option| option.to_string()))
+        .chain(args.format_options)
+        .collect();
+    let options_text = options.join(" ");
+    let written_with = out.join("bars.vortex.options");
+    let last_options = match std::fs::read_to_string(&written_with) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let stale = last_options.as_deref() != Some(options_text.as_str());
+    if args.rewrite || !vortex.exists() || stale {
+        println!("== writing {} with {options_text}", vortex.display());
         let start = Instant::now();
-        write_vortex(&source, &vortex, args.row_block_size).await?;
+        // No record while the file is being written: a failed write leaves it stale.
+        if last_options.is_some() {
+            std::fs::remove_file(&written_with)?;
+        }
+        write_vortex(&source, &vortex, &options).await?;
+        std::fs::write(&written_with, &options_text)?;
         println!("{:.1} s", start.elapsed().as_secs_f64());
     }
     for path in [&source, &vortex] {
@@ -230,14 +249,9 @@ fn canonical(path: &Path) -> Result<PathBuf> {
 }
 
 /// Write `source` to `vortex` with dft's CLI, as `dft -c "SELECT * FROM '<source>'" -o <vortex>
-/// --format-option ...` would. One partition reads the Parquet file in order, so the Vortex file
-/// keeps its rows' order (sorted by ticker, then time) and its zone maps stay tight.
-async fn write_vortex(source: &Path, vortex: &Path, row_block_size: usize) -> Result<()> {
-    let options = match std::env::var("VORTEX_OPTIONS") {
-        Ok(options) => options,
-        Err(std::env::VarError::NotPresent) => VORTEX_OPTIONS.to_string(),
-        Err(e) => return Err(e.into()),
-    };
+/// --format-option ...` would, with each of `options`. One partition reads the Parquet file in
+/// order, so the Vortex file keeps sort order and zone maps stay packed.
+async fn write_vortex(source: &Path, vortex: &Path, options: &[String]) -> Result<()> {
     let mut argv = vec![
         APP_NAME.to_string(),
         "-c".to_string(),
@@ -245,9 +259,8 @@ async fn write_vortex(source: &Path, vortex: &Path, row_block_size: usize) -> Re
         "-o".to_string(),
         vortex.display().to_string(),
     ];
-    let row_block_size = format!("row_block_size={row_block_size}");
-    for option in options.split_whitespace().chain([row_block_size.as_str()]) {
-        argv.extend(["--format-option".to_string(), option.to_string()]);
+    for option in options {
+        argv.extend(["--format-option".to_string(), option.clone()]);
     }
     let config = app_config(&Reader::Parquet.settings(1), false);
     datafusion_dft::cli::try_run(DftArgs::try_parse_from(argv)?, config).await?;
@@ -260,13 +273,18 @@ async fn write_vortex(source: &Path, vortex: &Path, row_block_size: usize) -> Re
 
 fn app_config(settings: &[(&str, String)], dedicated: bool) -> AppConfig {
     let datafusion = settings.iter().map(|(k, v)| (k.to_string(), v.clone()));
-    let mut config = AppConfig::default();
-    config.cli.execution = ExecutionConfig {
+    let execution = ExecutionConfig {
         ddl_path: None,
         datafusion: Some(datafusion.collect()),
         dedicated_executor_enabled: dedicated,
         ..ExecutionConfig::default()
     };
+    // The CLI merges `cli.execution` over `shared`
+    let mut config = AppConfig {
+        shared: execution.clone(),
+        ..AppConfig::default()
+    };
+    config.cli.execution = execution;
     config
 }
 

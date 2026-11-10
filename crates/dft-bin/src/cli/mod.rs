@@ -1219,6 +1219,11 @@ fn is_output_format_option(format: Format, key: &str) -> bool {
     }
 }
 
+/// The [`ExecutionContext`] the CLI runs queries on: `config.cli.execution` merged over
+/// `config.shared` (see [`merge_configs`]), with dft's extensions registered.
+///
+/// A field left `None` in `config.cli.execution` keeps `config.shared`'s value, so `ddl_path`
+/// defaults to `~/.config/dft/ddl.sql`. Building the context runs no DDL.
 pub async fn execution_context(config: &AppConfig) -> Result<ExecutionContext> {
     let merged_exec_config = merge_configs(config.shared.clone(), config.cli.execution.clone());
     let session_state = DftSessionStateBuilder::try_new(Some(merged_exec_config.clone()))?
@@ -1234,7 +1239,8 @@ pub async fn execution_context(config: &AppConfig) -> Result<ExecutionContext> {
     Ok(execution_ctx)
 }
 
-// CLI mode: executing commands from files or CLI arguments
+/// CLI mode: execute the commands in `cli`, from files or arguments, on a context built by
+/// [`execution_context`].
 pub async fn try_run(cli: DftArgs, config: AppConfig) -> Result<()> {
     let execution_ctx = execution_context(&config).await?;
     #[allow(unused_mut)]
