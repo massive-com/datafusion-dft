@@ -21,15 +21,5 @@ vortex-error.workspace = true
 [dev-dependencies]
 test-util.workspace = true
 
-# The `dft` bench, which writes and reads the files through dft.
-clap.workspace = true
-datafusion-app = { features = ["vortex"], workspace = true }
-datafusion-dft = { features = ["vortex"], workspace = true }
-tokio = { features = ["rt-multi-thread"], workspace = true }
-
 [lints]
 workspace = true
-
-[[bench]]
-harness = false
-name = "dft"

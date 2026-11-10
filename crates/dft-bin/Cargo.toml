@@ -153,3 +153,9 @@ workspace = true
 [[bin]]
 name = "dft"
 path = "src/main.rs"
+
+# The needles through dft, Vortex against Parquet.
+[[bench]]
+harness = false
+name = "dft"
+required-features = ["vortex"]

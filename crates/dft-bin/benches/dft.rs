@@ -5,8 +5,8 @@
 //! against the faster Parquet's.
 //!
 //! ```sh
-//! cargo bench -p vortex-ohlc --bench dft -- <bars.parquet> [-n ITERATIONS] \
-//!     [-p PARTITIONS,...] [-r READERS,...] [-o DIR] [--rewrite]
+//! cargo bench -p datafusion-dft --features vortex --bench dft -- <bars.parquet> \
+//!     [-n ITERATIONS] [-p PARTITIONS,...] [-r READERS,...] [-o DIR] [--rewrite]
 //! ```
 //!
 //! See [`Args`] (or `--help`) for the options. Set `VORTEX_OPTIONS` to write the Vortex file with
@@ -23,9 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Instant;
 
-use arrow::array::AsArray;
-use arrow::datatypes::Int64Type;
 use clap::{Parser, ValueEnum};
+use datafusion::arrow::array::AsArray;
+use datafusion::arrow::datatypes::Int64Type;
 use datafusion_app::config::ExecutionConfig;
 use datafusion_app::extensions::DftSessionStateBuilder;
 use datafusion_app::local::ExecutionContext;
@@ -95,7 +95,7 @@ impl Reader {
 
 /// The needles through dft, Vortex against Parquet.
 #[derive(Parser)]
-#[command(name = "cargo bench -p vortex-ohlc --bench dft --")]
+#[command(name = "cargo bench -p datafusion-dft --features vortex --bench dft --")]
 struct Args {
     /// The Parquet file of minute bars.
     source: PathBuf,
