@@ -22,7 +22,6 @@ use parquet::{
     basic::Encoding,
     file::{reader::FileReader, serialized_reader::SerializedFileReader},
 };
-use predicates::prelude::PredicateBooleanExt;
 use std::{io::Read, path::PathBuf};
 
 use super::{assert_output_contains, contains_str, sql_in_file};

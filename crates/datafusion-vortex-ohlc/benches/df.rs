@@ -148,8 +148,6 @@ impl Tables {
         // Vortex does its I/O on the runtime it finds when the session is made.
         let _runtime = runtime.enter();
         let session = VortexSession::default();
-        // The factory registers vortex-ohlc on the session, which the V2 scan's format reads with
-        // too.
         let factory = vortex_format_factory(session.clone());
         let format: Arc<dyn FileFormat> = match reader {
             Reader::VortexScanV2 => {
@@ -167,7 +165,7 @@ impl Tables {
         // The scans read the file directly, as dft reads a local file.
         let url = ObjectStoreUrl::local_filesystem();
         let store = ctx.runtime_env().object_store(&url).unwrap();
-        let mut factory = VortexExecFactory::new(reader_factory(&url, store));
+        let mut factory = VortexExecFactory::new(reader_factory(&url, store).unwrap());
         if reader == Reader::Vortex {
             factory = factory.with_pruner(Arc::new(ZonePruner::new(session)));
         }
