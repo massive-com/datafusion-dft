@@ -747,6 +747,8 @@ fn test_output_vortex() {
 #[test]
 #[cfg(feature = "vortex")]
 fn test_analyze_vortex_scan() {
+    use predicates::prelude::PredicateBooleanExt;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ids.vortex");
 
