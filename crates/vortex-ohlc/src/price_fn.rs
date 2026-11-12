@@ -3,16 +3,17 @@
 
 use std::fmt;
 
-use num_traits::{AsPrimitive, PrimInt, WrappingMul};
+use num_traits::{PrimInt, WrappingMul};
 
-use vortex::array::arrays::decimal::DecimalArrayExt;
+use vortex::array::arrays::decimal::{converted_buffer, DecimalArrayExt};
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{DecimalArray, StructArray};
 use vortex::array::{ArrayRef, ExecutionCtx, IntoArray};
 use vortex::buffer::Buffer;
-use vortex::dtype::{DType, DecimalDType, DecimalType, NativeDecimalType};
+use vortex::dtype::{DType, DecimalDType, NativeDecimalType};
 use vortex::error::{vortex_bail, VortexResult};
 use vortex::expr::Expression;
+use vortex::mask::Mask;
 use vortex::scalar_fn::{
     Arity, ChildName, ExecutionArgs, ScalarFnId, ScalarFnVTable, ScalarFnVTableExt,
 };
@@ -127,12 +128,7 @@ impl ScalarFnVTable for OhlcPriceFn {
 /// brought to the finest of them, and their sum to the price's scale.
 fn rebuilt<W>(options: &PriceOptions, parts: &[Option<DecimalArray>; 4]) -> VortexResult<Buffer<W>>
 where
-    W: PrimInt + WrappingMul + NativeDecimalType + 'static,
-    i8: AsPrimitive<W>,
-    i16: AsPrimitive<W>,
-    i32: AsPrimitive<W>,
-    i64: AsPrimitive<W>,
-    i128: AsPrimitive<W>,
+    W: PrimInt + WrappingMul + NativeDecimalType,
 {
     let finest = (parts.iter().flatten())
         .map(|part| part.scale())
@@ -158,38 +154,25 @@ fn pow10<W: PrimInt + WrappingMul>(exponent: u8) -> W {
 }
 
 /// A decimal array's unscaled values times `factor`, as `W`s, whatever width they're stored at.
+/// Values stored wider than `W` are narrowed with a check, which fails on one that doesn't fit.
 ///
 /// *A future Vortex*: once a release enforces vortex#10701 (0.91 doesn't yet), a decoded decimal
 /// always has its precision's width, and the stored width is a `Widen`'s child, which [`decoded`]
 /// should return (see there).
 fn widened<W>(array: &DecimalArray, factor: W) -> VortexResult<Buffer<W>>
 where
-    W: PrimInt + NativeDecimalType + 'static,
-    i8: AsPrimitive<W>,
-    i16: AsPrimitive<W>,
-    i32: AsPrimitive<W>,
-    i64: AsPrimitive<W>,
-    i128: AsPrimitive<W>,
+    W: PrimInt + NativeDecimalType,
 {
-    fn widen<T, W>(values: &[T], factor: W) -> Buffer<W>
-    where
-        T: NativeDecimalType + AsPrimitive<W>,
-        W: PrimInt + 'static,
-    {
-        // A multiply of 64-bit lanes doesn't vectorize on NEON or AVX2, so only where needed.
-        match factor.is_one() {
-            true => values.iter().map(|&v| v.as_()).collect(),
-            false => values.iter().map(|&v| v.as_() * factor).collect(),
-        }
+    // Every slot holds a part (the bars writer refuses null prices), so every one is checked.
+    let values = converted_buffer::<W>(array, &Mask::new_true(array.len()))?;
+    // A multiply of 64-bit lanes doesn't vectorize on NEON or AVX2, so only where needed. It
+    // reuses the buffer just converted, unless that's the array's own (stored as `W`).
+    if factor.is_one() {
+        return Ok(values);
     }
-    Ok(match array.values_type() {
-        DecimalType::I8 => widen(&array.buffer::<i8>(), factor),
-        DecimalType::I16 => widen(&array.buffer::<i16>(), factor),
-        DecimalType::I32 => widen(&array.buffer::<i32>(), factor),
-        DecimalType::I64 => widen(&array.buffer::<i64>(), factor),
-        DecimalType::I128 => widen(&array.buffer::<i128>(), factor),
-        other => vortex_bail!("parts stored as {other:?}"),
-    })
+    let mut values = values.into_mut();
+    values.iter_mut().for_each(|v| *v = *v * factor);
+    Ok(values.freeze())
 }
 
 #[cfg(test)]
